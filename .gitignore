@@ -1,2 +1,19 @@
 .DS_Store
 Thumbs.db
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+.env.local
+
+# Local stack runtime artifacts should stay outside this repo.
+lightrag_store/
+source_docs/
+uploads/
+logs/
+state/
