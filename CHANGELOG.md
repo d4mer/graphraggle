@@ -26,3 +26,4 @@
 3. LightRAG container command duplication issue
 4. Worker ingestion path for text files by switching to `POST /documents/text`
 5. Worker duplication of internal `source_docs/__enqueued__` files
+6. Worker text decoding by adding fallbacks for non-UTF-8 text files like Windows-1252 transcripts

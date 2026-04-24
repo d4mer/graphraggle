@@ -660,8 +660,10 @@ from .state_store import (
 
 
 SUPPORTED = {".txt", ".md", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json", ".html", ".htm"}
+TEXT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json", ".csv"}
 TERMINAL_SUCCESS = {"ingested"}
 TERMINAL_FAILURE = {"failed"}
+LIGHTRAG_INTERNAL_DIRS = {"__enqueued__"}
 
 
 def sha256_of(path: Path) -> str:
@@ -672,8 +674,39 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+def should_skip_path(path: Path, root: Path, source_type: str) -> bool:
+    if source_type != "filesystem":
+        return False
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return any(part in LIGHTRAG_INTERNAL_DIRS for part in relative_parts)
+
+
+def read_text_with_fallbacks(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 async def submit_file(path: Path, source_type: str, digest: str) -> None:
-    resp = await client.post_file("/documents/upload", str(path))
+    if path.suffix.lower() in TEXT_EXTENSIONS:
+        text = read_text_with_fallbacks(path)
+        resp = await client.post_json(
+            "/documents/text",
+            {
+                "text": text,
+                "file_source": str(path),
+            },
+        )
+    else:
+        resp = await client.post_file("/documents/upload", str(path))
+
     track_id = resp.get("track_id", "")
     await upsert_document(
         document_id=str(uuid.uuid4()),
@@ -705,7 +738,10 @@ async def poll_track(doc: dict) -> None:
         await update_status(doc["path"], "failed", str(exc))
 
 
-async def handle_candidate(path: Path, source_type: str) -> None:
+async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
+    if should_skip_path(path, root, source_type):
+        return
+
     digest = sha256_of(path)
     existing = await get_document_by_path(str(path))
 
@@ -735,7 +771,7 @@ async def scan_once() -> None:
         for path in base.rglob("*"):
             if path.is_file() and path.suffix.lower() in SUPPORTED:
                 try:
-                    await handle_candidate(path, source_type)
+                    await handle_candidate(path, source_type, base)
                 except Exception as exc:
                     existing = await get_document_by_path(str(path))
                     if existing:

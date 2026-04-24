@@ -87,6 +87,40 @@ Fix:
 1. text files must go through LightRAG `POST /documents/text`
 2. binary docs continue using `POST /documents/upload`
 
+## Text file ingestion fails with Unicode decode errors
+
+Symptom:
+
+```text
+'utf-8' codec can't decode byte ... invalid start byte
+```
+
+Cause:
+1. the text file is not UTF-8 encoded
+2. common examples are Windows-1252 or Latin-1 transcripts
+
+Fix:
+1. worker should try decoding text files with fallbacks:
+   - `utf-8`
+   - `utf-8-sig`
+   - `cp1252`
+   - `latin-1`
+2. text-like files should still be sent through LightRAG `POST /documents/text`
+
+Operational recovery:
+
+```bash
+cd ~/rag-project
+podman compose up -d --build
+```
+
+Then re-upload the failed file and recheck:
+
+```bash
+curl -i http://localhost:8000/ingest/status \
+  -H "Authorization: Bearer $RAG_API_KEY"
+```
+
 ## Duplicate upload records
 
 Cause:
