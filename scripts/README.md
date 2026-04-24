@@ -4,6 +4,36 @@
 
 Bootstrap script for the Mac mini GraphRAG stack.
 
+## `upload_batch.sh`
+
+Uploads all supported files from a directory to the gateway upload endpoint.
+
+Usage:
+
+```bash
+export RAG_API_KEY='your-gateway-key'
+./scripts/upload_batch.sh "/path/to/folder"
+```
+
+Optional second argument:
+
+```bash
+./scripts/upload_batch.sh "/path/to/folder" http://192.168.1.180:8000
+```
+
+Supported file types:
+
+1. `.txt`
+2. `.md`
+3. `.html`
+4. `.htm`
+5. `.json`
+6. `.csv`
+7. `.pdf`
+8. `.docx`
+9. `.pptx`
+10. `.xlsx`
+
 ## Notes
 
 1. This script reflects the currently validated stack architecture.
