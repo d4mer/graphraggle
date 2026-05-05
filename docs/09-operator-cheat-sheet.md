@@ -31,12 +31,30 @@ curl -i -X POST http://localhost:8000/upload \
   -F "file=@/path/to/file"
 ```
 
+With company scope:
+
+```bash
+curl -i -X POST http://localhost:8000/upload \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -F "file=@/path/to/file" \
+  -F "company=Acme Corp"
+```
+
 ## Check Ingestion
 
 ```bash
 curl -i http://localhost:8000/ingest/status \
   -H "Authorization: Bearer $RAG_API_KEY"
 ```
+
+## Validation State Quick Ref
+
+| `validation_state` | Meaning | Action |
+|--------------------|---------|--------|
+| `accept` | passed gate | none |
+| `warn` | passed with warnings | check `warnings_json` |
+| `reject` | failed gate | check `error_message`, fix and re-upload |
+| `auto_split` | too large (>500KB) | split file and re-upload |
 
 ## Query
 
@@ -45,6 +63,15 @@ curl -i -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query":"What does the document say?","mode":"mix"}'
+```
+
+Company-scoped:
+
+```bash
+curl -i -X POST http://localhost:8000/query \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What does the document say?","company":"Acme Corp","mode":"mix"}'
 ```
 
 ## Generate Document
@@ -56,21 +83,25 @@ curl -i -X POST http://localhost:8000/generate-document \
   -d '{"query":"Draft a memo summarizing the document","document_type":"memo"}'
 ```
 
+## The Three Surfaces
+
+| Surface | URL | Use for |
+|---------|-----|---------|
+| Gateway API | `http://localhost:8000` | Upload, status, query, generate |
+| Open WebUI | `http://localhost:3000` | Conversational research |
+| LightRAG Web UI | `http://macmini.local:9622` | Admin/debug only |
+
 ## Open WebUI
 
 ```bash
 open http://localhost:3000
 ```
 
-For conversational research and threaded exploration.
-
 ## LightRAG Web UI (Admin / Debug)
 
 ```bash
-open http://localhost:9622
+open http://macmini.local:9622
 ```
-
-For inspecting ingestion state, track status, and debugging. Not for primary ingestion or chat.
 
 ## Logs
 
@@ -96,15 +127,34 @@ podman exec rag-gateway-api curl -i \
   http://lightrag-server:9621/documents/track_status/YOUR_TRACK_ID
 ```
 
+## Reindex Failed Documents
+
+```bash
+curl -i -X POST http://localhost:8000/ingest/reindex \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"failed"}'
+```
+
+## Force Reindex One Document
+
+```bash
+curl -i -X POST http://localhost:8000/ingest/reindex \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"document_id":"YOUR-DOC-ID","force":true}'
+```
+
+## Company Summary
+
+```bash
+curl -s http://localhost:8000/ingest/status \
+  -H "Authorization: Bearer $RAG_API_KEY" | jq '.summary.by_company'
+```
+
 ## Known-Good Values
 
 ```bash
 EMBEDDING_MODEL=mxbai-embed-large-v1
 RERANK_MODEL=jina-reranker-v3-mlx
 ```
-
-## Key URLs
-
-1. API docs: `http://localhost:8000/docs`
-2. Open WebUI: `http://localhost:3000`
-3. LightRAG Web UI (admin/debug): `http://localhost:9622`
