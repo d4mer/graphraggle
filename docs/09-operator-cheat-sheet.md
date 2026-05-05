@@ -62,6 +62,16 @@ curl -i -X POST http://localhost:8000/generate-document \
 open http://localhost:3000
 ```
 
+For conversational research and threaded exploration.
+
+## LightRAG Web UI (Admin / Debug)
+
+```bash
+open http://localhost:9622
+```
+
+For inspecting ingestion state, track status, and debugging. Not for primary ingestion or chat.
+
 ## Logs
 
 ```bash
@@ -97,3 +107,4 @@ RERANK_MODEL=jina-reranker-v3-mlx
 
 1. API docs: `http://localhost:8000/docs`
 2. Open WebUI: `http://localhost:3000`
+3. LightRAG Web UI (admin/debug): `http://localhost:9622`

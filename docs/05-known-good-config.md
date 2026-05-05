@@ -11,6 +11,7 @@
 
 1. API docs: `http://localhost:8000/docs`
 2. Open WebUI: `http://localhost:3000`
+3. LightRAG Web UI (admin/debug): `http://localhost:9622`
 
 ## Validated Models
 

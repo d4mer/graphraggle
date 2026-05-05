@@ -78,10 +78,22 @@ open http://localhost:3000
 ```
 
 Use it for:
-
 1. conversational research
 2. threaded exploration
 3. iterative follow-up questions
+
+## 6b. Inspect With LightRAG Web UI (Admin / Debug)
+
+```bash
+open http://localhost:9622
+```
+
+Use it for:
+1. browsing ingestion state visually
+2. inspecting track status and internal health
+3. debugging ingestion failures without curl commands
+
+Do not use for primary ingestion or conversational research.
 
 ## 7. Generate A Grounded Document
 
