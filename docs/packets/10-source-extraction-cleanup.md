@@ -1,7 +1,7 @@
 # Packet 10: Source Extraction Cleanup
 
 ## Status
-ready
+accepted
 
 ## Objective
 
@@ -92,4 +92,4 @@ Treat this as a behavior-preserving structural packet as much as possible.
 
 ## Result
 
-Pending execution and review.
+Accepted. Extracted 5 files from install script HEREDOCs into `app/`: `__init__.py`, `config.py`, `auth.py`, `lightrag_client.py`, `generation.py`. Install script now copies these from canonical source. All 10 app files now exist as real source files.

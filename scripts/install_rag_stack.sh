@@ -236,29 +236,8 @@ CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
 volumes:
   open-webui-data:
 """,
-    app_dir / "__init__.py": "",
-    app_dir / "config.py": """from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    rag_api_key: str = Field(alias="RAG_API_KEY")
-    lightrag_internal_api_key: str = Field(alias="LIGHTRAG_INTERNAL_API_KEY")
-    lightrag_base_url: str = Field(alias="LIGHTRAG_BASE_URL")
-
-    source_docs_dir: str = Field(alias="SOURCE_DOCS_DIR")
-    uploads_dir: str = Field(alias="UPLOADS_DIR")
-    state_db_path: str = Field(alias="STATE_DB_PATH")
-
-    ingest_scan_interval_seconds: int = Field(default=30, alias="INGEST_SCAN_INTERVAL_SECONDS")
-    ingest_max_retries: int = Field(default=3, alias="INGEST_MAX_RETRIES")
-    request_timeout_seconds: int = Field(default=300, alias="REQUEST_TIMEOUT_SECONDS")
-
-
-settings = Settings()
-""",
+    app_dir / "__init__.py": None,
+    app_dir / "config.py": None,
     app_dir / "models.py": """from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -291,61 +270,8 @@ class ReindexRequest(BaseModel):
     path: str | None = None
     force: bool = True
 """,
-    app_dir / "auth.py": """from fastapi import Header, HTTPException
-from .config import settings
-
-
-def require_bearer(authorization: str | None = Header(default=None)) -> None:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.removeprefix("Bearer ").strip()
-    if token != settings.rag_api_key:
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
-""",
-    app_dir / "lightrag_client.py": """from __future__ import annotations
-
-import httpx
-from .config import settings
-
-
-class LightRAGClient:
-    def __init__(self) -> None:
-        self.base_url = settings.lightrag_base_url.rstrip("/")
-        self.headers = {"X-API-Key": settings.lightrag_internal_api_key}
-        self.timeout = settings.request_timeout_seconds
-
-    async def get(self, path: str) -> dict:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.get(f"{self.base_url}{path}", headers=self.headers)
-            resp.raise_for_status()
-            return resp.json()
-
-    async def post_json(self, path: str, payload: dict) -> dict:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(f"{self.base_url}{path}", headers=self.headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
-
-    async def post_file(self, path: str, file_path: str) -> dict:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            with open(file_path, "rb") as f:
-                files = {"file": (file_path.split("/")[-1], f)}
-                resp = await client.post(f"{self.base_url}{path}", headers=self.headers, files=files)
-            resp.raise_for_status()
-            return resp.json()
-
-    async def proxy(self, method: str, path: str, body: bytes | None = None, content_type: str | None = None):
-        headers = dict(self.headers)
-        if content_type:
-            headers["Content-Type"] = content_type
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.request(method, f"{self.base_url}{path}", headers=headers, content=body)
-            resp.raise_for_status()
-            return resp
-
-
-client = LightRAGClient()
-""",
+    app_dir / "auth.py": None,
+    app_dir / "lightrag_client.py": None,
     app_dir / "state_store.py": """from __future__ import annotations
 
 import aiosqlite
@@ -884,60 +810,7 @@ def _compute_sha256(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 """,
-    app_dir / "generation.py": """from .lightrag_client import client
-
-
-PROMPTS = {
-    "summary": "Create a concise grounded summary from the retrieved context.",
-    "memo": "Draft a professional memo grounded only in the retrieved context.",
-    "report": "Draft a structured report grounded only in the retrieved context.",
-    "proposal": "Draft a proposal grounded only in the retrieved context.",
-    "policy": "Draft a policy document grounded only in the retrieved context.",
-    "brief": "Draft a concise brief grounded only in the retrieved context.",
-    "draft": "Draft a document grounded only in the retrieved context.",
-}
-
-
-async def generate_document(query: str, document_type: str) -> dict:
-    retrieval = await client.post_json(
-        "/query",
-        {
-            "query": query,
-            "mode": "mix",
-            "include_references": True,
-            "include_chunk_content": True,
-        },
-    )
-    references = retrieval.get("references", [])
-    context_parts: list[str] = []
-    for ref in references:
-        file_path = ref.get("file_path", "")
-        content = ref.get("content") or []
-        joined = "\\n\\n".join(content)
-        if joined:
-            context_parts.append(f"Source: {file_path}\\n{joined}")
-    context = "\\n\\n".join(context_parts) if context_parts else retrieval.get("response", "")
-    prompt = (
-        f"{PROMPTS[document_type]}\\n\\n"
-        f"User request:\\n{query}\\n\\n"
-        f"Context:\\n{context}\\n\\n"
-        "Return only the requested document."
-    )
-    llm = await client.post_json(
-        "/query",
-        {
-            "query": prompt,
-            "mode": "bypass",
-            "include_references": False,
-        },
-    )
-    return {
-        "document_type": document_type,
-        "title": document_type.title(),
-        "document": llm.get("response", ""),
-        "citations": references,
-    }
-""",
+    app_dir / "generation.py": None,
     app_dir / "api.py": """from __future__ import annotations
 
 import hashlib
@@ -2234,8 +2107,18 @@ if __name__ == "__main__":
 }
 
 for path, content in files.items():
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    if content is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+import shutil
+src_app = Path(__file__).parent.parent / "app"
+dst_app = project_dir / "app"
+for name in ["__init__.py", "config.py", "auth.py", "lightrag_client.py", "generation.py"]:
+    src = src_app / name
+    if src.exists():
+        shutil.copy2(src, dst_app / name)
+
 PY
 
 printf "Building and starting services...\n"
