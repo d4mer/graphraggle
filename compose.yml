@@ -1,0 +1,79 @@
+services:
+  lightrag-server:
+    image: ghcr.io/hkuds/lightrag:v1.4.15
+    container_name: lightrag-server
+    env_file:
+      - .env
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9621"
+      - --working-dir
+      - /data/lightrag_store
+      - --input-dir
+      - /data/source_docs
+    volumes:
+      - ./lightrag_store:/data/lightrag_store
+      - ./source_docs:/data/source_docs
+      - ./logs:/data/logs
+    ports:
+      - "9622:9621"
+    restart: unless-stopped
+
+  gateway-api:
+      build:
+        context: .
+        dockerfile: Containerfile
+      image: local/rag-gateway:latest
+      pull_policy: never
+      container_name: rag-gateway-api
+      env_file:
+        - .env
+      volumes:
+        - ./source_docs:/app/source_docs
+        - ./uploads:/app/uploads
+        - ./logs:/app/logs
+        - ./state:/app/state
+      ports:
+        - "8000:8000"
+      depends_on:
+        - lightrag-server
+      restart: unless-stopped
+
+  ingest-worker:
+      build:
+        context: .
+        dockerfile: Containerfile
+      image: local/rag-gateway:latest
+      pull_policy: never
+      container_name: rag-ingest-worker
+      env_file:
+        - .env
+      command: ["python", "-m", "app.worker"]
+      volumes:
+        - ./source_docs:/app/source_docs
+        - ./uploads:/app/uploads
+        - ./logs:/app/logs
+        - ./state:/app/state
+      depends_on:
+        - lightrag-server
+      restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    environment:
+      WEBUI_AUTH: "False"
+      ENABLE_OLLAMA_API: "True"
+      OLLAMA_BASE_URLS: '["http://gateway-api:8000"]'
+    ports:
+      - "3000:8080"
+    depends_on:
+      - gateway-api
+    volumes:
+      - open-webui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
