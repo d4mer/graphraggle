@@ -1,7 +1,7 @@
 # Packet 09: Operator UX And Documentation Refresh
 
 ## Status
-ready
+accepted
 
 ## Objective
 
@@ -100,4 +100,4 @@ Borrow TrustGraph-style usability ideas only where they improve clarity, not by 
 
 ## Result
 
-Pending execution and review.
+Accepted. Five docs updated, one new doc created. Commit ece0642.
