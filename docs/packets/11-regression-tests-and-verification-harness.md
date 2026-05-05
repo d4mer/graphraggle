@@ -1,7 +1,7 @@
 # Packet 11: Regression Tests And Verification Harness
 
 ## Status
-ready
+accepted
 
 ## Objective
 
