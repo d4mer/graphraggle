@@ -38,16 +38,16 @@ echo "Polling /ingest/status..."
 STATUS_RESP=$(curl -s -X GET "${ENDPOINT}/ingest/status?document_id=${DOC_ID}" \
     -H "Authorization: Bearer ${TOKEN}")
 
-STATE=$(echo "$STATUS_RESP" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+STATE=$(echo "$STATUS_RESP" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
 echo "Current state: $STATE"
 
 MAX_ATTEMPTS=30
 ATTEMPT=0
-while [[ "$STATE" != "completed" && "$STATE" != "failed" && $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
+while [[ "$STATE" != "ingested" && "$STATE" != "failed" && $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
     sleep 2
     STATUS_RESP=$(curl -s -X GET "${ENDPOINT}/ingest/status?document_id=${DOC_ID}" \
         -H "Authorization: Bearer ${TOKEN}")
-    STATE=$(echo "$STATUS_RESP" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+    STATE=$(echo "$STATUS_RESP" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
     echo "State: $STATE (attempt $((++ATTEMPT)))"
 done
 
@@ -56,7 +56,7 @@ if [[ "$STATE" == "failed" ]]; then
     exit 1
 fi
 
-if [[ "$STATE" != "completed" ]]; then
+if [[ "$STATE" != "ingested" ]]; then
     echo "ERROR: Ingestion did not complete within expected time" >&2
     exit 1
 fi
