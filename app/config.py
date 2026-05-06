@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
+    rerank_binding_api_key: Optional[str] = Field(default=None, alias="RERANK_BINDING_API_KEY")
+    rerank_model: Optional[str] = Field(default=None, alias="RERANK_MODEL")
 
     multi_query_enabled: bool = Field(default=False, alias="MULTI_QUERY_ENABLED")
     multi_query_long_query_words: int = Field(default=20, alias="MULTI_QUERY_LONG_QUERY_WORDS")

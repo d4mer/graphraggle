@@ -481,7 +481,7 @@ class TestGenerateRewritesViaBypass(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_calls_bypass_mode(self):
-        """Should call /query with mode='bypass' and top_k=0."""
+        """Should call /query with mode='bypass' and top_k=1."""
         mock_client = MagicMock()
         mock_result = {"response": '["rewrite 1"]'}
         mock_client.post_json = AsyncMock(return_value=mock_result)
@@ -493,7 +493,7 @@ class TestGenerateRewritesViaBypass(unittest.TestCase):
         self.assertEqual(call_args[0][0], "/query")
         payload = call_args[0][1]
         self.assertEqual(payload["mode"], "bypass")
-        self.assertEqual(payload["top_k"], 0)
+        self.assertEqual(payload["top_k"], 1)
         self.assertFalse(payload["include_references"])
         self.assertFalse(payload["include_chunk_content"])
 

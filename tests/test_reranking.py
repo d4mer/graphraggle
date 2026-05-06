@@ -81,6 +81,11 @@ class TestCitationToText(unittest.TestCase):
         citation = {"text": "fallback text"}
         self.assertEqual(citation_to_text(citation), "fallback text")
 
+    def test_joins_list_content_field(self):
+        from app.rerank import citation_to_text
+        citation = {"content": ["first part", "second part"]}
+        self.assertEqual(citation_to_text(citation), "first part\n\nsecond part")
+
     def test_falls_back_to_json_repr(self):
         from app.rerank import citation_to_text
         citation = {"path": "/docs/x.txt", "index": 3}

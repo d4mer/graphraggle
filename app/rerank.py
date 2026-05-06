@@ -20,7 +20,11 @@ def citation_to_text(citation: dict[str, Any]) -> str:
     for key in ("content", "text", "chunk_text", "body"):
         value = citation.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return value.strip()[:4000]
+        if isinstance(value, list):
+            parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+            if parts:
+                return "\n\n".join(parts)[:4000]
     return json.dumps(citation, sort_keys=True, default=str)
 
 
@@ -33,6 +37,8 @@ async def call_rerank_endpoint(
     query: str,
     documents: list[str],
     rerank_host: str,
+    rerank_api_key: str | None = None,
+    rerank_model: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """Call an external rerank endpoint and return sorted results or None on failure.
 
@@ -47,12 +53,18 @@ async def call_rerank_endpoint(
         "query": query,
         "documents": [doc for _, doc in indexed_docs],
     }
+    if rerank_model:
+        payload["model"] = rerank_model
 
     try:
+        headers: dict[str, str] = {}
+        if rerank_api_key:
+            headers["Authorization"] = f"Bearer {rerank_api_key}"
         async with httpx.AsyncClient(timeout=RERANK_TIMEOUT_SECONDS) as http_client:
             resp = await http_client.post(
                 f"{rerank_host.rstrip('/')}/rerank",
                 json=payload,
+                headers=headers or None,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -78,6 +90,8 @@ async def rerank_citations(
     query: str,
     citations: list[dict[str, Any]],
     rerank_host: str | None,
+    rerank_api_key: str | None = None,
+    rerank_model: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Rerank citations by relevance to the query.
 
@@ -97,7 +111,13 @@ async def rerank_citations(
 
     documents = [citation_to_text(c) for c in citations]
 
-    results = await call_rerank_endpoint(query, documents, rerank_host)
+    results = await call_rerank_endpoint(
+        query,
+        documents,
+        rerank_host,
+        rerank_api_key=rerank_api_key,
+        rerank_model=rerank_model,
+    )
 
     if results is None:
         metadata["rerank_error"] = "rerank_unavailable"

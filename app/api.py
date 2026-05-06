@@ -571,7 +571,13 @@ async def query(req: QueryRequest):
             "rerank_output_count": 0,
         }
         if settings.rerank_enabled and settings.rerank_binding_host:
-            reranked_citations, rerank_meta = await rerank_citations(query_text, scoped_citations, settings.rerank_binding_host)
+            reranked_citations, rerank_meta = await rerank_citations(
+                query_text,
+                scoped_citations,
+                settings.rerank_binding_host,
+                rerank_api_key=settings.rerank_binding_api_key,
+                rerank_model=settings.rerank_model,
+            )
             if rerank_meta.get("rerank_applied"):
                 scoped_citations = reranked_citations
 

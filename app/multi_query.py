@@ -215,7 +215,7 @@ async def generate_rewrites_via_bypass(
             {
                 "query": rewrite_prompt + "\n\nOriginal query: " + query,
                 "mode": "bypass",
-                "top_k": 0,
+                "top_k": 1,
                 "include_references": False,
                 "include_chunk_content": False,
             },

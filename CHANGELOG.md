@@ -14,6 +14,14 @@
 
 ## 2026-05-06
 
+### Packet 14.1: Production Activation Hotfix (Multi-Query + Rerank)
+
+1. Fixed multi-query rewrite generation by changing bypass rewrite requests from `top_k=0` to `top_k=1` to avoid upstream 500 responses.
+2. Added rerank endpoint auth/model support in gateway config and rerank requests: `RERANK_BINDING_API_KEY`, `RERANK_MODEL`.
+3. Improved rerank citation text extraction to handle list-based citation content and cap payload text length for stability on large transcript citations.
+4. Updated tests for rewrite request behavior and added rerank list-content coverage.
+5. Verified live production behavior: `multi_query_triggered=true`, `multi_query_rewrite_count=2`, `rerank_applied=true`, `rerank_error=null`.
+
 ### Packet 13: Reranking Post-Scoping
 
 1. Added config settings `RERANK_ENABLED` (bool, default false) and `RERANK_BINDING_HOST` (optional URL) to `app/config.py`.
