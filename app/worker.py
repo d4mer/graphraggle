@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,16 @@ def read_text_with_fallbacks(path: Path) -> tuple[str, str]:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace"), "utf-8"
+
+
+def normalize_text_submission_payload(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    normalized = re.sub(r"\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]\s*", "", normalized)
+    normalized = re.sub(r"(?:^|\n)(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
 
 
 def parse_warning_metadata(raw: str | None) -> dict[str, Any]:
@@ -348,6 +359,7 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
     if path.suffix.lower() in TEXT_EXTENSIONS:
         try:
             text_payload, detected_encoding = read_text_with_fallbacks(path)
+            text_payload = normalize_text_submission_payload(text_payload)
         except Exception as exc:
             await update_document_state(
                 str(path),

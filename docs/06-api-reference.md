@@ -175,8 +175,15 @@ The response distinguishes `queued_documents` from `blocked_documents` and recor
 curl -i -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the document say?","mode":"mix"}'
+  -d '{"query":"What does the document say?"}'
 ```
+
+Packet 12 retrieval defaults and fallback behavior:
+
+1. If `mode` is omitted, the gateway defaults to `hybrid`.
+2. If first-pass retrieval is weak, the gateway performs a one-time fallback query in `naive` mode.
+3. Transcript-like prompts are automatically given deeper retrieval settings by the gateway.
+4. Client guidance: use explicit speaker/date terms and short quote fragments when querying meeting transcripts.
 
 Packet 07 scoping behavior:
 
@@ -193,7 +200,7 @@ Company-scoped example:
 curl -i -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What changed in the logistics plan?","company":"Acme QA","mode":"mix"}'
+  -d '{"query":"What changed in the logistics plan?","company":"Acme QA"}'
 ```
 
 ## Generate Document
@@ -227,5 +234,5 @@ podman exec rag-gateway-api curl -i \
 curl -i -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the smoke test document say about deployment?","mode":"mix"}'
+  -d '{"query":"What does the smoke test document say about deployment?"}'
 ```

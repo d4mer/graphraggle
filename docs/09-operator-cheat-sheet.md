@@ -62,8 +62,14 @@ curl -i http://localhost:8000/ingest/status \
 curl -i -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the document say?","mode":"mix"}'
+  -d '{"query":"What does the document say?"}'
 ```
+
+Default behavior:
+
+1. Omitted query mode defaults to `hybrid`.
+2. Weak first pass triggers one fallback retrieval in `naive` mode.
+3. Transcript-like queries use deeper retrieval settings.
 
 Company-scoped:
 
@@ -71,8 +77,14 @@ Company-scoped:
 curl -i -X POST http://localhost:8000/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the document say?","company":"Acme Corp","mode":"mix"}'
+  -d '{"query":"What does the document say?","company":"Acme Corp"}'
 ```
+
+Transcript query pattern:
+
+1. include speaker name/role
+2. include date or timestamp clue
+3. include a short exact quote fragment
 
 ## Generate Document
 
@@ -143,6 +155,13 @@ curl -i -X POST http://localhost:8000/ingest/reindex \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"document_id":"YOUR-DOC-ID","force":true}'
+```
+
+## Reindex SCT / Workshop GSK Batch
+
+```bash
+./scripts/reindex_sct_docs.sh --endpoint http://localhost:8000 --token "$RAG_API_KEY"
+./scripts/reindex_sct_docs.sh --endpoint http://localhost:8000 --token "$RAG_API_KEY" --apply
 ```
 
 ## Company Summary

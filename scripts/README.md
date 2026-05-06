@@ -51,6 +51,33 @@ Supported file types:
 4. Text-like files should be ingested via LightRAG `POST /documents/text`
 5. Binary files should be ingested via LightRAG `POST /documents/upload`
 
+## `reindex_sct_docs.sh`
+
+Helper script to batch-mark SCT/workshop transcript-like GSK docs for worker reindex.
+
+Usage:
+
+```bash
+./scripts/reindex_sct_docs.sh \
+  --endpoint http://localhost:8000 \
+  --token "$RAG_API_KEY"
+```
+
+Apply mode:
+
+```bash
+./scripts/reindex_sct_docs.sh \
+  --endpoint http://localhost:8000 \
+  --token "$RAG_API_KEY" \
+  --apply
+```
+
+Flags:
+
+1. `--company` defaults to `GSK`
+2. `--force` sets `force=true` on each `/ingest/reindex` call
+3. dry-run is default; no API write calls are made without `--apply`
+
 ## Versioning Practice
 
 When the installer changes materially:

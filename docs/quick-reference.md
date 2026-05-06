@@ -80,14 +80,21 @@ curl -s http://macmini.local:8000/ingest/status \
 curl -X POST http://macmini.local:8000/query \
   -H "Authorization: Bearer 1234" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the data say?","mode":"mix"}'
+  -d '{"query":"What does the data say?"}'
 
 # Company-scoped
 curl -X POST http://macmini.local:8000/query \
   -H "Authorization: Bearer 1234" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the data say?","company":"My Company","mode":"mix"}'
+  -d '{"query":"What does the data say?","company":"My Company"}'
 ```
+
+Defaults and fallback:
+
+1. Omitted mode defaults to `hybrid`.
+2. Weak retrieval triggers a one-time fallback query in `naive` mode.
+3. Transcript-like prompts use deeper retrieval settings.
+4. For transcripts, include speaker/date anchors and a short exact quote fragment.
 
 ---
 
@@ -105,6 +112,10 @@ curl -X POST http://macmini.local:8000/ingest/reindex \
   -H "Authorization: Bearer 1234" \
   -H "Content-Type: application/json" \
   -d '{"document_id":"YOUR-DOC-ID","force":true}'
+
+# Reindex GSK transcript/workshop docs (dry-run then apply)
+./scripts/reindex_sct_docs.sh --endpoint http://macmini.local:8000 --token 1234
+./scripts/reindex_sct_docs.sh --endpoint http://macmini.local:8000 --token 1234 --apply
 ```
 
 ---

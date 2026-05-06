@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-05-06
+
+### Packet 12: Retrieval Usability Hotfix
+
+1. Updated gateway query guidance to reflect default `hybrid` mode when omitted and one-time fallback to `naive` on weak retrieval.
+2. Added transcript-query operator guidance recommending speaker/date anchors plus short quote fragments.
+3. Added worker-side minimal transcript normalization before `/documents/text` submission (newline collapse, safe timestamp-noise cleanup, whitespace trimming).
+4. Added executable helper script `scripts/reindex_sct_docs.sh` for dry-run/apply reindex of matching SCT/workshop GSK docs via `/ingest/status` plus `/ingest/reindex`.
+5. Updated API/admin/operator/OpenWebUI/quick-reference docs and script docs for Packet 12 operations.
+
 ## 2026-04-24
 
 ### Added

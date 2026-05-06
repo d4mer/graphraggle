@@ -173,6 +173,19 @@ Check:
 2. API query returns citations
 3. LightRAG health is good
 4. Open WebUI is pointed at the gateway, not a different backend
+5. retry with a transcript-focused prompt using speaker/date/phrase anchors
+
+Gateway retrieval defaults you should expect:
+
+1. Query mode defaults to `hybrid` when omitted.
+2. If retrieval is weak, gateway runs one fallback pass in `naive` mode.
+3. Transcript-like prompts automatically receive deeper retrieval depth.
+
+Transcript prompt pattern:
+
+1. include speaker name or role
+2. include day/time anchor if known
+3. include a short exact phrase from the meeting
 
 Commands:
 

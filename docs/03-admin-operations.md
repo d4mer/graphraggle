@@ -96,6 +96,37 @@ curl -i -X POST http://localhost:8000/ingest/reindex \
 
 Use `force=true` only when intentionally replacing an in-flight, rejected, split-required, or already-ingested row through the normal worker path.
 
+## Reindex SCT / Workshop GSK Files
+
+Dry-run selection (default behavior):
+
+```bash
+./scripts/reindex_sct_docs.sh \
+  --endpoint http://localhost:8000 \
+  --token "$RAG_API_KEY"
+```
+
+Apply reindex calls:
+
+```bash
+./scripts/reindex_sct_docs.sh \
+  --endpoint http://localhost:8000 \
+  --token "$RAG_API_KEY" \
+  --apply
+```
+
+Optional flags:
+
+1. `--company` defaults to `GSK` and controls `source_docs/<company>` path matching.
+2. `--force` forwards `force=true` into each `/ingest/reindex` request.
+3. Selector matches filenames/paths containing `SCT`, `Workshop`, `Apr 30`, or `May`.
+
+## Query Defaults And Transcript Guidance
+
+1. Gateway defaults `/query` mode to `hybrid` when mode is omitted.
+2. If first retrieval is weak, gateway performs a bounded one-time fallback to `naive`.
+3. For transcripts, queries work best when they include a speaker name, time/date clue, and 3-8 exact words from the target passage.
+
 ## Find Track IDs
 
 ```bash
