@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +20,9 @@ class Settings(BaseSettings):
     ingest_scan_interval_seconds: int = Field(default=30, alias="INGEST_SCAN_INTERVAL_SECONDS")
     ingest_max_retries: int = Field(default=3, alias="INGEST_MAX_RETRIES")
     request_timeout_seconds: int = Field(default=300, alias="REQUEST_TIMEOUT_SECONDS")
+
+    rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
+    rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
 
 
 settings = Settings()

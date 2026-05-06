@@ -2,6 +2,18 @@
 
 ## 2026-05-06
 
+### Packet 13: Reranking Post-Scoping
+
+1. Added config settings `RERANK_ENABLED` (bool, default false) and `RERANK_BINDING_HOST` (optional URL) to `app/config.py`.
+2. Created `app/rerank.py` as a deep module with pure rerank helper functions: `citation_to_text`, `call_rerank_endpoint`, `rerank_citations`, and `truncate_citations`.
+3. Wired reranking into the gateway `/query` endpoint: applied only to in-scope citations (after company scope filtering), with fail-open behavior (preserves original order on error).
+4. Enforced top-5 citation truncation after reranking (or after original order when disabled/failed).
+5. Added five `query_scope` metadata fields: `rerank_enabled`, `rerank_applied`, `rerank_error`, `rerank_input_count`, `rerank_output_count`.
+6. Preserved existing transcript-like `top_k` expansion and fallback behavior unchanged.
+7. Added 25 unittest-style tests under `tests/test_reranking.py` covering: rerank applied and reorders, feature flag off preserves order, rerank failure fail-open, top-5 truncation, company filter before rerank, and config defaults.
+
+## 2026-05-06
+
 ### Packet 12: Retrieval Usability Hotfix
 
 1. Updated gateway query guidance to reflect default `hybrid` mode when omitted and one-time fallback to `naive` on weak retrieval.

@@ -15,6 +15,7 @@ from .config import settings
 from .generation import generate_document
 from .lightrag_client import client
 from .models import Envelope, GenerateDocumentRequest, QueryRequest, ReindexRequest
+from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
     derive_readiness,
@@ -504,50 +505,65 @@ async def query(req: QueryRequest):
     transcript_like = is_transcript_like_query(req.query)
     top_k = max(req.top_k, 24) if transcript_like else req.top_k
 
-    result = await client.post_json(
-        "/query",
-        {
-            "query": req.query,
-            "mode": retrieval_mode,
-            "top_k": top_k,
-            "include_references": True,
-            "include_chunk_content": True,
-        },
-    )
-    fallback_used = False
-    fallback_reason = None
-
-    answer = str(result.get("response", ""))
-    citation_count = len(result.get("references", []))
-    weak_reason = None
-    if citation_count < 2:
-        weak_reason = "citations_below_threshold"
-    elif has_weak_answer_signal(answer):
-        weak_reason = "weak_answer_signal"
-
-    if weak_reason and retrieval_mode != "bypass":
-        fallback_used = True
-        fallback_reason = weak_reason
-        retrieval_mode = "naive"
+    async def execute_query_pass(mode: str) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any], str | None]:
         result = await client.post_json(
             "/query",
             {
                 "query": req.query,
-                "mode": retrieval_mode,
+                "mode": mode,
                 "top_k": top_k,
                 "include_references": True,
                 "include_chunk_content": True,
             },
         )
+        answer = str(result.get("response", ""))
+        citations, query_scope = await scope_query_citations(result.get("references", []), requested_company=requested_company)
 
-    citations, query_scope = await scope_query_citations(result.get("references", []), requested_company=requested_company)
+        rerank_meta: dict[str, Any] = {
+            "rerank_enabled": settings.rerank_enabled and settings.rerank_binding_host is not None,
+            "rerank_applied": False,
+            "rerank_error": None,
+            "rerank_input_count": len(citations),
+            "rerank_output_count": 0,
+        }
+        if settings.rerank_enabled and settings.rerank_binding_host:
+            reranked_citations, rerank_meta = await rerank_citations(req.query, citations, settings.rerank_binding_host)
+            if rerank_meta.get("rerank_applied"):
+                citations = reranked_citations
+
+        citations = truncate_citations(citations, top_k=RERANK_TOP_K)
+
+        weak_reason = None
+        if len(citations) < 2:
+            weak_reason = "citations_below_threshold"
+        elif has_weak_answer_signal(answer):
+            weak_reason = "weak_answer_signal"
+
+        return answer, citations, query_scope, rerank_meta, weak_reason
+
+    fallback_used = False
+    fallback_reason = None
+
+    answer, citations, query_scope, rerank_meta, weak_reason = await execute_query_pass(retrieval_mode)
+
+    if weak_reason and retrieval_mode != "bypass":
+        fallback_used = True
+        fallback_reason = weak_reason
+        retrieval_mode = "naive"
+        answer, citations, query_scope, rerank_meta, _ = await execute_query_pass(retrieval_mode)
+
     query_scope["retrieval_mode_used"] = retrieval_mode
     query_scope["fallback_used"] = fallback_used
     query_scope["fallback_reason"] = fallback_reason
     query_scope["explicit_mode"] = explicit_mode
     query_scope["transcript_like_query"] = transcript_like
     query_scope["top_k_used"] = top_k
-    return ok({"answer": result.get("response", ""), "citations": citations, "query_scope": query_scope})
+    query_scope["rerank_enabled"] = rerank_meta["rerank_enabled"]
+    query_scope["rerank_applied"] = rerank_meta["rerank_applied"]
+    query_scope["rerank_error"] = rerank_meta["rerank_error"]
+    query_scope["rerank_input_count"] = rerank_meta["rerank_input_count"]
+    query_scope["rerank_output_count"] = rerank_meta["rerank_output_count"]
+    return ok({"answer": answer, "citations": citations, "query_scope": query_scope})
 
 
 @app.post("/generate-document", response_model=Envelope, dependencies=[Depends(require_bearer)])
