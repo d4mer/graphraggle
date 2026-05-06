@@ -31,7 +31,7 @@ This packet addresses usability issues in the retrieval layer by improving defau
 4. Write evidence file: `docs/ops/runs/packet-12-evidence.md`
 5. Update packet status to `accepted`.
 
-## Result: accepted with commit hashes pending finalization
+## Result: accepted. Implemented via commits `e38cfa8` and `dd12bda`.
 
 ## Checklist
 - [x] Create packet file
