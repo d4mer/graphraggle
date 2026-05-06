@@ -17,7 +17,7 @@ async def generate_document(query: str, document_type: str) -> dict:
         "/query",
         {
             "query": query,
-            "mode": "mix",
+            "mode": "hybrid",
             "include_references": True,
             "include_chunk_content": True,
         },

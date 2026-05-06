@@ -33,6 +33,8 @@ from .validation import validate_upload
 app = FastAPI(title="RAG Gateway", version="0.1.0")
 
 FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+TRANSCRIPT_QUERY_KEYWORDS = ("transcript", "workshop", "speaker", "meeting minutes", "recording")
+WEAK_ANSWER_MARKERS = ("not enough information", "do not have enough information")
 
 
 @app.on_event("startup")
@@ -211,6 +213,16 @@ def reindex_block_reason(doc: dict, *, force: bool) -> tuple[str, str] | None:
     if doc.get("validation_state") == "auto_split":
         return "split_required", "Document is blocked for manual splitting; use force=true only if you want the worker to re-evaluate the same file"
     return None
+
+
+def is_transcript_like_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(keyword in lowered for keyword in TRANSCRIPT_QUERY_KEYWORDS)
+
+
+def has_weak_answer_signal(answer: str) -> bool:
+    lowered = answer.lower()
+    return any(marker in lowered for marker in WEAK_ANSWER_MARKERS)
 
 
 @app.get("/health", response_model=Envelope)
@@ -487,17 +499,54 @@ async def upload(file: UploadFile = File(...), company: str | None = Form(defaul
 @app.post("/query", response_model=Envelope, dependencies=[Depends(require_bearer)])
 async def query(req: QueryRequest):
     requested_company = normalize_company(req.company)
+    explicit_mode = req.mode is not None
+    retrieval_mode = req.mode or "hybrid"
+    transcript_like = is_transcript_like_query(req.query)
+    top_k = max(req.top_k, 24) if transcript_like else req.top_k
+
     result = await client.post_json(
         "/query",
         {
             "query": req.query,
-            "mode": req.mode,
-            "top_k": req.top_k,
+            "mode": retrieval_mode,
+            "top_k": top_k,
             "include_references": True,
             "include_chunk_content": True,
         },
     )
+    fallback_used = False
+    fallback_reason = None
+
+    answer = str(result.get("response", ""))
+    citation_count = len(result.get("references", []))
+    weak_reason = None
+    if citation_count < 2:
+        weak_reason = "citations_below_threshold"
+    elif has_weak_answer_signal(answer):
+        weak_reason = "weak_answer_signal"
+
+    if weak_reason and retrieval_mode != "bypass":
+        fallback_used = True
+        fallback_reason = weak_reason
+        retrieval_mode = "naive"
+        result = await client.post_json(
+            "/query",
+            {
+                "query": req.query,
+                "mode": retrieval_mode,
+                "top_k": top_k,
+                "include_references": True,
+                "include_chunk_content": True,
+            },
+        )
+
     citations, query_scope = await scope_query_citations(result.get("references", []), requested_company=requested_company)
+    query_scope["retrieval_mode_used"] = retrieval_mode
+    query_scope["fallback_used"] = fallback_used
+    query_scope["fallback_reason"] = fallback_reason
+    query_scope["explicit_mode"] = explicit_mode
+    query_scope["transcript_like_query"] = transcript_like
+    query_scope["top_k_used"] = top_k
     return ok({"answer": result.get("response", ""), "citations": citations, "query_scope": query_scope})
 
 
