@@ -23,6 +23,13 @@ from .multi_query import (
     parse_keywords_csv,
     should_trigger_multi_query,
 )
+from .graphrag import (
+    build_graph_metadata,
+    compute_adaptive_hops,
+    expand_graph_neighbors,
+    extract_entities_via_llm,
+    merge_graph_expansion,
+)
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -232,6 +239,17 @@ def is_transcript_like_query(query: str) -> bool:
 def has_weak_answer_signal(answer: str) -> bool:
     lowered = answer.lower()
     return any(marker in lowered for marker in WEAK_ANSWER_MARKERS)
+
+
+def get_top_retrieval_confidence(citations: list[dict[str, Any]]) -> float:
+    best = 0.0
+    for citation in citations:
+        for key in ("relevance_score", "score", "similarity"):
+            value = citation.get(key)
+            if isinstance(value, (int, float)):
+                best = max(best, float(value))
+                break
+    return best
 
 
 @app.get("/health", response_model=Envelope)
@@ -676,6 +694,85 @@ async def query(req: QueryRequest):
         else:
             merged_citations = all_citations_fallback
 
+    # ── GraphRAG adaptive expansion (after merge, before scope filter) ───
+    graph_enabled = settings.graph_expansion_enabled
+    graph_error = None
+    graph_applied = False
+    graph_seed_count = 0
+    graph_neighbor_count = 0
+    graph_hops_used = 0
+
+    if graph_enabled:
+        try:
+            # Extract entities from top seed citations
+            seed_count_cfg = settings.graph_seed_citation_count
+            seed_citations = merged_citations[:seed_count_cfg]
+            entities = await extract_entities_via_llm(
+                client, seed_citations, seed_count=seed_count_cfg
+            )
+            graph_seed_count = len(entities)
+
+            if entities:
+                # 1-hop expansion
+                max_neighbors_cfg = settings.graph_expansion_max_neighbors
+                configured_hops = settings.graph_expansion_hops
+                neighbors_1hop, err_1hop, hops_1 = await expand_graph_neighbors(
+                    client, entities, max_neighbors=max_neighbors_cfg, hops=1
+                )
+                graph_neighbor_count = len(neighbors_1hop)
+                graph_hops_used = 1
+                graph_error = err_1hop
+
+                if not err_1hop:
+                    # Merge 1-hop neighbors for adaptive hop decision
+                    merged_after_1hop = merge_graph_expansion(merged_citations, neighbors_1hop)
+
+                    # Compute scoped count for adaptive trigger (estimate without full scope)
+                    # Use total merged count as proxy for scoped count
+                    scoped_proxy_count = len(merged_after_1hop)
+
+                    # Compute adaptive hops
+                    target_hops = compute_adaptive_hops(
+                        graph_neighbor_count=graph_neighbor_count,
+                        scoped_citation_count=scoped_proxy_count,
+                        query_word_count=len(req.query.split()),
+                        is_transcript_like=transcript_like,
+                        rerank_top_score=get_top_retrieval_confidence(merged_after_1hop),
+                        configured_hops=configured_hops,
+                    )
+
+                    neighbors_2hop = []
+                    if target_hops >= 2:
+                        # Run 2-hop with remaining budget
+                        remaining_budget = max_neighbors_cfg - graph_neighbor_count
+                        if remaining_budget > 0:
+                            neighbors_2hop, err_2hop, hops_2 = await expand_graph_neighbors(
+                                client, entities, max_neighbors=remaining_budget, hops=1
+                            )
+                            graph_neighbor_count += len(neighbors_2hop)
+                            graph_hops_used = 2
+                            if err_2hop:
+                                graph_error = err_2hop
+
+                    # Final merge with all graph neighbors (1-hop + 2-hop)
+                    all_graph_neighbors = neighbors_1hop + neighbors_2hop
+                    merged_citations = merge_graph_expansion(merged_citations, all_graph_neighbors)
+                    graph_applied = True
+
+        except Exception as exc:
+            graph_error = str(exc)
+            # Fail-open: merged_citations unchanged
+
+    # Build graph metadata (always populated)
+    graph_meta = build_graph_metadata(
+        enabled=graph_enabled,
+        applied=graph_applied,
+        error=graph_error,
+        seed_count=graph_seed_count,
+        neighbor_count=graph_neighbor_count,
+        hops_used=graph_hops_used,
+    )
+
     # ── Apply scope filter, rerank, truncate on merged citations ────────
     final_citations, rerank_meta = await apply_scope_rerank_truncate(merged_citations, req.query)
 
@@ -714,6 +811,9 @@ async def query(req: QueryRequest):
         candidate_count_after_dedupe=total_after_dedupe,
     )
     query_scope.update(mq_meta)
+
+    # Add graph expansion metadata
+    query_scope.update(graph_meta)
 
     if requested_company is not None:
         query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"

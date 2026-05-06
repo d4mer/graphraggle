@@ -1,0 +1,28 @@
+{
+  "packet_id": "packet-14",
+  "version": 1,
+  "timestamp": "2026-05-06T12:00:00Z",
+  "author": "operator",
+  "config": {
+    "LIGHTRAG_BASE_URL": "http://lightrag-server:9621",
+    "RERANK_ENABLED": true,
+    "RERANK_BINDING_HOST": "http://192.168.1.180:1234/v1",
+    "RERANK_BINDING_API_KEY": null,
+    "RERANK_MODEL": null,
+    "MULTI_QUERY_ENABLED": true,
+    "MULTI_QUERY_LONG_QUERY_WORDS": 20,
+    "MULTI_QUERY_REWRITE_COUNT": 2,
+    "MULTI_QUERY_TRANSCRIPT_KEYWORDS": "transcript,workshop,speaker,meeting minutes,recording",
+    "REQUEST_TIMEOUT_SECONDS": 300
+  },
+  "metrics": {
+    "mean_rubric_score": 0.0,
+    "p50_latency_ms": 0,
+    "p95_latency_ms": 0,
+    "grounded_rate": 0.0,
+    "fact_consistent_rate": 0.0,
+    "complete_rate": 0.0,
+    "total_queries": 0,
+    "parse_failures": 0
+  }
+}

@@ -34,5 +34,10 @@ class Settings(BaseSettings):
         alias="MULTI_QUERY_TRANSCRIPT_KEYWORDS",
     )
 
+    graph_expansion_enabled: bool = Field(default=False, alias="GRAPH_EXPANSION_ENABLED")
+    graph_expansion_hops: int = Field(default=1, alias="GRAPH_EXPANSION_HOPS")
+    graph_expansion_max_neighbors: int = Field(default=10, alias="GRAPH_EXPANSION_MAX_NEIGHBORS")
+    graph_seed_citation_count: int = Field(default=3, alias="GRAPH_SEED_CITATION_COUNT")
+
 
 settings = Settings()

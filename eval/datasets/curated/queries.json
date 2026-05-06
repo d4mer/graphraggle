@@ -1,0 +1,50 @@
+[
+  {
+    "id": "q001",
+    "query": "What is the Q3 revenue guidance for the semiconductor division?",
+    "expected_topics": ["revenue", "Q3", "semiconductor", "guidance"],
+    "category": "financial"
+  },
+  {
+    "id": "q002",
+    "query": "Summarize the key decisions from the April 2026 board meeting transcript",
+    "expected_topics": ["board meeting", "April 2026", "decisions"],
+    "category": "transcript"
+  },
+  {
+    "id": "q003",
+    "query": "Compare the risk factors listed in the 10-K filing versus the Q2 earnings release",
+    "expected_topics": ["risk factors", "10-K", "Q2 earnings"],
+    "category": "comparison"
+  },
+  {
+    "id": "q004",
+    "query": "Who are the named executives in the proxy statement and what are their compensation packages?",
+    "expected_topics": ["executives", "proxy statement", "compensation"],
+    "category": "governance"
+  },
+  {
+    "id": "q005",
+    "query": "What supply chain disruptions were mentioned in the last two earnings calls?",
+    "expected_topics": ["supply chain", "disruptions", "earnings calls"],
+    "category": "operations"
+  },
+  {
+    "id": "q006",
+    "query": "List all material contracts disclosed in the latest SEC filing",
+    "expected_topics": ["material contracts", "SEC filing"],
+    "category": "legal"
+  },
+  {
+    "id": "q007",
+    "query": "What are the ESG commitments mentioned in the annual sustainability report?",
+    "expected_topics": ["ESG", "sustainability", "commitments"],
+    "category": "esg"
+  },
+  {
+    "id": "q008",
+    "query": "Extract the R&D spend trend over the past 5 years from the 10-K filings",
+    "expected_topics": ["R&D", "spend", "5-year trend", "10-K"],
+    "category": "financial"
+  }
+]

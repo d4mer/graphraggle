@@ -2,6 +2,32 @@
 
 ## 2026-05-06
 
+### Packet 16: GraphRAG Adaptive Expansion
+
+1. Added config settings `GRAPH_EXPANSION_ENABLED` (bool, default false), `GRAPH_EXPANSION_HOPS` (int, default 1), `GRAPH_EXPANSION_MAX_NEIGHBORS` (int, default 10), and `GRAPH_SEED_CITATION_COUNT` (int, default 3) to `app/config.py`.
+2. Created `app/graphrag.py` as a deep module with pure graph helper functions: `citation_to_text_for_entity_extraction`, `extract_entities_via_llm`, `expand_graph_neighbors`, `merge_graph_expansion`, `compute_adaptive_hops`, and `build_graph_metadata`.
+3. Wired graph expansion into the gateway `/query` endpoint: after merged_citations computed (single or multi-query), extract entities from top `GRAPH_SEED_CITATION_COUNT` citations via LLM bypass, run 1-hop expansion, evaluate adaptive triggers for 2-hop escalation (neighbors < 4 OR scoped citations < 3 OR complex query + low rerank score < 0.15), merge graph pseudo-citations into merged_citations, then existing scope -> rerank -> top-5 path. Fail-open on any graph extraction/expansion failure.
+4. Added six `query_scope` metadata fields: `graph_expansion_enabled`, `graph_expansion_applied`, `graph_expansion_error`, `graph_seed_count`, `graph_neighbor_count`, `graph_hops_used`.
+5. Preserved existing multi-query/rerank/fallback behavior unchanged.
+6. Added 47 unittest-style tests under `tests/test_graphrag.py` covering: entity extraction parse success/malformed fail-open, adaptive hop escalation rules, neighbor cap and remaining-budget for hop2, merge/dedupe stability, metadata fields, config defaults, and integration flow placement.
+
+## 2026-05-06
+
+### Packet 15: Eval Harness and Auto Gates
+
+1. Created `docs/packets/15-eval-harness-and-auto-gates.md` with locked decisions: hybrid eval dataset (curated + anonymized production samples), automated scoring with human spot-review for borderline runs, multi-query gate thresholds (quality lift >= 8%, p95 latency increase <= 20%), baselines versioned in repo JSON, CI + operator-triggered model, borderline criteria (quality delta ±2% of threshold, p95 latency ±3% of threshold, >10% parse/rubric failures), rubric fields per query (grounded, fact_consistent, complete 0/1), deterministic local anonymization, A/B in one invocation, on-fail explicit criteria with rollback recommendation.
+2. Created `eval/` directory tree: `eval/datasets/curated/queries.json` (8 curated queries), `eval/datasets/production-samples/README.md` (anonymization workflow doc), `eval/baselines/packet-13.json` and `eval/baselines/packet-14.json` (versioned baseline JSON with config snapshot and metrics schema), `eval/baselines/SCHEMA.md` (baseline file schema documentation), `eval/README.md` (A/B run and promotion workflow documentation).
+3. Created `scripts/eval_run.sh` (executable A/B runner entrypoint): reads query set, calls gateway `/query` for each query under baseline and candidate configs in one invocation, captures per-query latency, writes JSON report to `docs/ops/runs/packet-15-eval-report.json` and markdown summary to `docs/ops/runs/packet-15-eval-summary.md`.
+4. Created `scripts/eval_gate.py` (gate evaluation): computes quality lift and p95 latency increase, evaluates thresholds (>=8% quality lift, <=20% latency increase), detects borderline conditions, outputs pass/fail verdict with rollback hints.
+5. Created `scripts/eval_anonymize_samples.py` (deterministic anonymization): replaces emails, phones, SSNs, IPs, and multi-word names with fixed-salt SHA-256 hashed placeholders; same input always produces same output; no network calls.
+6. Created `scripts/eval_score.py` (rubric scoring): parses model-judge structured JSON output, applies heuristic fallback for CI without judge access, aggregates per-configuration mean rubric score and per-field pass rates.
+7. Added 35 unittest-based tests in `tests/test_eval_gate.py` covering threshold logic, borderline detection, fail handling, rollback recommendations, and edge cases.
+8. Added 17 unittest-based tests in `tests/test_eval_anonymize.py` covering deterministic obfuscation, PII pattern replacement, determinism verification, and file I/O.
+9. Added 24 unittest-based tests in `tests/test_eval_score.py` covering judge output parsing, heuristic scoring, rubric aggregation, parse failure handling, and report scoring.
+10. Documented CI integration pattern in `eval/README.md` for automated and manual gate evaluation runs.
+
+## 2026-05-06
+
 ### Packet 14: Multi-Query Expansion
 
 1. Added config settings `MULTI_QUERY_ENABLED` (bool, default false), `MULTI_QUERY_LONG_QUERY_WORDS` (int, default 20), `MULTI_QUERY_REWRITE_COUNT` (int, default 2), and `MULTI_QUERY_TRANSCRIPT_KEYWORDS` (csv string, default matching existing transcript keywords) to `app/config.py`.
