@@ -24,5 +24,13 @@ class Settings(BaseSettings):
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
 
+    multi_query_enabled: bool = Field(default=False, alias="MULTI_QUERY_ENABLED")
+    multi_query_long_query_words: int = Field(default=20, alias="MULTI_QUERY_LONG_QUERY_WORDS")
+    multi_query_rewrite_count: int = Field(default=2, alias="MULTI_QUERY_REWRITE_COUNT")
+    multi_query_transcript_keywords: str = Field(
+        default="transcript,workshop,speaker,meeting minutes,recording",
+        alias="MULTI_QUERY_TRANSCRIPT_KEYWORDS",
+    )
+
 
 settings = Settings()

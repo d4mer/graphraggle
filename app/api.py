@@ -15,6 +15,14 @@ from .config import settings
 from .generation import generate_document
 from .lightrag_client import client
 from .models import Envelope, GenerateDocumentRequest, QueryRequest, ReindexRequest
+from .multi_query import (
+    build_multi_query_metadata,
+    generate_rewrites_via_bypass,
+    has_weak_answer_signal,
+    merge_and_dedupe_citations,
+    parse_keywords_csv,
+    should_trigger_multi_query,
+)
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -505,11 +513,18 @@ async def query(req: QueryRequest):
     transcript_like = is_transcript_like_query(req.query)
     top_k = max(req.top_k, 24) if transcript_like else req.top_k
 
-    async def execute_query_pass(mode: str) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any], str | None]:
+    # Parse transcript keywords for multi-query trigger
+    mq_transcript_keywords = parse_keywords_csv(settings.multi_query_transcript_keywords)
+
+    async def execute_query_pass(
+        mode: str,
+        query_text: str,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any], str | None]:
+        """Execute a single retrieval pass and return (answer, citations, query_scope, rerank_meta, weak_reason)."""
         result = await client.post_json(
             "/query",
             {
-                "query": req.query,
+                "query": query_text,
                 "mode": mode,
                 "top_k": top_k,
                 "include_references": True,
@@ -517,53 +532,187 @@ async def query(req: QueryRequest):
             },
         )
         answer = str(result.get("response", ""))
-        citations, query_scope = await scope_query_citations(result.get("references", []), requested_company=requested_company)
+        # For multi-query, scope is applied after merge, so we return raw references
+        # The scope_flag indicates whether to scope now or later
+        citations_raw = result.get("references", [])
+        # Return raw citations without scoping for multi-query merge
+        # The caller will decide whether to scope
+        answer_only = answer
 
         rerank_meta: dict[str, Any] = {
             "rerank_enabled": settings.rerank_enabled and settings.rerank_binding_host is not None,
             "rerank_applied": False,
             "rerank_error": None,
-            "rerank_input_count": len(citations),
+            "rerank_input_count": 0,
             "rerank_output_count": 0,
         }
-        if settings.rerank_enabled and settings.rerank_binding_host:
-            reranked_citations, rerank_meta = await rerank_citations(req.query, citations, settings.rerank_binding_host)
-            if rerank_meta.get("rerank_applied"):
-                citations = reranked_citations
 
-        citations = truncate_citations(citations, top_k=RERANK_TOP_K)
-
+        # Compute weak signal for trigger decision
         weak_reason = None
-        if len(citations) < 2:
+        if len(citations_raw) < 2:
             weak_reason = "citations_below_threshold"
         elif has_weak_answer_signal(answer):
             weak_reason = "weak_answer_signal"
 
-        return answer, citations, query_scope, rerank_meta, weak_reason
+        return answer_only, citations_raw, {}, rerank_meta, weak_reason
+
+    async def apply_scope_rerank_truncate(
+        citations: list[dict[str, Any]],
+        query_text: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Apply company scope filter, rerank, and top-5 truncation."""
+        scoped_citations, query_scope = await scope_query_citations(citations, requested_company=requested_company)
+
+        rerank_meta: dict[str, Any] = {
+            "rerank_enabled": settings.rerank_enabled and settings.rerank_binding_host is not None,
+            "rerank_applied": False,
+            "rerank_error": None,
+            "rerank_input_count": len(scoped_citations),
+            "rerank_output_count": 0,
+        }
+        if settings.rerank_enabled and settings.rerank_binding_host:
+            reranked_citations, rerank_meta = await rerank_citations(query_text, scoped_citations, settings.rerank_binding_host)
+            if rerank_meta.get("rerank_applied"):
+                scoped_citations = reranked_citations
+
+        scoped_citations = truncate_citations(scoped_citations, top_k=RERANK_TOP_K)
+        return scoped_citations, rerank_meta
 
     fallback_used = False
     fallback_reason = None
 
-    answer, citations, query_scope, rerank_meta, weak_reason = await execute_query_pass(retrieval_mode)
+    # ── First pass: original query ──────────────────────────────────────
+    answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
 
-    if weak_reason and retrieval_mode != "bypass":
+    # Compute weak signal from first pass
+    first_weak_signal = first_weak_reason is not None
+
+    # ── Multi-query trigger decision ────────────────────────────────────
+    mq_enabled = settings.multi_query_enabled
+    mq_triggered = False
+    mq_trigger_reason = "none"
+    mq_error = None
+    mq_rewrite_count = 0
+
+    if mq_enabled:
+        mq_triggered, mq_trigger_reason = should_trigger_multi_query(
+            req.query,
+            transcript_keywords=mq_transcript_keywords,
+            long_query_words=settings.multi_query_long_query_words,
+            weak_signal=first_weak_signal,
+        )
+
+    # ── Multi-query expansion (if triggered and enabled) ────────────────
+    merged_citations = all_citations  # default: single-query path
+
+    if mq_triggered:
+        groups = [all_citations]
+        total_before_dedupe = len(all_citations)
+        total_after_dedupe = len(all_citations)
+
+        # Generate rewrites via bypass mode
+        rewrites = await generate_rewrites_via_bypass(
+            client,
+            req.query,
+            settings.multi_query_rewrite_count,
+        )
+        mq_rewrite_count = len(rewrites)
+
+        if rewrites:
+            # Retrieve citations for each rewrite
+            for rw_query in rewrites:
+                try:
+                    _, rw_citations, _, _, _ = await execute_query_pass(retrieval_mode, rw_query)
+                    groups.append(rw_citations)
+                except Exception:
+                    mq_error = "rewrite_retrieval_failed"
+                    break
+            if mq_error:
+                # Fail open to original single-query path
+                merged_citations = all_citations
+                total_before_dedupe = len(all_citations)
+                total_after_dedupe = len(all_citations)
+            else:
+                # Merge and dedupe citations (stable order: original -> rewrite1 -> rewrite2)
+                total_before_dedupe = sum(len(g) for g in groups)
+                merged_citations = merge_and_dedupe_citations(groups)
+                total_after_dedupe = len(merged_citations)
+        else:
+            mq_error = "rewrite_generation_failed"
+            # Fail open to original single-query path
+            merged_citations = all_citations
+            total_before_dedupe = len(all_citations)
+            total_after_dedupe = len(all_citations)
+    else:
+        total_before_dedupe = len(all_citations)
+        total_after_dedupe = len(all_citations)
+
+    # ── Fallback logic (only for single-query or fail-open path) ────────
+    weak_reason = None
+    if first_weak_reason and retrieval_mode != "bypass":
         fallback_used = True
-        fallback_reason = weak_reason
+        fallback_reason = first_weak_reason
         retrieval_mode = "naive"
-        answer, citations, query_scope, rerank_meta, _ = await execute_query_pass(retrieval_mode)
+        # Re-run first pass with naive mode
+        answer, all_citations_fallback, _, _, _ = await execute_query_pass(retrieval_mode, req.query)
+        # If multi-query was triggered, re-merge with fallback
+        if mq_triggered and not mq_error:
+            groups_fallback = [all_citations_fallback]
+            for rw_query in (rewrites if rewrites else []):
+                try:
+                    _, rw_citations, _, _, _ = await execute_query_pass(retrieval_mode, rw_query)
+                    groups_fallback.append(rw_citations)
+                except Exception:
+                    mq_error = "rewrite_retrieval_failed"
+                    groups_fallback.append([])
+                    break
+            merged_citations = merge_and_dedupe_citations(groups_fallback)
+        else:
+            merged_citations = all_citations_fallback
 
-    query_scope["retrieval_mode_used"] = retrieval_mode
-    query_scope["fallback_used"] = fallback_used
-    query_scope["fallback_reason"] = fallback_reason
-    query_scope["explicit_mode"] = explicit_mode
-    query_scope["transcript_like_query"] = transcript_like
-    query_scope["top_k_used"] = top_k
-    query_scope["rerank_enabled"] = rerank_meta["rerank_enabled"]
-    query_scope["rerank_applied"] = rerank_meta["rerank_applied"]
-    query_scope["rerank_error"] = rerank_meta["rerank_error"]
-    query_scope["rerank_input_count"] = rerank_meta["rerank_input_count"]
-    query_scope["rerank_output_count"] = rerank_meta["rerank_output_count"]
-    return ok({"answer": answer, "citations": citations, "query_scope": query_scope})
+    # ── Apply scope filter, rerank, truncate on merged citations ────────
+    final_citations, rerank_meta = await apply_scope_rerank_truncate(merged_citations, req.query)
+
+    # ── Build query_scope metadata ──────────────────────────────────────
+    query_scope: dict[str, Any] = {
+        "company": requested_company,
+        "mode": "company" if requested_company is not None else "unscoped",
+        "policy": {
+            "scoped_query_behavior": "exact_company_match_only" if requested_company is not None else "include_all_upstream_citations",
+            "unscoped_docs_in_scoped_queries": False,
+            "unscoped_docs_in_unscoped_queries": True,
+            "enforcement": "gateway_citation_filter" if requested_company is not None else "none",
+            "hard_multi_tenant_isolation": False,
+        },
+        "retrieval_mode_used": retrieval_mode,
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "explicit_mode": explicit_mode,
+        "transcript_like_query": transcript_like,
+        "top_k_used": top_k,
+        "rerank_enabled": rerank_meta["rerank_enabled"],
+        "rerank_applied": rerank_meta["rerank_applied"],
+        "rerank_error": rerank_meta["rerank_error"],
+        "rerank_input_count": rerank_meta["rerank_input_count"],
+        "rerank_output_count": rerank_meta["rerank_output_count"],
+    }
+
+    # Add multi-query metadata
+    mq_meta = build_multi_query_metadata(
+        enabled=mq_enabled,
+        triggered=mq_triggered,
+        trigger_reason=mq_trigger_reason,
+        rewrite_count=mq_rewrite_count,
+        error=mq_error,
+        candidate_count_before_dedupe=total_before_dedupe,
+        candidate_count_after_dedupe=total_after_dedupe,
+    )
+    query_scope.update(mq_meta)
+
+    if requested_company is not None:
+        query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
+
+    return ok({"answer": answer, "citations": final_citations, "query_scope": query_scope})
 
 
 @app.post("/generate-document", response_model=Envelope, dependencies=[Depends(require_bearer)])

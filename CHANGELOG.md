@@ -2,6 +2,18 @@
 
 ## 2026-05-06
 
+### Packet 14: Multi-Query Expansion
+
+1. Added config settings `MULTI_QUERY_ENABLED` (bool, default false), `MULTI_QUERY_LONG_QUERY_WORDS` (int, default 20), `MULTI_QUERY_REWRITE_COUNT` (int, default 2), and `MULTI_QUERY_TRANSCRIPT_KEYWORDS` (csv string, default matching existing transcript keywords) to `app/config.py`.
+2. Created `app/multi_query.py` as a deep module with pure multi-query helper functions: `should_trigger_multi_query`, `parse_keywords_csv`, `has_weak_answer_signal`, `generate_rewrites_via_bypass`, `merge_and_dedupe_citations`, `build_multi_query_metadata`, and `_normalize_citation_path`.
+3. Wired multi-query expansion into the gateway `/query` endpoint: first-pass retrieval with original query, deterministic trigger evaluation (long query word count, transcript keyword hit, weak first-pass signal), LLM-driven rewrite generation via LightRAG `/query` in bypass mode, per-rewrite retrieval, stable merge (original -> rewrite1 -> rewrite2), path-first then content-fallback deduplication, then company scope filter -> rerank -> top-5.
+4. Fail-open: rewrite generation or retrieval failure falls back to single-query original path with `multi_query_error` set in `query_scope` metadata.
+5. Added seven `query_scope` metadata fields: `multi_query_enabled`, `multi_query_triggered`, `multi_query_trigger_reason`, `multi_query_rewrite_count`, `multi_query_error`, `multi_query_candidate_count_before_dedupe`, `multi_query_candidate_count_after_dedupe`.
+6. Preserved existing transcript-like `top_k` expansion and fallback behavior unchanged.
+7. Added 42 unittest-style tests under `tests/test_multi_query.py` covering: trigger decisions, rewrite parsing robustness, stable merge + dedupe rules, fail-open metadata, config defaults, and integration-level metadata field presence/counts.
+
+## 2026-05-06
+
 ### Packet 13: Reranking Post-Scoping
 
 1. Added config settings `RERANK_ENABLED` (bool, default false) and `RERANK_BINDING_HOST` (optional URL) to `app/config.py`.
