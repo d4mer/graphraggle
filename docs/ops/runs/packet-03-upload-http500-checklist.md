@@ -12,42 +12,42 @@ Narrowly scoped verification: ensure the upload endpoint no longer returns HTTP 
 
 ## Pre-Run Prerequisites
 
-- [ ] Code changes deployed to macmini.local (via installer or direct file copy)
-- [ ] Containers rebuilt: `podman compose down && podman compose up -d --build`
-- [ ] Health check passes: `curl -fsS http://macmini.local:8000/health`
+- [x] Code changes deployed to macmini.local (via installer or direct file copy)
+- [x] Containers rebuilt: `podman compose down && podman compose up -d --build`
+- [x] Health check passes: `curl -fsS http://macmini.local:8000/health`
 
 ## Minimum Acceptance Conditions (One Live Rerun)
 
 ### 1. Supported Upload Works (No HTTP 500)
-- [ ] HTTP 200 returned for supported file upload (.txt, .md, .pdf, .docx, .csv, etc.)
-- [ ] Response contains `ok: true`
-- [ ] Response contains `original_filename` field
-- [ ] Document persisted to database with `original_filename` populated
+- [x] HTTP 200 returned for supported file upload (.txt, .md, .pdf, .docx, .csv, etc.)
+- [x] Response contains `ok: true`
+- [x] Response contains `original_filename` field
+- [x] Document persisted to database with `original_filename` populated
 
 ### 2. Reject Upload Works (No HTTP 500)
-- [ ] HTTP 200 (not 500) returned for unsupported file (.bin, .exe, etc.)
-- [ ] Response contains `ok: false`
-- [ ] Error envelope contains `error_code: unsupported_extension`
-- [ ] Rejection record persisted with `original_filename`
+- [x] HTTP 200 (not 500) returned for unsupported file (.bin, .exe, etc.)
+- [x] Response contains `ok: false`
+- [x] Error envelope contains `error_code: unsupported_extension`
+- [x] Rejection record persisted with `original_filename`
 
 ### 3. original_filename Persistence Intact
-- [ ] `original_filename` column exists in schema
-- [ ] Upload response returns `original_filename` field
-- [ ] `/documents` endpoint returns `original_filename` for uploaded docs
-- [ ] `/documents/{id}` endpoint returns `original_filename` for uploaded docs
+- [x] `original_filename` column exists in schema
+- [x] Upload response returns `original_filename` field
+- [x] `/documents` endpoint returns `original_filename` for uploaded docs
+- [x] `/documents/{id}` endpoint returns `original_filename` for uploaded docs
 
 ### 4. 5 Summary Slices Remain Intact
-- [ ] `/ingest/status` returns `by_status`
-- [ ] `/ingest/status` returns `by_validation_state`
-- [ ] `/ingest/status` returns `by_query_ready`
-- [ ] `/ingest/status` returns `by_error_stage`
-- [ ] `/ingest/status` returns `by_company`
+- [x] `/ingest/status` returns `by_status`
+- [x] `/ingest/status` returns `by_validation_state`
+- [x] `/ingest/status` returns `by_query_ready`
+- [x] `/ingest/status` returns `by_error_stage`
+- [x] `/ingest/status` returns `by_company`
 
 ### 5. No Packet 01/02 Behavior Regressed
-- [ ] Unsupported file rejection returns same error codes (`unsupported_extension`, `empty_file`)
-- [ ] Supported file returns same validation flow (pending → validating → accepted → submitted)
-- [ ] Worker lifecycle transitions unchanged
-- [ ] All 26 target fields present in API responses
+- [x] Unsupported file rejection returns same error codes (`unsupported_extension`, `empty_file`)
+- [x] Supported file returns same validation flow (pending → validating → accepted → submitted)
+- [x] Worker lifecycle transitions unchanged
+- [x] All 26 target fields present in API responses
 
 ## Live Verification Commands
 

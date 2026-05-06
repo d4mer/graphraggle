@@ -55,8 +55,8 @@ Added upload-time extension validation in the `/upload` endpoint. When a file wi
 ## Decision
 
 1. **[x]** `accepted` — if all acceptance checks pass
-2. `[ ]` `needs_changes` — if gap is not fully addressed
-3. `[ ]` `blocked` — if implementation breaks existing functionality
+2. **[x]** `needs_changes` — if gap is not fully addressed
+3. **[x]** `blocked` — if implementation breaks existing functionality
 
 ## Follow-Ups
 

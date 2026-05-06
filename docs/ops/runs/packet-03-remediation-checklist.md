@@ -12,39 +12,39 @@ Fix the missing `original_filename` field gap: the field is returned in upload r
 
 ## Pre-Run Prerequisites
 
-- [ ] Code changes deployed to macmini.local (via installer or direct file copy)
-- [ ] Containers rebuilt: `podman compose down && podman compose up -d --build`
-- [ ] Health check passes: `curl -fsS http://macmini.local:8000/health`
+- [x] Code changes deployed to macmini.local (via installer or direct file copy)
+- [x] Containers rebuilt: `podman compose down && podman compose up -d --build`
+- [x] Health check passes: `curl -fsS http://macmini.local:8000/health`
 
 ## Minimum Acceptance Conditions (One Live Rerun)
 
 ### 1. Database Schema Updated
-- [ ] `original_filename` column exists in `documents` table
-- [ ] Column is nullable (backward-compatible with existing rows)
-- [ ] Migration is idempotent (safe to run multiple times)
+- [x] `original_filename` column exists in `documents` table
+- [x] Column is nullable (backward-compatible with existing rows)
+- [x] Migration is idempotent (safe to run multiple times)
 
 ### 2. Upload Endpoint Behavior
-- [ ] **Accept case**: `original_filename` returned in response (existing behavior preserved)
-- [ ] **Warn case**: `original_filename` returned in response (existing behavior preserved)
-- [ ] **Auto-split case**: `original_filename` returned in response (existing behavior preserved)
-- [ ] **Reject case**: `original_filename` returned in error response data (NEW - gap closed)
+- [x] **Accept case**: `original_filename` returned in response (existing behavior preserved)
+- [x] **Warn case**: `original_filename` returned in response (existing behavior preserved)
+- [x] **Auto-split case**: `original_filename` returned in response (existing behavior preserved)
+- [x] **Reject case**: `original_filename` returned in error response data (NEW - gap closed)
 
 ### 3. Document Retrieval Endpoints
-- [ ] `/documents` returns `original_filename` for all documents
-- [ ] `/documents/{id}` returns `original_filename` for the requested document
-- [ ] Field is populated from stored database value (not just in-memory)
+- [x] `/documents` returns `original_filename` for all documents
+- [x] `/documents/{id}` returns `original_filename` for the requested document
+- [x] Field is populated from stored database value (not just in-memory)
 
 ### 4. Summary API Behavior (Packet 03 Verified)
-- [ ] `/ingest/status` returns all 5 summary slices: `by_status`, `by_validation_state`, `by_query_ready`, `by_error_stage`, `by_company`
-- [ ] Summary counts are accurate
-- [ ] No regression in response structure or envelope format
+- [x] `/ingest/status` returns all 5 summary slices: `by_status`, `by_validation_state`, `by_query_ready`, `by_error_stage`, `by_company`
+- [x] Summary counts are accurate
+- [x] No regression in response structure or envelope format
 
 ### 5. Previously Verified Packet 03 Behavior Intact
-- [ ] Upload rejection logic unchanged (same error codes, same response structure)
-- [ ] Upload warn/auto-split/accept logic unchanged
-- [ ] Worker lifecycle transitions unchanged
-- [ ] All 26 target fields present in API responses (including the 9 new nullable columns)
-- [ ] `byte_size` and `ingested_at` populated correctly
+- [x] Upload rejection logic unchanged (same error codes, same response structure)
+- [x] Upload warn/auto-split/accept logic unchanged
+- [x] Worker lifecycle transitions unchanged
+- [x] All 26 target fields present in API responses (including the 9 new nullable columns)
+- [x] `byte_size` and `ingested_at` populated correctly
 
 ## Live Verification Commands
 
