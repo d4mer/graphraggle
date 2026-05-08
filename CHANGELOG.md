@@ -40,6 +40,10 @@
 
 ## 2026-05-06
 
+### Packet 20: Graph-Aware Answer Synthesis
+
+1. Added a graph-aware synthesis stage that can build answers from the fused vector + graph evidence channel with fail-open behavior.
+
 ### Packet 19: Graph Evidence Fusion
 
 1. Added provenance-preserving fusion of vector citations and graph-native evidence into a deterministic `combined_evidence` response field.

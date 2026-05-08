@@ -33,6 +33,7 @@ from .graphrag import (
 )
 from .graph_native import build_graph_native_metadata, fetch_graph_native_evidence
 from .graph_fusion import fuse_graph_and_vector_evidence
+from .graph_synthesis import synthesize_graph_aware_answer
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -864,6 +865,19 @@ async def query(req: QueryRequest):
     )
 
     combined_evidence = fuse_graph_and_vector_evidence(final_citations, graph_evidence)
+
+    graph_synthesis_applied = False
+    graph_synthesis_error = None
+    if graph_native_applied and combined_evidence:
+        synthesized_answer, graph_synthesis_error = await synthesize_graph_aware_answer(client, req.query, combined_evidence)
+        if synthesized_answer:
+            answer = synthesized_answer
+            graph_synthesis_applied = True
+
+    query_scope.update({
+        "graph_synthesis_applied": graph_synthesis_applied,
+        "graph_synthesis_error": graph_synthesis_error,
+    })
 
     if requested_company is not None:
         query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
