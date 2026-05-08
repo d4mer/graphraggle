@@ -40,6 +40,14 @@
 
 ## 2026-05-06
 
+### Packet 22: Graph-Specific Eval Slice
+
+1. Added a graph-specific, domain-matched eval dataset for graph-shaped logistics/process questions.
+
+### Packet 21: Graph Query Routing
+
+1. Added explicit graph route metadata to `/query` so graph-shaped and standard questions are distinguishable.
+
 ### Packet 20: Graph-Aware Answer Synthesis
 
 1. Added a graph-aware synthesis stage that can build answers from the fused vector + graph evidence channel with fail-open behavior.

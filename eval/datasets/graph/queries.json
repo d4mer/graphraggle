@@ -1,0 +1,38 @@
+[
+  {
+    "id": "g001",
+    "query": "How does the workshop connect firm horizon, cancellation windows, and mode of transport?",
+    "expected_topics": ["firm horizon", "cancellation windows", "mode of transport", "relationship"],
+    "category": "graph-transcript"
+  },
+  {
+    "id": "g002",
+    "query": "What relationship is described between Code Orange feedback and planned goods receipt dates?",
+    "expected_topics": ["Code Orange", "planned goods receipt date", "feedback loop", "relationship"],
+    "category": "graph-integration"
+  },
+  {
+    "id": "g003",
+    "query": "How are SCIM, dashboards, and CAPA connected in the exception management discussion?",
+    "expected_topics": ["SCIM", "dashboards", "CAPA", "exception management"],
+    "category": "graph-operations"
+  },
+  {
+    "id": "g004",
+    "query": "What dependency chain was discussed between eCommit, manual trigger, and shipment planning?",
+    "expected_topics": ["eCommit", "manual trigger", "shipment planning", "dependency chain"],
+    "category": "graph-process"
+  },
+  {
+    "id": "g005",
+    "query": "How are consolidation hubs, direct shipment, and container utilization related in the workshop notes?",
+    "expected_topics": ["consolidation hub", "direct shipment", "container utilization", "relationship"],
+    "category": "graph-logistics"
+  },
+  {
+    "id": "g006",
+    "query": "What link was made between CMO scope, interim phase, and S4 transition concerns?",
+    "expected_topics": ["CMO", "interim phase", "S4 transition", "scope linkage"],
+    "category": "graph-transition"
+  }
+]

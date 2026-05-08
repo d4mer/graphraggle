@@ -264,6 +264,10 @@ def is_graph_native_target(query: str) -> bool:
     return is_graph_expansion_target(query)
 
 
+def classify_graph_route(query: str) -> str:
+    return "graph" if is_graph_native_target(query) else "standard"
+
+
 def has_weak_answer_signal(answer: str) -> bool:
     lowered = answer.lower()
     return any(marker in lowered for marker in WEAK_ANSWER_MARKERS)
@@ -794,13 +798,14 @@ async def query(req: QueryRequest):
     )
 
     graph_native_enabled = settings.graph_native_enabled
+    graph_native_route = classify_graph_route(req.query)
     graph_native_applied = False
     graph_native_error = None
     graph_native_seed_labels: list[str] = []
     graph_native_result_count = 0
     graph_evidence: list[dict[str, Any]] = []
 
-    if graph_native_enabled and is_graph_native_target(req.query):
+    if graph_native_enabled and graph_native_route == "graph":
         graph_evidence, graph_native_error, graph_native_seed_labels = await fetch_graph_native_evidence(
             client,
             req.query,
@@ -863,6 +868,7 @@ async def query(req: QueryRequest):
             result_count=graph_native_result_count,
         )
     )
+    query_scope["graph_native_route"] = graph_native_route
 
     combined_evidence = fuse_graph_and_vector_evidence(final_citations, graph_evidence)
 

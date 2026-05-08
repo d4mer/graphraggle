@@ -15,6 +15,7 @@ This directory contains assets for the A/B evaluation harness (Packet 15):
 The eval uses a hybrid dataset:
 
 - **Curated queries**: Hand-authored queries in `datasets/curated/queries.json`.
+- **Graph-specific queries**: Graph-shaped domain questions in `datasets/graph/queries.json`.
 - **Production samples**: Anonymized queries in `datasets/production-samples/`.
 
 To add production samples:
@@ -40,6 +41,12 @@ The runner:
 4. Captures per-query: answer, citations, latency (ms), metadata.
 5. Writes machine-readable report to `docs/ops/runs/packet-15-eval-report.json`.
 6. Writes human-readable summary to `docs/ops/runs/packet-15-eval-summary.md`.
+
+For GraphRAG promotion, use the graph-specific dataset first:
+
+```bash
+QUERY_SET=eval/datasets/graph/queries.json ./scripts/eval_run.sh
+```
 
 ### 3. Score Results
 
