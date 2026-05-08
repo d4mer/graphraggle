@@ -40,6 +40,11 @@
 
 ## 2026-05-06
 
+### Packet 18: Graph Observability And Safety
+
+1. Added dedicated graph-native metadata construction for `/query` responses.
+2. Standardized graph-native enabled/applied/error/seed/result metadata for safer rollout diagnostics.
+
 ### Packet 17: Graph-Native Retrieval Tracer Bullet
 
 1. Added `app/graph_native.py` with bounded LightRAG native graph label search and graph fetch helpers.

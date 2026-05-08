@@ -105,3 +105,20 @@ async def fetch_graph_native_evidence(
         return evidence, None, seed_labels
     except Exception as exc:
         return [], str(exc), []
+
+
+def build_graph_native_metadata(
+    *,
+    enabled: bool,
+    applied: bool,
+    error: str | None,
+    seed_labels: list[str],
+    result_count: int,
+) -> dict[str, Any]:
+    return {
+        "graph_native_enabled": enabled,
+        "graph_native_applied": applied,
+        "graph_native_error": error,
+        "graph_native_seed_labels": seed_labels,
+        "graph_native_result_count": result_count,
+    }

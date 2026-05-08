@@ -31,7 +31,7 @@ from .graphrag import (
     filter_graph_neighbors_for_query,
     merge_graph_expansion,
 )
-from .graph_native import fetch_graph_native_evidence
+from .graph_native import build_graph_native_metadata, fetch_graph_native_evidence
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -853,13 +853,13 @@ async def query(req: QueryRequest):
     # Add graph expansion metadata
     query_scope.update(graph_meta)
     query_scope.update(
-        {
-            "graph_native_enabled": graph_native_enabled,
-            "graph_native_applied": graph_native_applied,
-            "graph_native_error": graph_native_error,
-            "graph_native_seed_labels": graph_native_seed_labels,
-            "graph_native_result_count": graph_native_result_count,
-        }
+        build_graph_native_metadata(
+            enabled=graph_native_enabled,
+            applied=graph_native_applied,
+            error=graph_native_error,
+            seed_labels=graph_native_seed_labels,
+            result_count=graph_native_result_count,
+        )
     )
 
     if requested_company is not None:

@@ -40,6 +40,20 @@ class TestGraphNativeHelpers(unittest.TestCase):
         self.assertIn("chunk-1", out["provenance"])
         self.assertIn("/docs/a.txt", out["provenance"])
 
+    def test_build_graph_native_metadata(self):
+        meta = gn.build_graph_native_metadata(
+            enabled=True,
+            applied=False,
+            error="graph_native_query_family_skipped",
+            seed_labels=["Firm Horizon"],
+            result_count=0,
+        )
+        self.assertTrue(meta["graph_native_enabled"])
+        self.assertFalse(meta["graph_native_applied"])
+        self.assertEqual(meta["graph_native_error"], "graph_native_query_family_skipped")
+        self.assertEqual(meta["graph_native_seed_labels"], ["Firm Horizon"])
+        self.assertEqual(meta["graph_native_result_count"], 0)
+
 
 class TestFetchGraphNativeEvidence(unittest.TestCase):
     def test_fail_open_on_client_error(self):
