@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import scripts.eval_score as score_module
@@ -244,6 +245,124 @@ class TestScoreReport(unittest.TestCase):
             "candidate_errors": 0,
             "results": results,
         }
+
+
+class TestJudgeModelScoring(unittest.TestCase):
+    def _make_report(self, with_judge=False):
+        results = []
+        judge_out = {
+            "grounded": 1,
+            "fact_consistent": 0,
+            "complete": 1,
+            "reasoning": "partial",
+        }
+        for i in range(4):
+            r = {
+                "query_id": f"q{i+1}",
+                "query": f"Query {i+1}",
+                "category": "test",
+                "baseline": {
+                    "latency_ms": 1000 + i * 100,
+                    "answer": f"Baseline answer {i+1}",
+                    "citation_count": 3,
+                    "error": None,
+                },
+                "candidate": {
+                    "latency_ms": 1100 + i * 100,
+                    "answer": f"Candidate answer {i+1}",
+                    "citation_count": 4,
+                    "error": None,
+                },
+            }
+            if with_judge:
+                r["baseline"]["judge_output"] = judge_out
+            results.append(r)
+
+        return {
+            "run_id": "packet-15",
+            "baseline_env": "baseline",
+            "candidate_env": "candidate",
+            "total_queries": 4,
+            "baseline_errors": 0,
+            "candidate_errors": 0,
+            "results": results,
+        }
+
+    def _write_temp(self, report: dict) -> str:
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(report, f)
+            return path
+        except:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
+
+    def test_judge_model_success(self):
+        payload = {
+            "choices": [
+                {"message": {"content": '{"grounded":1,"fact_consistent":1,"complete":0,"reason":"ok"}'}}
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_resp
+        mock_ctx.__exit__.return_value = False
+
+        with patch.dict(os.environ, {
+            "EVAL_JUDGE_ENABLED": "true",
+            "EVAL_JUDGE_URL": "http://judge.local/v1",
+            "EVAL_JUDGE_MODEL": "judge-model",
+            "EVAL_JUDGE_API_KEY": "1234",
+        }, clear=False), patch("scripts.eval_score.urllib.request.urlopen", return_value=mock_ctx):
+            out = score_module.score_with_judge_model("q", "a", [{"content": "c"}])
+        self.assertIsNotNone(out)
+        self.assertEqual(out["method"], "judge_model")
+        self.assertEqual(out["rubric_score"], round((1 + 1 + 0) / 3, 4))
+
+    def test_judge_model_fallback_none_on_bad_payload(self):
+        payload = {"choices": [{"message": {"content": "not-json"}}]}
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_resp
+        mock_ctx.__exit__.return_value = False
+        with patch.dict(os.environ, {
+            "EVAL_JUDGE_ENABLED": "true",
+            "EVAL_JUDGE_URL": "http://judge.local/v1",
+            "EVAL_JUDGE_MODEL": "judge-model",
+        }, clear=False), patch("scripts.eval_score.urllib.request.urlopen", return_value=mock_ctx):
+            out = score_module.score_with_judge_model("q", "a", [{"content": "c"}])
+        self.assertIsNone(out)
+
+    def test_judge_prompt_includes_expected_topics(self):
+        payload = {
+            "choices": [
+                {"message": {"content": '{"grounded":1,"fact_consistent":1,"complete":1,"reason":"ok"}'}}
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_resp
+        mock_ctx.__exit__.return_value = False
+        captured = {}
+
+        def fake_urlopen(req, timeout=60):
+            captured["body"] = req.data.decode("utf-8")
+            return mock_ctx
+
+        with patch.dict(os.environ, {
+            "EVAL_JUDGE_ENABLED": "true",
+            "EVAL_JUDGE_URL": "http://judge.local/v1",
+            "EVAL_JUDGE_MODEL": "judge-model",
+        }, clear=False), patch("scripts.eval_score.urllib.request.urlopen", side_effect=fake_urlopen):
+            out = score_module.score_with_judge_model("query", "answer", [{"content": "citation"}], ["topic-a", "topic-b"])
+        self.assertIsNotNone(out)
+        self.assertIn("topic-a", captured["body"])
+        self.assertIn("topic-b", captured["body"])
 
     def test_scored_field_added(self):
         """Scored field is added to each result."""

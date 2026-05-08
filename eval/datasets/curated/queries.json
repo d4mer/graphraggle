@@ -1,50 +1,74 @@
 [
   {
     "id": "q001",
-    "query": "What is the Q3 revenue guidance for the semiconductor division?",
-    "expected_topics": ["revenue", "Q3", "semiconductor", "guidance"],
-    "category": "financial"
-  },
-  {
-    "id": "q002",
-    "query": "Summarize the key decisions from the April 2026 board meeting transcript",
-    "expected_topics": ["board meeting", "April 2026", "decisions"],
+    "query": "Summarize the main discussion points about firm horizon in the logistics workshop transcripts.",
+    "expected_topics": ["firm horizon", "mode of transport", "booking timing", "cancellation windows"],
     "category": "transcript"
   },
   {
+    "id": "q002",
+    "query": "What is eCommit and how is it used in the current pharma shipment planning process?",
+    "expected_topics": ["eCommit", "manual trigger", "shipment planning", "pickup date"],
+    "category": "process"
+  },
+  {
     "id": "q003",
-    "query": "Compare the risk factors listed in the 10-K filing versus the Q2 earnings release",
-    "expected_topics": ["risk factors", "10-K", "Q2 earnings"],
-    "category": "comparison"
+    "query": "What feedback is sent back to GSK through Code Orange or related interfaces?",
+    "expected_topics": ["Code Orange", "feedback loop", "shipment milestones", "planned goods receipt date"],
+    "category": "integration"
   },
   {
     "id": "q004",
-    "query": "Who are the named executives in the proxy statement and what are their compensation packages?",
-    "expected_topics": ["executives", "proxy statement", "compensation"],
-    "category": "governance"
+    "query": "How are exceptions and deviations managed today according to the logistics discussions?",
+    "expected_topics": ["SCIM", "deviations", "dashboards", "CAPA", "governance"],
+    "category": "operations"
   },
   {
     "id": "q005",
-    "query": "What supply chain disruptions were mentioned in the last two earnings calls?",
-    "expected_topics": ["supply chain", "disruptions", "earnings calls"],
+    "query": "What is the role of consolidation hubs in the current logistics process?",
+    "expected_topics": ["consolidation hub", "container utilization", "direct shipment", "scope"],
     "category": "operations"
   },
   {
     "id": "q006",
-    "query": "List all material contracts disclosed in the latest SEC filing",
-    "expected_topics": ["material contracts", "SEC filing"],
-    "category": "legal"
+    "query": "What did the workshop say about CMOs being in or out of scope?",
+    "expected_topics": ["CMO", "out of scope", "phasing", "future phase"],
+    "category": "scope"
   },
   {
     "id": "q007",
-    "query": "What are the ESG commitments mentioned in the annual sustainability report?",
-    "expected_topics": ["ESG", "sustainability", "commitments"],
-    "category": "esg"
+    "query": "How does the proposal distinguish optimization horizon from firm horizon?",
+    "expected_topics": ["optimization horizon", "firm horizon", "pre-booking", "automatic firming"],
+    "category": "process"
   },
   {
     "id": "q008",
-    "query": "Extract the R&D spend trend over the past 5 years from the 10-K filings",
-    "expected_topics": ["R&D", "spend", "5-year trend", "10-K"],
-    "category": "financial"
+    "query": "What did participants say about using AI tools in the optimization horizon?",
+    "expected_topics": ["AI tools", "optimization horizon", "message enrichment", "accuracy"],
+    "category": "ai"
+  },
+  {
+    "id": "q009",
+    "query": "What existing dashboards or controls were mentioned for monitoring deviations and exceptions?",
+    "expected_topics": ["ControlLog", "CST dashboard", "deviations", "missing data", "PFA"],
+    "category": "dashboard"
+  },
+  {
+    "id": "q010",
+    "query": "What were the key concerns about changing the process before S4 is fully in place?",
+    "expected_topics": ["interim phase", "S4 transition", "change management", "process stability"],
+    "category": "transition"
+  },
+  {
+    "id": "q011",
+    "query": "How is the planned goods receipt date described in the current feedback mechanism?",
+    "expected_topics": ["planned goods receipt date", "estimated pickup date", "write back", "ECC"],
+    "category": "integration"
+  },
+  {
+    "id": "q012",
+    "query": "What did the meeting notes say about Premium Freight Authorization and when it is used?",
+    "expected_topics": ["Premium Freight Authorization", "PFA", "urgent shipment", "cost control"],
+    "category": "operations"
   }
 ]

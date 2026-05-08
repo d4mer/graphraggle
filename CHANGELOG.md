@@ -40,6 +40,13 @@
 
 ## 2026-05-06
 
+### Packet 15.1: Eval Gate Repair
+
+1. Replaced the generic curated eval set with domain-matched logistics/transcript queries tied to the live corpus.
+2. Updated eval runner reports to persist full citations, query_scope, and expected_topics for each baseline/candidate answer.
+3. Strengthened judge scoring prompt to evaluate groundedness, completeness, and expected-topic coverage with richer context.
+4. Added minimum sample-size gating and graph activation diagnostics to the eval verdict output.
+
 ### Packet 14.1: Production Activation Hotfix (Multi-Query + Rerank)
 
 1. Fixed multi-query rewrite generation by changing bypass rewrite requests from `top_k=0` to `top_k=1` to avoid upstream 500 responses.

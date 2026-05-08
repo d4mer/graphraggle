@@ -28,6 +28,8 @@ import json
 import sys
 import os
 import re
+import urllib.request
+import urllib.error
 
 
 # ── Judge output parser ──────────────────────────────────────────────────────
@@ -64,7 +66,7 @@ def parse_judge_output(judge_output: dict) -> dict | None:
             "fact_consistent": fact_consistent,
             "complete": complete,
             "rubric_score": round(rubric_score, 4),
-            "reasoning": judge_output.get("reasoning", ""),
+            "reasoning": judge_output.get("reasoning", judge_output.get("reason", "")),
         }
     except (ValueError, TypeError):
         return None
@@ -106,6 +108,78 @@ def heuristic_score(answer: str, citations: list, query: str) -> dict:
         "rubric_score": round(rubric_score, 4),
         "method": "heuristic",
     }
+
+
+def score_with_judge_model(query: str, answer: str, citations: list, expected_topics: list | None = None) -> dict | None:
+    enabled = os.getenv("EVAL_JUDGE_ENABLED", "false").lower() == "true"
+    if not enabled:
+        return None
+
+    judge_url = os.getenv("EVAL_JUDGE_URL", "").strip()
+    judge_model = os.getenv("EVAL_JUDGE_MODEL", "").strip()
+    judge_key = os.getenv("EVAL_JUDGE_API_KEY", "").strip()
+    if not judge_url or not judge_model:
+        return None
+
+    prompt = (
+        "You are a strict evaluator for a retrieval-augmented answer. Return ONLY JSON with keys grounded, fact_consistent, complete, reason. "
+        "Each score must be 0 or 1. Grounded means the answer is directly supported by the provided citations. "
+        "Complete means the answer covers the expected topics when they are provided.\n\n"
+        f"Query: {query}\n"
+        f"Expected topics: {json.dumps(expected_topics or [], ensure_ascii=True)}\n"
+        f"Answer: {answer}\n"
+        f"Citations: {json.dumps(citations, ensure_ascii=True)[:8000]}\n"
+    )
+
+    payload = {
+        "model": judge_model,
+        "messages": [
+            {"role": "system", "content": "Return strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if judge_key:
+        headers["Authorization"] = f"Bearer {judge_key}"
+
+    try:
+        req = urllib.request.Request(
+            judge_url.rstrip("/") + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    text = content.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except Exception:
+        return None
+
+    rubric = parse_judge_output(parsed)
+    if rubric is None:
+        return None
+    rubric["method"] = "judge_model"
+    return rubric
 
 
 # ── Aggregation ───────────────────────────────────────────────────────────────
@@ -169,6 +243,7 @@ def score_report(report_path: str) -> dict:
 
     for r in results:
         query_text = r.get("query", "")
+        expected_topics = r.get("expected_topics", [])
         bl = r.get("baseline", {})
         cd = r.get("candidate", {})
         citations_bl = bl.get("citations", [])
@@ -185,6 +260,8 @@ def score_report(report_path: str) -> dict:
         # Try judge output first, fall back to heuristic
         bl_rubric = parse_judge_output(bl_judge)
         if bl_rubric is None:
+            bl_rubric = score_with_judge_model(query_text, bl.get("answer", ""), citations_bl, expected_topics)
+        if bl_rubric is None:
             bl_rubric = heuristic_score(
                 bl.get("answer", ""), citations_bl, query_text
             )
@@ -192,6 +269,8 @@ def score_report(report_path: str) -> dict:
         scored["baseline"] = bl_rubric
 
         cd_rubric = parse_judge_output(cd_judge)
+        if cd_rubric is None:
+            cd_rubric = score_with_judge_model(query_text, cd.get("answer", ""), citations_cd, expected_topics)
         if cd_rubric is None:
             cd_rubric = heuristic_score(
                 cd.get("answer", ""), citations_cd, query_text

@@ -7,11 +7,14 @@
 # Environment variables:
 #   BASELINE_ENV     — Identifier for baseline env config (e.g. "baseline", "packet-14")
 #   CANDIDATE_ENV    — Identifier for candidate env config (e.g. "candidate", "packet-15")
-#   GATEWAY_URL     — Gateway API base URL (default: http://localhost:8000)
+#   GATEWAY_URL     — Gateway API base URL (used when BASELINE_URL/CANDIDATE_URL unset)
+#   BASELINE_URL    — Baseline API base URL (optional)
+#   CANDIDATE_URL   — Candidate API base URL (optional)
 #   QUERY_SET       — Path to queries.json (default: eval/datasets/curated/queries.json)
 #   PROD_SAMPLES    — Path to anonymized production samples (optional)
 #   OUTPUT_DIR      — Directory for run artifacts (default: docs/ops/runs)
 #   REQUEST_TIMEOUT — Per-query request timeout in seconds (default: 60)
+#   QUERY_TOP_K     — Optional top_k override for eval queries (default: unset)
 #
 # Produces:
 #   docs/ops/runs/packet-15-eval-report.json  — Machine-readable report
@@ -26,10 +29,13 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASELINE_ENV="${BASELINE_ENV:-baseline}"
 CANDIDATE_ENV="${CANDIDATE_ENV:-candidate}"
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:8000}"
+BASELINE_URL="${BASELINE_URL:-$GATEWAY_URL}"
+CANDIDATE_URL="${CANDIDATE_URL:-$GATEWAY_URL}"
 QUERY_SET="${QUERY_SET:-$ROOT_DIR/eval/datasets/curated/queries.json}"
 PROD_SAMPLES="${PROD_SAMPLES:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/docs/ops/runs}"
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-60}"
+QUERY_TOP_K="${QUERY_TOP_K:-}"
 API_KEY="${RAG_API_KEY:-}"
 
 # ── Validate ──────────────────────────────────────────────────────────────────
@@ -46,10 +52,16 @@ SUMMARY_FILE="$OUTPUT_DIR/packet-15-eval-summary.md"
 echo "=== Packet 15: A/B Evaluation Runner ==="
 echo "Baseline env: $BASELINE_ENV"
 echo "Candidate env: $CANDIDATE_ENV"
-echo "Gateway URL: $GATEWAY_URL"
+echo "Baseline URL: $BASELINE_URL"
+echo "Candidate URL: $CANDIDATE_URL"
 echo "Query set: $QUERY_SET"
 echo "Output: $REPORT_FILE"
 echo ""
+
+if [ "$BASELINE_URL" = "$CANDIDATE_URL" ]; then
+    echo "WARNING: BASELINE_URL and CANDIDATE_URL are identical." >&2
+    echo "         This is not a true A/B unless endpoint config differs externally." >&2
+fi
 
 # ── Load queries ──────────────────────────────────────────────────────────────
 # Merge curated + production samples into a single list
@@ -86,7 +98,7 @@ echo ""
 echo "Running A/B comparison..."
 echo ""
 
-python3 - "$ALL_QUERIES" "$BASELINE_ENV" "$CANDIDATE_ENV" "$GATEWAY_URL" "$REQUEST_TIMEOUT" "$API_KEY" "$REPORT_FILE" <<'PYEOF'
+python3 - "$ALL_QUERIES" "$BASELINE_ENV" "$CANDIDATE_ENV" "$BASELINE_URL" "$CANDIDATE_URL" "$REQUEST_TIMEOUT" "$QUERY_TOP_K" "$API_KEY" "$REPORT_FILE" <<'PYEOF'
 import json
 import sys
 import time
@@ -96,10 +108,12 @@ import urllib.error
 queries = json.loads(sys.argv[1])
 baseline_env = sys.argv[2]
 candidate_env = sys.argv[3]
-gateway_url = sys.argv[4]
-timeout = int(sys.argv[5])
-api_key = sys.argv[6]
-output_path = sys.argv[7]
+baseline_url = sys.argv[4]
+candidate_url = sys.argv[5]
+timeout = int(sys.argv[6])
+query_top_k = sys.argv[7].strip()
+api_key = sys.argv[8]
+output_path = sys.argv[9]
 
 results = []
 baseline_errors = 0
@@ -109,6 +123,7 @@ for i, q in enumerate(queries):
     qid = q.get("id", f"q{i+1}")
     query_text = q.get("query", "")
     category = q.get("category", "unknown")
+    expected_topics = q.get("expected_topics", [])
 
     print(f"  [{i+1}/{len(queries)}] {qid}: {query_text[:60]}...")
 
@@ -116,11 +131,15 @@ for i, q in enumerate(queries):
     bl_latency_ms = None
     bl_answer = None
     bl_citations = []
+    bl_query_scope = {}
     bl_error = None
     try:
-        body = json.dumps({"query": query_text}).encode("utf-8")
+        payload = {"query": query_text}
+        if query_top_k:
+            payload["top_k"] = int(query_top_k)
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{gateway_url}/query",
+            f"{baseline_url}/query",
             data=body,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             method="POST",
@@ -129,8 +148,9 @@ for i, q in enumerate(queries):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
             bl_latency_ms = int((time.time() - t0) * 1000)
-            bl_answer = data.get("data", {}).get("response", "")
-            bl_citations = data.get("data", {}).get("references", [])
+            bl_answer = data.get("data", {}).get("answer", "")
+            bl_citations = data.get("data", {}).get("citations", [])
+            bl_query_scope = data.get("data", {}).get("query_scope", {})
     except Exception as e:
         bl_error = str(e)
         baseline_errors += 1
@@ -140,11 +160,15 @@ for i, q in enumerate(queries):
     cd_latency_ms = None
     cd_answer = None
     cd_citations = []
+    cd_query_scope = {}
     cd_error = None
     try:
-        body = json.dumps({"query": query_text}).encode("utf-8")
+        payload = {"query": query_text}
+        if query_top_k:
+            payload["top_k"] = int(query_top_k)
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{gateway_url}/query",
+            f"{candidate_url}/query",
             data=body,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             method="POST",
@@ -153,8 +177,9 @@ for i, q in enumerate(queries):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
             cd_latency_ms = int((time.time() - t0) * 1000)
-            cd_answer = data.get("data", {}).get("response", "")
-            cd_citations = data.get("data", {}).get("references", [])
+            cd_answer = data.get("data", {}).get("answer", "")
+            cd_citations = data.get("data", {}).get("citations", [])
+            cd_query_scope = data.get("data", {}).get("query_scope", {})
     except Exception as e:
         cd_error = str(e)
         candidate_errors += 1
@@ -164,16 +189,21 @@ for i, q in enumerate(queries):
         "query_id": qid,
         "query": query_text,
         "category": category,
+        "expected_topics": expected_topics,
         "baseline": {
             "latency_ms": bl_latency_ms,
             "answer": bl_answer,
+            "citations": bl_citations,
             "citation_count": len(bl_citations),
+            "query_scope": bl_query_scope,
             "error": bl_error,
         },
         "candidate": {
             "latency_ms": cd_latency_ms,
             "answer": cd_answer,
+            "citations": cd_citations,
             "citation_count": len(cd_citations),
+            "query_scope": cd_query_scope,
             "error": cd_error,
         },
     })
@@ -182,7 +212,8 @@ report = {
     "run_id": "packet-15",
     "baseline_env": baseline_env,
     "candidate_env": candidate_env,
-    "gateway_url": gateway_url,
+    "baseline_url": baseline_url,
+    "candidate_url": candidate_url,
     "total_queries": len(queries),
     "baseline_errors": baseline_errors,
     "candidate_errors": candidate_errors,
@@ -217,7 +248,8 @@ lines.append(f"# Packet 15: A/B Evaluation Summary")
 lines.append("")
 lines.append(f"- **Baseline env**: {report['baseline_env']}")
 lines.append(f"- **Candidate env**: {report['candidate_env']}")
-lines.append(f"- **Gateway URL**: {report['gateway_url']}")
+lines.append(f"- **Baseline URL**: {report.get('baseline_url', 'n/a')}")
+lines.append(f"- **Candidate URL**: {report.get('candidate_url', 'n/a')}")
 lines.append(f"- **Total queries**: {report['total_queries']}")
 lines.append(f"- **Baseline errors**: {report['baseline_errors']}")
 lines.append(f"- **Candidate errors**: {report['candidate_errors']}")

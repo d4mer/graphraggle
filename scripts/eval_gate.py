@@ -29,6 +29,7 @@ LATENCY_INCREASE_THRESHOLD = 20.0  # percent — candidate p95 latency increase 
 QUALITY_BORDERLINE_MARGIN = 2.0    # ±2% of quality threshold
 LATENCY_BORDERLINE_MARGIN = 3.0    # ±3% of latency threshold
 PARSE_FAILURE_THRESHOLD = 10.0     # >10% parse/rubric failures → borderline
+MIN_SAMPLE_SIZE = 12
 
 
 def compute_percentile(sorted_values: list[float], percentile: float) -> float | None:
@@ -87,7 +88,8 @@ def extract_rubric_scores(results: list[dict], env: str) -> list[float | None]:
     """Extract per-query rubric scores for the given environment.
 
     Checks multiple locations for rubric scores:
-    1. r["scored"][env]["mean_rubric_score"] (from eval_score.py)
+    1. r["scored"][env]["rubric_score"] (from eval_score.py)
+       or r["scored"][env]["mean_rubric_score"] (legacy)
     2. r["judge_output"]["rubric_score"] (top-level judge output)
     3. r[env]["judge_output"] (per-environment judge output in baseline/candidate)
 
@@ -97,8 +99,13 @@ def extract_rubric_scores(results: list[dict], env: str) -> list[float | None]:
     for r in results:
         # Check for scored rubric (from eval_score.py)
         scored = r.get("scored", {})
-        if env in scored and "mean_rubric_score" in scored[env]:
-            scores.append(scored[env]["mean_rubric_score"])
+        if env in scored:
+            if "rubric_score" in scored[env]:
+                scores.append(scored[env]["rubric_score"])
+                continue
+            if "mean_rubric_score" in scored[env]:
+                scores.append(scored[env]["mean_rubric_score"])
+                continue
         elif "judge_output" in r:
             # Top-level judge output
             judge = r["judge_output"]
@@ -254,9 +261,13 @@ def compute_parse_failures(results: list[dict]) -> dict:
         scored = r.get("scored", {})
         has_score = False
         for env_key in ["baseline", "candidate"]:
-            if env_key in scored and scored[env_key].get("mean_rubric_score") is not None:
-                has_score = True
-                break
+            if env_key in scored:
+                if scored[env_key].get("rubric_score") is not None:
+                    has_score = True
+                    break
+                if scored[env_key].get("mean_rubric_score") is not None:
+                    has_score = True
+                    break
         if not has_score:
             # Check top-level judge_output
             if "judge_output" in r:
@@ -276,6 +287,30 @@ def compute_parse_failures(results: list[dict]) -> dict:
         "failures": failures,
         "failure_rate": round(failure_rate, 2),
         "is_borderline": failure_rate > PARSE_FAILURE_THRESHOLD,
+    }
+
+
+def compute_graph_activation_metrics(results: list[dict]) -> dict:
+    total = len(results)
+    if total == 0:
+        return {
+            "graph_applied_rate": 0.0,
+            "average_graph_neighbor_count": 0.0,
+            "average_graph_hops_used": 0.0,
+        }
+    applied = 0
+    neighbor_total = 0
+    hops_total = 0
+    for r in results:
+        qs = r.get("candidate", {}).get("query_scope", {}) or {}
+        if qs.get("graph_expansion_applied"):
+            applied += 1
+        neighbor_total += int(qs.get("graph_neighbor_count") or 0)
+        hops_total += int(qs.get("graph_hops_used") or 0)
+    return {
+        "graph_applied_rate": round((applied / total) * 100.0, 2),
+        "average_graph_neighbor_count": round(neighbor_total / total, 2),
+        "average_graph_hops_used": round(hops_total / total, 2),
     }
 
 
@@ -303,6 +338,14 @@ def evaluate_gates(report: dict) -> dict:
 
     # Compute parse failures
     parse_failures = compute_parse_failures(results)
+    graph_metrics = compute_graph_activation_metrics(results)
+
+    sample_size_pass = total_queries >= MIN_SAMPLE_SIZE
+    sample_size_detail = (
+        f"PASS: sample size {total_queries} >= {MIN_SAMPLE_SIZE}"
+        if sample_size_pass else
+        f"BORDERLINE: sample size {total_queries} < {MIN_SAMPLE_SIZE}; results are not promotion-grade"
+    )
 
     # Evaluate quality gate
     quality_pass = False
@@ -382,6 +425,8 @@ def evaluate_gates(report: dict) -> dict:
 
     # Determine overall verdict
     failed_criteria = []
+    if not sample_size_pass:
+        failed_criteria.append("minimum_sample_size")
     if not quality_pass:
         failed_criteria.append("quality_lift")
     if not latency_pass:
@@ -390,7 +435,7 @@ def evaluate_gates(report: dict) -> dict:
         failed_criteria.append("parse_failures")
 
     overall_pass = len(failed_criteria) == 0 and not quality_borderline and not latency_borderline
-    is_borderline = quality_borderline or latency_borderline or parse_borderline
+    is_borderline = quality_borderline or latency_borderline or parse_borderline or (not sample_size_pass)
 
     # Generate rollback recommendation
     rollback = generate_rollback_recommendation(
@@ -411,8 +456,14 @@ def evaluate_gates(report: dict) -> dict:
             "quality_lift": quality,
             "latency_increase": latency,
             "parse_failures": parse_failures,
+            "graph_activation": graph_metrics,
         },
         "criteria": {
+            "minimum_sample_size": {
+                "pass": sample_size_pass,
+                "borderline": not sample_size_pass,
+                "detail": sample_size_detail,
+            },
             "quality_lift": {
                 "pass": quality_pass,
                 "borderline": quality_borderline,

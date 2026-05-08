@@ -335,11 +335,11 @@ class TestGateEvaluation(unittest.TestCase):
         # Candidate: score=0.667 (rubric 1,1,0 → score 0.667), p95=1100ms
         # Lift = (0.667-0.333)/0.333 ≈ 100%, latency increase = 10%
         report = _make_report(
-            total_queries=10,
-            baseline_scores=[0.333] * 10,
-            candidate_scores=[0.667] * 10,
-            baseline_latencies=[1000] * 10,
-            candidate_latencies=[1100] * 10,
+            total_queries=12,
+            baseline_scores=[0.333] * 12,
+            candidate_scores=[0.667] * 12,
+            baseline_latencies=[1000] * 12,
+            candidate_latencies=[1100] * 12,
         )
         verdict = gate_module.evaluate_gates(report)
         self.assertTrue(verdict["verdict"]["overall_pass"])
@@ -552,6 +552,27 @@ class TestGateEvaluation(unittest.TestCase):
         verdict = gate_module.evaluate_gates(report)
         self.assertFalse(verdict["verdict"]["overall_pass"])
         self.assertIn("quality_lift", verdict["verdict"]["failed_criteria"])
+
+    def test_minimum_sample_size_blocks_promotion(self):
+        report = _make_report(total_queries=4)
+        verdict = gate_module.evaluate_gates(report)
+        self.assertFalse(verdict["criteria"]["minimum_sample_size"]["pass"])
+        self.assertTrue(verdict["criteria"]["minimum_sample_size"]["borderline"])
+        self.assertIn("minimum_sample_size", verdict["verdict"]["failed_criteria"])
+
+    def test_graph_activation_metrics_present(self):
+        report = _make_report(total_queries=12)
+        for row in report["results"]:
+            row["candidate"]["query_scope"] = {
+                "graph_expansion_applied": True,
+                "graph_neighbor_count": 5,
+                "graph_hops_used": 1,
+            }
+        verdict = gate_module.evaluate_gates(report)
+        metrics = verdict["metrics"]["graph_activation"]
+        self.assertEqual(metrics["graph_applied_rate"], 100.0)
+        self.assertEqual(metrics["average_graph_neighbor_count"], 5.0)
+        self.assertEqual(metrics["average_graph_hops_used"], 1.0)
 
     def test_verdict_structure(self):
         """Verdict contains all required fields."""
