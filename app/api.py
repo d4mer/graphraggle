@@ -28,6 +28,7 @@ from .graphrag import (
     compute_adaptive_hops,
     expand_graph_neighbors,
     extract_entities_via_llm,
+    filter_graph_neighbors_for_query,
     merge_graph_expansion,
 )
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
@@ -50,6 +51,21 @@ app = FastAPI(title="RAG Gateway", version="0.1.0")
 
 FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 TRANSCRIPT_QUERY_KEYWORDS = ("transcript", "workshop", "speaker", "meeting minutes", "recording")
+GRAPH_QUERY_KEYWORDS = (
+    "process",
+    "shipment",
+    "code orange",
+    "ecommit",
+    "firm horizon",
+    "dashboard",
+    "exception",
+    "logistics",
+    "cmo",
+    "consolidation",
+    "transport",
+    "freight",
+    "policy",
+)
 WEAK_ANSWER_MARKERS = ("not enough information", "do not have enough information")
 
 
@@ -234,6 +250,11 @@ def reindex_block_reason(doc: dict, *, force: bool) -> tuple[str, str] | None:
 def is_transcript_like_query(query: str) -> bool:
     lowered = query.lower()
     return any(keyword in lowered for keyword in TRANSCRIPT_QUERY_KEYWORDS)
+
+
+def is_graph_expansion_target(query: str) -> bool:
+    lowered = query.lower()
+    return is_transcript_like_query(query) or any(keyword in lowered for keyword in GRAPH_QUERY_KEYWORDS)
 
 
 def has_weak_answer_signal(answer: str) -> bool:
@@ -704,60 +725,52 @@ async def query(req: QueryRequest):
 
     if graph_enabled:
         try:
+            if not is_graph_expansion_target(req.query):
+                graph_error = "graph_query_family_skipped"
+            else:
             # Extract entities from top seed citations
-            seed_count_cfg = settings.graph_seed_citation_count
-            seed_citations = merged_citations[:seed_count_cfg]
-            entities = await extract_entities_via_llm(
-                client, seed_citations, seed_count=seed_count_cfg
-            )
-            graph_seed_count = len(entities)
-
-            if entities:
-                # 1-hop expansion
-                max_neighbors_cfg = settings.graph_expansion_max_neighbors
-                configured_hops = settings.graph_expansion_hops
-                neighbors_1hop, err_1hop, hops_1 = await expand_graph_neighbors(
-                    client, entities, max_neighbors=max_neighbors_cfg, hops=1
+                seed_count_cfg = settings.graph_seed_citation_count
+                seed_citations = merged_citations[:seed_count_cfg]
+                entities = await extract_entities_via_llm(
+                    client, seed_citations, seed_count=seed_count_cfg, query=req.query
                 )
-                graph_neighbor_count = len(neighbors_1hop)
-                graph_hops_used = 1
-                graph_error = err_1hop
+                graph_seed_count = len(entities)
 
-                if not err_1hop:
-                    # Merge 1-hop neighbors for adaptive hop decision
-                    merged_after_1hop = merge_graph_expansion(merged_citations, neighbors_1hop)
-
-                    # Compute scoped count for adaptive trigger (estimate without full scope)
-                    # Use total merged count as proxy for scoped count
-                    scoped_proxy_count = len(merged_after_1hop)
-
-                    # Compute adaptive hops
-                    target_hops = compute_adaptive_hops(
-                        graph_neighbor_count=graph_neighbor_count,
-                        scoped_citation_count=scoped_proxy_count,
-                        query_word_count=len(req.query.split()),
-                        is_transcript_like=transcript_like,
-                        rerank_top_score=get_top_retrieval_confidence(merged_after_1hop),
-                        configured_hops=configured_hops,
+                if entities:
+                    max_neighbors_cfg = min(settings.graph_expansion_max_neighbors, 3)
+                    neighbors_1hop, err_1hop, hops_1 = await expand_graph_neighbors(
+                        client, entities, max_neighbors=max_neighbors_cfg, hops=1
                     )
+                    graph_error = err_1hop
+                    graph_hops_used = 1 if neighbors_1hop else 0
 
-                    neighbors_2hop = []
-                    if target_hops >= 2:
-                        # Run 2-hop with remaining budget
-                        remaining_budget = max_neighbors_cfg - graph_neighbor_count
-                        if remaining_budget > 0:
-                            neighbors_2hop, err_2hop, hops_2 = await expand_graph_neighbors(
-                                client, entities, max_neighbors=remaining_budget, hops=1
-                            )
-                            graph_neighbor_count += len(neighbors_2hop)
-                            graph_hops_used = 2
-                            if err_2hop:
-                                graph_error = err_2hop
+                    if not err_1hop:
+                        filtered_neighbors = filter_graph_neighbors_for_query(req.query, neighbors_1hop)
+                        graph_neighbor_count = len(filtered_neighbors)
 
-                    # Final merge with all graph neighbors (1-hop + 2-hop)
-                    all_graph_neighbors = neighbors_1hop + neighbors_2hop
-                    merged_citations = merge_graph_expansion(merged_citations, all_graph_neighbors)
-                    graph_applied = True
+                        # no-improvement-no-merge guard
+                        query_terms = {t for t in re.findall(r"[A-Za-z0-9_]+", req.query.lower()) if len(t) > 2}
+
+                        def term_overlaps(items: list[dict[str, Any]]) -> set[str]:
+                            overlaps: set[str] = set()
+                            for item in items:
+                                text = (str(item.get("content", "")) + " " + str(item.get("path", ""))).lower()
+                                overlaps.update(term for term in query_terms if term in text)
+                            return overlaps
+
+                        base_overlaps = term_overlaps(merged_citations)
+                        graph_overlaps: set[str] = set()
+                        for item in filtered_neighbors:
+                            text = f"{item.get('seed_entity','')} {item.get('related_entity','')} {item.get('relationship','')} {item.get('context','')}".lower()
+                            graph_overlaps.update(term for term in query_terms if term in text)
+
+                        if filtered_neighbors and graph_overlaps.issubset(base_overlaps):
+                            graph_error = "graph_no_improvement"
+                        elif filtered_neighbors:
+                            merged_citations = merge_graph_expansion(merged_citations, filtered_neighbors)
+                            graph_applied = True
+                        else:
+                            graph_error = graph_error or "graph_no_improvement"
 
         except Exception as exc:
             graph_error = str(exc)

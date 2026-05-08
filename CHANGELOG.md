@@ -40,6 +40,13 @@
 
 ## 2026-05-06
 
+### Packet 16.2: Graph Precision Rollback
+
+1. Restricted GraphRAG activation to transcript/process/logistics-style queries only.
+2. Tightened graph-neighbor filtering with higher relevance threshold and deterministic top-3 cap.
+3. Added a no-improvement-no-merge guard so graph evidence is skipped when it does not add new query-term coverage.
+4. Forced rollout to 1-hop only while retaining existing helper logic for future tuning.
+
 ### Packet 15.1: Eval Gate Repair
 
 1. Replaced the generic curated eval set with domain-matched logistics/transcript queries tied to the live corpus.

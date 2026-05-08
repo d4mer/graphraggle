@@ -125,6 +125,22 @@ class TestExtractEntitiesViaLLM(unittest.TestCase):
         self.assertEqual(payload["mode"], "bypass")
         self.assertEqual(payload["top_k"], 1)
 
+    def test_query_aware_prompt_includes_query(self):
+        mock_client = MagicMock()
+        mock_result = {"response": '["firm horizon"]'}
+        mock_client.post_json = AsyncMock(return_value=mock_result)
+        _run_async(
+            _gr_module.extract_entities_via_llm(
+                mock_client,
+                [{"content": "firm horizon details"}],
+                seed_count=1,
+                query="What is firm horizon?",
+            )
+        )
+        payload = mock_client.post_json.call_args[0][1]
+        self.assertIn("USER QUERY", payload["query"])
+        self.assertIn("What is firm horizon?", payload["query"])
+
     def test_respects_seed_count(self):
         """Should only use top N citations for entity extraction."""
         mock_client = MagicMock()
@@ -244,6 +260,25 @@ class TestExtractEntitiesViaLLM(unittest.TestCase):
 
 
 # ── expand_graph_neighbors tests ────────────────────────────────────────────
+
+class TestFilterGraphNeighborsForQuery(unittest.TestCase):
+    def test_filters_low_score_and_caps_to_top_three(self):
+        neighbors = [
+            {"seed_entity": "A", "related_entity": f"R{i}", "relationship": "rel", "context": f"good shipment process context {i}", "score": 0.9 - i * 0.1}
+            for i in range(5)
+        ]
+        neighbors.append({"seed_entity": "A", "related_entity": "bad", "relationship": "rel", "context": "good shipment process context", "score": 0.1})
+        out = _gr_module.filter_graph_neighbors_for_query("shipment process", neighbors)
+        self.assertEqual(len(out), 3)
+        self.assertTrue(all(float(n.get("score", 0)) >= 0.2 for n in out))
+
+    def test_filters_when_no_query_or_operational_overlap(self):
+        neighbors = [
+            {"seed_entity": "A", "related_entity": "B", "relationship": "rel", "context": "totally unrelated context", "score": 0.9},
+        ]
+        out = _gr_module.filter_graph_neighbors_for_query("firm horizon", neighbors)
+        self.assertEqual(out, [])
+
 
 class TestExpandGraphNeighbors(unittest.TestCase):
     """Test graph neighbor expansion."""

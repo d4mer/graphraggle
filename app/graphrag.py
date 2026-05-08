@@ -19,10 +19,10 @@ DEFAULT_HOPS = 1
 
 # Entity extraction prompt – strict JSON array response
 _ENTITY_EXTRACTION_PROMPT = (
-    "Extract up to 10 key entities (persons, organizations, locations, concepts, "
-    "products, events) from the following text. Return ONLY a JSON array of "
-    "string entity names. Do not include any explanation or other text. "
-    "Example: [\"Alice\", \"Acme Corp\", \"Q3 revenue\"]\n\nTEXT:\n{text}"
+    "Extract up to 6 entities that are directly relevant to answering the user query. "
+    "Ignore unrelated entities. Return ONLY a JSON array of string entity names. "
+    "Do not include explanation or extra text. Example: [\"Alice\", \"Acme Corp\", \"Q3 revenue\"]\n\n"
+    "USER QUERY:\n{query}\n\nTEXT:\n{text}"
 )
 
 # Graph neighbor query prompt for LightRAG-style API
@@ -76,6 +76,7 @@ async def extract_entities_via_llm(
     client: Any,
     citations: list[dict[str, Any]],
     seed_count: int = DEFAULT_SEED_CITATION_COUNT,
+    query: str = "",
 ) -> list[str]:
     """Extract entities from the top seed_count citations via LLM bypass query.
 
@@ -100,7 +101,7 @@ async def extract_entities_via_llm(
         return []
 
     combined_text = "\n\n---\n\n".join(texts)
-    prompt = _ENTITY_EXTRACTION_PROMPT.format(text=combined_text)
+    prompt = _ENTITY_EXTRACTION_PROMPT.format(query=query, text=combined_text)
 
     try:
         result = await client.post_json(
@@ -338,6 +339,39 @@ def merge_graph_expansion(
     # Merge using the same dedupe logic as multi_query
     from .multi_query import merge_and_dedupe_citations
     return merge_and_dedupe_citations([base_citations, pseudo_citations])
+
+
+def filter_graph_neighbors_for_query(query: str, neighbors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    query_terms = {t for t in re.findall(r"[A-Za-z0-9_]+", query.lower()) if len(t) > 2}
+    operational_terms = {"process", "shipment", "code", "orange", "ecommit", "firm", "horizon", "dashboard", "exception", "logistics", "cmo", "consolidation", "transport", "freight"}
+
+    filtered: list[dict[str, Any]] = []
+    for item in neighbors:
+        rel = str(item.get("relationship", "")).strip()
+        ctx = str(item.get("context", "")).strip()
+        if not rel or not ctx:
+            continue
+        if len(rel) < 2 or len(ctx) < 10:
+            continue
+        score = item.get("score")
+        if isinstance(score, (int, float)) and float(score) < 0.2:
+            continue
+        text = f"{item.get('seed_entity','')} {item.get('related_entity','')} {rel} {ctx}".lower()
+        has_query_overlap = bool(query_terms) and any(term in text for term in query_terms)
+        has_operational_overlap = any(term in text for term in operational_terms)
+        if not (has_query_overlap or has_operational_overlap):
+            continue
+        filtered.append(item)
+
+    def sort_key(item: dict[str, Any]) -> tuple:
+        text = f"{item.get('seed_entity','')} {item.get('related_entity','')} {item.get('relationship','')} {item.get('context','')}".lower()
+        overlap_count = sum(1 for term in query_terms if term in text)
+        score = float(item.get("score", 0.0)) if isinstance(item.get("score"), (int, float)) else 0.0
+        ctx_len = len(str(item.get("context", "")))
+        return (-overlap_count, -score, ctx_len, str(item.get("seed_entity", "")).lower(), str(item.get("related_entity", "")).lower())
+
+    filtered.sort(key=sort_key)
+    return filtered[:3]
 
 
 # ── compute_adaptive_hops ───────────────────────────────────────────────────
