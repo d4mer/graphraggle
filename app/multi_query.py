@@ -10,8 +10,6 @@ import json
 import re
 from typing import Any
 
-import httpx
-
 # Default transcript-like keywords (mirrors api.py TRANSCRIPT_QUERY_KEYWORDS)
 DEFAULT_TRANSCRIPT_KEYWORDS = "transcript,workshop,speaker,meeting minutes,recording"
 

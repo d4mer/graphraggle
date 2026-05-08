@@ -39,5 +39,10 @@ class Settings(BaseSettings):
     graph_expansion_max_neighbors: int = Field(default=10, alias="GRAPH_EXPANSION_MAX_NEIGHBORS")
     graph_seed_citation_count: int = Field(default=3, alias="GRAPH_SEED_CITATION_COUNT")
 
+    graph_native_enabled: bool = Field(default=False, alias="GRAPH_NATIVE_ENABLED")
+    graph_native_max_seeds: int = Field(default=3, alias="GRAPH_NATIVE_MAX_SEEDS")
+    graph_native_max_depth: int = Field(default=2, alias="GRAPH_NATIVE_MAX_DEPTH")
+    graph_native_max_nodes: int = Field(default=50, alias="GRAPH_NATIVE_MAX_NODES")
+
 
 settings = Settings()

@@ -40,6 +40,12 @@
 
 ## 2026-05-06
 
+### Packet 17: Graph-Native Retrieval Tracer Bullet
+
+1. Added `app/graph_native.py` with bounded LightRAG native graph label search and graph fetch helpers.
+2. Added separate `graph_evidence` response field and `graph_native_*` metadata through `/query` for graph-shaped queries.
+3. Kept graph-native retrieval fail-open and separate from baseline citations/answer synthesis.
+
 ### Packet 16.2: Graph Precision Rollback
 
 1. Restricted GraphRAG activation to transcript/process/logistics-style queries only.

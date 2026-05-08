@@ -31,6 +31,7 @@ from .graphrag import (
     filter_graph_neighbors_for_query,
     merge_graph_expansion,
 )
+from .graph_native import fetch_graph_native_evidence
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -255,6 +256,10 @@ def is_transcript_like_query(query: str) -> bool:
 def is_graph_expansion_target(query: str) -> bool:
     lowered = query.lower()
     return is_transcript_like_query(query) or any(keyword in lowered for keyword in GRAPH_QUERY_KEYWORDS)
+
+
+def is_graph_native_target(query: str) -> bool:
+    return is_graph_expansion_target(query)
 
 
 def has_weak_answer_signal(answer: str) -> bool:
@@ -786,6 +791,26 @@ async def query(req: QueryRequest):
         hops_used=graph_hops_used,
     )
 
+    graph_native_enabled = settings.graph_native_enabled
+    graph_native_applied = False
+    graph_native_error = None
+    graph_native_seed_labels: list[str] = []
+    graph_native_result_count = 0
+    graph_evidence: list[dict[str, Any]] = []
+
+    if graph_native_enabled and is_graph_native_target(req.query):
+        graph_evidence, graph_native_error, graph_native_seed_labels = await fetch_graph_native_evidence(
+            client,
+            req.query,
+            max_seeds=settings.graph_native_max_seeds,
+            max_depth=settings.graph_native_max_depth,
+            max_nodes=settings.graph_native_max_nodes,
+        )
+        graph_native_result_count = len(graph_evidence)
+        graph_native_applied = graph_native_result_count > 0 and graph_native_error is None
+    elif graph_native_enabled:
+        graph_native_error = "graph_native_query_family_skipped"
+
     # ── Apply scope filter, rerank, truncate on merged citations ────────
     final_citations, rerank_meta = await apply_scope_rerank_truncate(merged_citations, req.query)
 
@@ -827,11 +852,20 @@ async def query(req: QueryRequest):
 
     # Add graph expansion metadata
     query_scope.update(graph_meta)
+    query_scope.update(
+        {
+            "graph_native_enabled": graph_native_enabled,
+            "graph_native_applied": graph_native_applied,
+            "graph_native_error": graph_native_error,
+            "graph_native_seed_labels": graph_native_seed_labels,
+            "graph_native_result_count": graph_native_result_count,
+        }
+    )
 
     if requested_company is not None:
         query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
 
-    return ok({"answer": answer, "citations": final_citations, "query_scope": query_scope})
+    return ok({"answer": answer, "citations": final_citations, "graph_evidence": graph_evidence, "query_scope": query_scope})
 
 
 @app.post("/generate-document", response_model=Envelope, dependencies=[Depends(require_bearer)])

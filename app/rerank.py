@@ -9,7 +9,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import httpx
+try:
+    import httpx
+except ImportError:  # pragma: no cover - test environments may patch this module directly
+    class _MissingHttpx:
+        AsyncClient = None
+
+    httpx = _MissingHttpx()
 
 RERANK_TOP_K = 5
 RERANK_TIMEOUT_SECONDS = 10
