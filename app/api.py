@@ -32,6 +32,7 @@ from .graphrag import (
     merge_graph_expansion,
 )
 from .graph_native import build_graph_native_metadata, fetch_graph_native_evidence
+from .graph_fusion import fuse_graph_and_vector_evidence
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -862,10 +863,12 @@ async def query(req: QueryRequest):
         )
     )
 
+    combined_evidence = fuse_graph_and_vector_evidence(final_citations, graph_evidence)
+
     if requested_company is not None:
         query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
 
-    return ok({"answer": answer, "citations": final_citations, "graph_evidence": graph_evidence, "query_scope": query_scope})
+    return ok({"answer": answer, "citations": final_citations, "graph_evidence": graph_evidence, "combined_evidence": combined_evidence, "query_scope": query_scope})
 
 
 @app.post("/generate-document", response_model=Envelope, dependencies=[Depends(require_bearer)])

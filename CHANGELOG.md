@@ -40,6 +40,10 @@
 
 ## 2026-05-06
 
+### Packet 19: Graph Evidence Fusion
+
+1. Added provenance-preserving fusion of vector citations and graph-native evidence into a deterministic `combined_evidence` response field.
+
 ### Packet 18: Graph Observability And Safety
 
 1. Added dedicated graph-native metadata construction for `/query` responses.
