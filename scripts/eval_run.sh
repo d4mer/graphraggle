@@ -131,6 +131,8 @@ for i, q in enumerate(queries):
     bl_latency_ms = None
     bl_answer = None
     bl_citations = []
+    bl_graph_evidence = []
+    bl_combined_evidence = []
     bl_query_scope = {}
     bl_error = None
     try:
@@ -150,6 +152,8 @@ for i, q in enumerate(queries):
             bl_latency_ms = int((time.time() - t0) * 1000)
             bl_answer = data.get("data", {}).get("answer", "")
             bl_citations = data.get("data", {}).get("citations", [])
+            bl_graph_evidence = data.get("data", {}).get("graph_evidence", [])
+            bl_combined_evidence = data.get("data", {}).get("combined_evidence", [])
             bl_query_scope = data.get("data", {}).get("query_scope", {})
     except Exception as e:
         bl_error = str(e)
@@ -160,6 +164,8 @@ for i, q in enumerate(queries):
     cd_latency_ms = None
     cd_answer = None
     cd_citations = []
+    cd_graph_evidence = []
+    cd_combined_evidence = []
     cd_query_scope = {}
     cd_error = None
     try:
@@ -179,6 +185,8 @@ for i, q in enumerate(queries):
             cd_latency_ms = int((time.time() - t0) * 1000)
             cd_answer = data.get("data", {}).get("answer", "")
             cd_citations = data.get("data", {}).get("citations", [])
+            cd_graph_evidence = data.get("data", {}).get("graph_evidence", [])
+            cd_combined_evidence = data.get("data", {}).get("combined_evidence", [])
             cd_query_scope = data.get("data", {}).get("query_scope", {})
     except Exception as e:
         cd_error = str(e)
@@ -194,6 +202,8 @@ for i, q in enumerate(queries):
             "latency_ms": bl_latency_ms,
             "answer": bl_answer,
             "citations": bl_citations,
+            "graph_evidence": bl_graph_evidence,
+            "combined_evidence": bl_combined_evidence,
             "citation_count": len(bl_citations),
             "query_scope": bl_query_scope,
             "error": bl_error,
@@ -202,6 +212,8 @@ for i, q in enumerate(queries):
             "latency_ms": cd_latency_ms,
             "answer": cd_answer,
             "citations": cd_citations,
+            "graph_evidence": cd_graph_evidence,
+            "combined_evidence": cd_combined_evidence,
             "citation_count": len(cd_citations),
             "query_scope": cd_query_scope,
             "error": cd_error,

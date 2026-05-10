@@ -33,7 +33,7 @@ from .graphrag import (
 )
 from .graph_native import build_graph_native_metadata, fetch_graph_native_evidence
 from .graph_fusion import fuse_graph_and_vector_evidence
-from .graph_synthesis import synthesize_graph_aware_answer
+from .graph_synthesis import is_graph_synthesis_answer_usable, synthesize_graph_aware_answer
 from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -876,9 +876,11 @@ async def query(req: QueryRequest):
     graph_synthesis_error = None
     if graph_native_applied and combined_evidence:
         synthesized_answer, graph_synthesis_error = await synthesize_graph_aware_answer(client, req.query, combined_evidence)
-        if synthesized_answer:
+        if is_graph_synthesis_answer_usable(synthesized_answer):
             answer = synthesized_answer
             graph_synthesis_applied = True
+        elif synthesized_answer:
+            graph_synthesis_error = "weak_graph_synthesis_answer"
 
     query_scope.update({
         "graph_synthesis_applied": graph_synthesis_applied,

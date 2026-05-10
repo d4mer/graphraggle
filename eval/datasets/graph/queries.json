@@ -1,38 +1,74 @@
 [
   {
     "id": "g001",
-    "query": "How does the workshop connect firm horizon, cancellation windows, and mode of transport?",
-    "expected_topics": ["firm horizon", "cancellation windows", "mode of transport", "relationship"],
-    "category": "graph-transcript"
+    "query": "What relationship is described between Code Orange feedback and planned goods receipt dates?",
+    "expected_topics": ["Code Orange", "planned goods receipt date", "feedback loop", "relationship"],
+    "category": "graph-feedback"
   },
   {
     "id": "g002",
-    "query": "What relationship is described between Code Orange feedback and planned goods receipt dates?",
-    "expected_topics": ["Code Orange", "planned goods receipt date", "feedback loop", "relationship"],
-    "category": "graph-integration"
+    "query": "How are empty shipments, freight orders, and the split between optimization horizon and firm horizon connected?",
+    "expected_topics": ["empty shipments", "freight order", "optimization horizon", "firm horizon"],
+    "category": "graph-horizons"
   },
   {
     "id": "g003",
-    "query": "How are SCIM, dashboards, and CAPA connected in the exception management discussion?",
-    "expected_topics": ["SCIM", "dashboards", "CAPA", "exception management"],
-    "category": "graph-operations"
-  },
-  {
-    "id": "g004",
     "query": "What dependency chain was discussed between eCommit, manual trigger, and shipment planning?",
     "expected_topics": ["eCommit", "manual trigger", "shipment planning", "dependency chain"],
     "category": "graph-process"
   },
   {
-    "id": "g005",
-    "query": "How are consolidation hubs, direct shipment, and container utilization related in the workshop notes?",
-    "expected_topics": ["consolidation hub", "direct shipment", "container utilization", "relationship"],
-    "category": "graph-logistics"
-  },
-  {
-    "id": "g006",
+    "id": "g004",
     "query": "What link was made between CMO scope, interim phase, and S4 transition concerns?",
     "expected_topics": ["CMO", "interim phase", "S4 transition", "scope linkage"],
     "category": "graph-transition"
+  },
+  {
+    "id": "g005",
+    "query": "How are Code Orange Interface, SAP, and OMP related when OMP needs fields it does not natively have?",
+    "expected_topics": ["Code Orange Interface", "SAP", "OMP", "fields not natively available", "data provision"],
+    "category": "graph-integration"
+  },
+  {
+    "id": "g006",
+    "query": "How does the shipment plan connect OMP-led planning horizon decisions with SAP-led optimization and firm horizon execution?",
+    "expected_topics": ["Shipment Plan", "OMP", "planning horizon", "SAP", "optimization horizon", "firm horizon"],
+    "category": "graph-horizons"
+  },
+  {
+    "id": "g007",
+    "query": "How are current pharma ETA feedback and pre-execution shipment-object creation contrasted in the design discussions?",
+    "expected_topics": ["pharma", "ETA feedback", "pre-execution", "shipment object", "contrast"],
+    "category": "graph-architecture"
+  },
+  {
+    "id": "g008",
+    "query": "What relationship was described between vaccines onboarding, TRB approval, and inbound Kuehne + Nagel to ECC interface changes?",
+    "expected_topics": ["vaccines", "TRB", "Kuehne + Nagel", "ECC", "interface change"],
+    "category": "graph-governance"
+  },
+  {
+    "id": "g009",
+    "query": "What relationship is described between Code Orange exports, Andrew, and the gap analysis for required fields?",
+    "expected_topics": ["Code Orange", "Andrew", "gap analysis", "required fields", "exports"],
+    "category": "graph-fields"
+  },
+  {
+    "id": "g010",
+    "query": "What relationship is described between eCommit replacement, Shipment Plan, and the S/4HANA transition?",
+    "expected_topics": ["eCommit", "Shipment Plan", "S/4HANA", "replacement", "transition"],
+    "category": "graph-transition"
+  },
+  {
+    "id": "g011",
+    "query": "How are standard fields already exported to Code Orange connected to the gap analysis for target fields?",
+    "expected_topics": ["standard fields", "Code Orange", "gap analysis", "target fields"],
+    "category": "graph-fields"
+  },
+  {
+    "id": "g012",
+    "query": "What relationship was described between current Code Orange fields and the required target-field fit gap?",
+    "expected_topics": ["Code Orange", "current fields", "target field", "fit gap"],
+    "category": "graph-fields"
   }
 ]

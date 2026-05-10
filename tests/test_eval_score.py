@@ -364,6 +364,39 @@ class TestJudgeModelScoring(unittest.TestCase):
         self.assertIn("topic-a", captured["body"])
         self.assertIn("topic-b", captured["body"])
 
+    def test_judge_prompt_includes_graph_evidence(self):
+        payload = {
+            "choices": [
+                {"message": {"content": '{"grounded":1,"fact_consistent":1,"complete":1,"reason":"ok"}'}}
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_resp
+        mock_ctx.__exit__.return_value = False
+        captured = {}
+
+        def fake_urlopen(req, timeout=60):
+            captured["body"] = req.data.decode("utf-8")
+            return mock_ctx
+
+        with patch.dict(os.environ, {
+            "EVAL_JUDGE_ENABLED": "true",
+            "EVAL_JUDGE_URL": "http://judge.local/v1",
+            "EVAL_JUDGE_MODEL": "judge-model",
+        }, clear=False), patch("scripts.eval_score.urllib.request.urlopen", side_effect=fake_urlopen):
+            out = score_module.score_with_judge_model(
+                "query",
+                "answer",
+                [{"content": "citation"}],
+                ["topic-a"],
+                [{"seed_label": "Code Orange"}],
+                [{"kind": "graph", "evidence": {"seed_label": "Code Orange"}}],
+            )
+        self.assertIsNotNone(out)
+        self.assertIn("Code Orange", captured["body"])
+
     def test_scored_field_added(self):
         """Scored field is added to each result."""
         report = self._make_report(with_judge=True)

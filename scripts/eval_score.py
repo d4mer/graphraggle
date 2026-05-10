@@ -74,7 +74,13 @@ def parse_judge_output(judge_output: dict) -> dict | None:
 
 # ── Heuristic scorer (deterministic fallback) ────────────────────────────────
 
-def heuristic_score(answer: str, citations: list, query: str) -> dict:
+def heuristic_score(
+    answer: str,
+    citations: list,
+    query: str,
+    graph_evidence: list | None = None,
+    combined_evidence: list | None = None,
+) -> dict:
     """Apply heuristic scoring when no judge output is available.
 
     This is a deterministic, keyword-based fallback for CI environments
@@ -83,10 +89,10 @@ def heuristic_score(answer: str, citations: list, query: str) -> dict:
     """
     answer_lower = answer.lower() if answer else ""
     query_lower = query.lower() if query else ""
-    has_citations = len(citations) > 0
+    has_evidence = bool(citations) or bool(graph_evidence) or bool(combined_evidence)
 
     # Grounded: answer references something in citations (has citations + non-empty)
-    grounded = 1 if has_citations and len(answer_lower) > 10 else 0
+    grounded = 1 if has_evidence and len(answer_lower) > 10 else 0
 
     # Fact consistent: no obvious contradiction markers
     contradiction_markers = [
@@ -110,7 +116,14 @@ def heuristic_score(answer: str, citations: list, query: str) -> dict:
     }
 
 
-def score_with_judge_model(query: str, answer: str, citations: list, expected_topics: list | None = None) -> dict | None:
+def score_with_judge_model(
+    query: str,
+    answer: str,
+    citations: list,
+    expected_topics: list | None = None,
+    graph_evidence: list | None = None,
+    combined_evidence: list | None = None,
+) -> dict | None:
     enabled = os.getenv("EVAL_JUDGE_ENABLED", "false").lower() == "true"
     if not enabled:
         return None
@@ -123,12 +136,14 @@ def score_with_judge_model(query: str, answer: str, citations: list, expected_to
 
     prompt = (
         "You are a strict evaluator for a retrieval-augmented answer. Return ONLY JSON with keys grounded, fact_consistent, complete, reason. "
-        "Each score must be 0 or 1. Grounded means the answer is directly supported by the provided citations. "
+        "Each score must be 0 or 1. Grounded means the answer is directly supported by the provided evidence. "
         "Complete means the answer covers the expected topics when they are provided.\n\n"
         f"Query: {query}\n"
         f"Expected topics: {json.dumps(expected_topics or [], ensure_ascii=True)}\n"
         f"Answer: {answer}\n"
         f"Citations: {json.dumps(citations, ensure_ascii=True)[:8000]}\n"
+        f"Graph evidence: {json.dumps(graph_evidence or [], ensure_ascii=True)[:8000]}\n"
+        f"Combined evidence: {json.dumps(combined_evidence or [], ensure_ascii=True)[:8000]}\n"
     )
 
     payload = {
@@ -248,6 +263,10 @@ def score_report(report_path: str) -> dict:
         cd = r.get("candidate", {})
         citations_bl = bl.get("citations", [])
         citations_cd = cd.get("citations", [])
+        graph_bl = bl.get("graph_evidence", [])
+        graph_cd = cd.get("graph_evidence", [])
+        combined_bl = bl.get("combined_evidence", [])
+        combined_cd = cd.get("combined_evidence", [])
 
         scored = {}
 
@@ -260,20 +279,34 @@ def score_report(report_path: str) -> dict:
         # Try judge output first, fall back to heuristic
         bl_rubric = parse_judge_output(bl_judge)
         if bl_rubric is None:
-            bl_rubric = score_with_judge_model(query_text, bl.get("answer", ""), citations_bl, expected_topics)
+            bl_rubric = score_with_judge_model(
+                query_text,
+                bl.get("answer", ""),
+                citations_bl,
+                expected_topics,
+                graph_bl,
+                combined_bl,
+            )
         if bl_rubric is None:
             bl_rubric = heuristic_score(
-                bl.get("answer", ""), citations_bl, query_text
+                bl.get("answer", ""), citations_bl, query_text, graph_bl, combined_bl
             )
         baseline_scores.append(bl_rubric)
         scored["baseline"] = bl_rubric
 
         cd_rubric = parse_judge_output(cd_judge)
         if cd_rubric is None:
-            cd_rubric = score_with_judge_model(query_text, cd.get("answer", ""), citations_cd, expected_topics)
+            cd_rubric = score_with_judge_model(
+                query_text,
+                cd.get("answer", ""),
+                citations_cd,
+                expected_topics,
+                graph_cd,
+                combined_cd,
+            )
         if cd_rubric is None:
             cd_rubric = heuristic_score(
-                cd.get("answer", ""), citations_cd, query_text
+                cd.get("answer", ""), citations_cd, query_text, graph_cd, combined_cd
             )
         candidate_scores.append(cd_rubric)
         scored["candidate"] = cd_rubric

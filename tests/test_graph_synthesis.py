@@ -31,3 +31,9 @@ class TestGraphSynthesis(unittest.TestCase):
         answer, error = _run_async(gs.synthesize_graph_aware_answer(client, "q", []))
         self.assertIsNone(answer)
         self.assertIsNotNone(error)
+
+    def test_marks_no_context_answer_unusable(self):
+        self.assertFalse(gs.is_graph_synthesis_answer_usable("No relevant context found for the query."))
+
+    def test_marks_grounded_answer_usable(self):
+        self.assertTrue(gs.is_graph_synthesis_answer_usable("Code Orange provides SAP fields to OMP through the interface."))

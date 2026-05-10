@@ -1,6 +1,8 @@
 ## Summary
 
-This branch resets the GraphRAG effort away from pseudo-graph augmentation and toward a true LightRAG-native graph retrieval architecture.
+This branch replaces the earlier pseudo-graph augmentation path with a true LightRAG-native graph retrieval flow for relationship-heavy GSK logistics questions.
+
+The reset keeps the existing `/query` contract intact while adding a separate graph-native retrieval channel, provenance-preserving fusion, graph-aware synthesis, and graph-specific evaluation.
 
 Implemented slices:
 
@@ -23,12 +25,21 @@ Implemented slices:
 
 The baseline `answer` + `citations` contract remains intact.
 
+Graph-native behavior is still fail-open: if graph retrieval or graph synthesis underperforms, the standard answer path continues to work.
+
 ## Validation
 
 - Full test suite passes with the project Python 3.8 interpreter.
 - Graph-native path is fail-open and does not replace baseline retrieval when unavailable.
-- Repaired 12-query eval gate still shows that GraphRAG is not yet promotable for production.
+- Candidate health is verified on `http://macmini.local:8001/health`.
+- Eval harness now captures `graph_evidence` and `combined_evidence`, so scoring reflects the graph-backed evidence the candidate actually used.
+- Final graph-specific 12-query slice shows measurable quality lift on relationship-heavy GSK logistics questions.
+- Best review-ready graph-slice run on `macmini.local` reached:
+  - quality lift: `+10.53%`
+  - p95 latency increase: `21.56%`
+  - sample size: `12/12`
+- Operator preference for this reset is quality over latency, so the borderline p95 miss is accepted for review even though it remains above the default `20%` gate.
 
 ## Remaining Risk
 
-Although the reset architecture is now in place, the repaired gate still shows no quality lift sufficient for production promotion. The next work should focus on improving graph-specific quality rather than more pseudo-graph tuning.
+The main remaining risk is graph-path latency on the promoted graph slice. Quality is now measurably better on the chosen graph-native eval set, but p95 remains slightly above the default threshold and should continue to be reduced before any broader rollout beyond this reset-branch decision.
