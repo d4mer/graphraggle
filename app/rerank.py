@@ -21,6 +21,15 @@ RERANK_TOP_K = 5
 RERANK_TIMEOUT_SECONDS = 10
 
 
+def build_rerank_url(rerank_host: str) -> str:
+    base = rerank_host.rstrip("/")
+    if base.endswith("/rerank"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/rerank"
+    return f"{base}/v1/rerank"
+
+
 def citation_to_text(citation: dict[str, Any]) -> str:
     """Extract a human-readable text snippet from a citation dict for reranking."""
     for key in ("content", "text", "chunk_text", "body"):
@@ -68,7 +77,7 @@ async def call_rerank_endpoint(
             headers["Authorization"] = f"Bearer {rerank_api_key}"
         async with httpx.AsyncClient(timeout=RERANK_TIMEOUT_SECONDS) as http_client:
             resp = await http_client.post(
-                f"{rerank_host.rstrip('/')}/rerank",
+                build_rerank_url(rerank_host),
                 json=payload,
                 headers=headers or None,
             )

@@ -181,6 +181,68 @@ class TestRerankCitationsApplied(unittest.TestCase):
         self.assertEqual(meta["rerank_input_count"], 3)
         self.assertEqual(meta["rerank_output_count"], 3)
 
+    def test_calls_v1_rerank_with_auth_header(self):
+        from app.rerank import rerank_citations
+
+        citations = [{"content": "doc A"}, {"content": "doc B"}]
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "results": [
+                {"index": 0, "relevance_score": 0.9},
+                {"index": 1, "relevance_score": 0.1},
+            ]
+        }
+        captured = {}
+
+        def post_fn(*args, **kwargs):
+            captured["url"] = args[0]
+            captured["headers"] = kwargs.get("headers")
+            captured["json"] = kwargs.get("json")
+            return mock_response
+
+        with patch.object(_rerank_module, "httpx") as mock_httpx:
+            _setup_httpx_mock(mock_httpx, post_fn)
+            _run_async(
+                rerank_citations(
+                    "test query",
+                    citations,
+                    rerank_host="http://rerank:8080",
+                    rerank_api_key="secret",
+                    rerank_model="model-x",
+                )
+            )
+
+        self.assertEqual(captured["url"], "http://rerank:8080/v1/rerank")
+        self.assertEqual(captured["headers"], {"Authorization": "Bearer secret"})
+        self.assertEqual(captured["json"]["documents"], ["doc A", "doc B"])
+        self.assertEqual(captured["json"]["model"], "model-x")
+
+    def test_accepts_full_rerank_endpoint_url(self):
+        from app.rerank import rerank_citations
+
+        citations = [{"content": "doc A"}]
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "results": [{"index": 0, "relevance_score": 0.9}]
+        }
+        captured = {}
+
+        def post_fn(*args, **kwargs):
+            captured["url"] = args[0]
+            return mock_response
+
+        with patch.object(_rerank_module, "httpx") as mock_httpx:
+            _setup_httpx_mock(mock_httpx, post_fn)
+            _run_async(
+                rerank_citations(
+                    "test query",
+                    citations,
+                    rerank_host="http://rerank:8080/v1/rerank",
+                )
+            )
+
+        self.assertEqual(captured["url"], "http://rerank:8080/v1/rerank")
+
     def test_handles_partial_results(self):
         """Rerank only returns some indices; others preserved in original order."""
         from app.rerank import rerank_citations
