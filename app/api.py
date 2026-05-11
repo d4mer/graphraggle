@@ -70,6 +70,143 @@ GRAPH_QUERY_KEYWORDS = (
     "policy",
 )
 WEAK_ANSWER_MARKERS = ("not enough information", "do not have enough information")
+OLLAMA_BRIDGE_MODEL = "lightrag:latest"
+
+
+def normalize_ollama_stream_response(raw_body: bytes, *, response_key: str) -> bytes:
+    text = raw_body.decode("utf-8", errors="replace")
+    chunks: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            return raw_body
+        if isinstance(parsed, dict):
+            chunks.append(parsed)
+    if not chunks:
+        return raw_body
+
+    final_chunk = dict(chunks[-1])
+    aggregated = ""
+    if response_key == "message":
+        for chunk in chunks:
+            message = chunk.get("message")
+            if isinstance(message, dict):
+                aggregated += str(message.get("content", ""))
+        final_message = dict(final_chunk.get("message") or {})
+        final_message["content"] = aggregated
+        final_chunk["message"] = final_message
+    else:
+        for chunk in chunks:
+            aggregated += str(chunk.get(response_key, ""))
+        final_chunk[response_key] = aggregated
+    final_chunk["done"] = True
+    return (json.dumps(final_chunk) + "\n").encode("utf-8")
+
+
+def request_wants_stream(raw_body: bytes) -> bool:
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return False
+    return bool(payload.get("stream")) if isinstance(payload, dict) else False
+
+
+def parse_json_body(raw_body: bytes) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def extract_ollama_prompt(payload: dict[str, Any]) -> str:
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""
+
+
+async def answer_ollama_bridge_prompt(prompt: str, top_k: int = 4) -> str:
+    if not prompt.strip():
+        return ""
+    envelope = await query(QueryRequest(query=prompt, top_k=top_k))
+    data = envelope.data if isinstance(envelope.data, dict) else {}
+    answer = data.get("answer") if isinstance(data, dict) else None
+    return answer.strip() if isinstance(answer, str) else ""
+
+
+def build_ollama_chat_response(model: str, content: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "created_at": "2024-01-15T00:00:00Z",
+        "message": {
+            "role": "assistant",
+            "content": content,
+            "images": None,
+        },
+        "done_reason": "stop",
+        "done": True,
+        "total_duration": 0,
+        "load_duration": 0,
+        "prompt_eval_count": 0,
+        "prompt_eval_duration": 0,
+        "eval_count": 0,
+        "eval_duration": 0,
+    }
+
+
+def build_ollama_generate_response(model: str, content: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "created_at": "2024-01-15T00:00:00Z",
+        "response": content,
+        "done": True,
+        "done_reason": "stop",
+        "context": [],
+        "total_duration": 0,
+        "load_duration": 0,
+        "prompt_eval_count": 0,
+        "prompt_eval_duration": 0,
+        "eval_count": 0,
+        "eval_duration": 0,
+    }
+
+
+async def maybe_handle_ollama_bridge(raw_body: bytes, *, response_kind: str) -> Response | None:
+    payload = parse_json_body(raw_body)
+    if not payload:
+        return None
+    model = payload.get("model")
+    if model != OLLAMA_BRIDGE_MODEL:
+        return None
+
+    prompt = extract_ollama_prompt(payload)
+    answer = await answer_ollama_bridge_prompt(prompt, top_k=4)
+    if response_kind == "chat":
+        body = build_ollama_chat_response(str(model), answer)
+    else:
+        body = build_ollama_generate_response(str(model), answer)
+
+    media_type = "application/json"
+    if request_wants_stream(raw_body):
+        media_type = "application/x-ndjson"
+        return Response(content=(json.dumps(body) + "\n").encode("utf-8"), media_type=media_type)
+    return Response(content=json.dumps(body), media_type=media_type)
 
 
 @app.on_event("startup")
@@ -997,12 +1134,28 @@ async def api_ps():
 @app.post("/api/generate")
 async def api_generate(request: Request):
     body = await request.body()
+    bridged = await maybe_handle_ollama_bridge(body, response_kind="generate")
+    if bridged is not None:
+        return bridged
     resp = await client.proxy("POST", "/api/generate", body=body, content_type=request.headers.get("content-type"))
-    return Response(content=resp.content, media_type=resp.headers.get("content-type", "application/json"))
+    content = resp.content
+    media_type = resp.headers.get("content-type", "application/json")
+    if request_wants_stream(body):
+        content = normalize_ollama_stream_response(resp.content, response_key="response")
+        media_type = "application/x-ndjson"
+    return Response(content=content, media_type=media_type)
 
 
 @app.post("/api/chat")
 async def api_chat(request: Request):
     body = await request.body()
+    bridged = await maybe_handle_ollama_bridge(body, response_kind="chat")
+    if bridged is not None:
+        return bridged
     resp = await client.proxy("POST", "/api/chat", body=body, content_type=request.headers.get("content-type"))
-    return Response(content=resp.content, media_type=resp.headers.get("content-type", "application/json"))
+    content = resp.content
+    media_type = resp.headers.get("content-type", "application/json")
+    if request_wants_stream(body):
+        content = normalize_ollama_stream_response(resp.content, response_key="message")
+        media_type = "application/x-ndjson"
+    return Response(content=content, media_type=media_type)
