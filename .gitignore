@@ -17,3 +17,7 @@ source_docs/
 uploads/
 logs/
 state/
+
+# Evaluation reports
+docs/ops/runs/*.json
+docs/ops/runs/*.md
