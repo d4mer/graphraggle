@@ -27,14 +27,14 @@ async def generate_document(query: str, document_type: str) -> dict:
     for ref in references:
         file_path = ref.get("file_path", "")
         content = ref.get("content") or []
-        joined = "\\n\\n".join(content)
+        joined = "\n\n".join(content)
         if joined:
-            context_parts.append(f"Source: {file_path}\\n{joined}")
-    context = "\\n\\n".join(context_parts) if context_parts else retrieval.get("response", "")
+            context_parts.append(f"Source: {file_path}\n{joined}")
+    context = "\n\n".join(context_parts) if context_parts else retrieval.get("response", "")
     prompt = (
-        f"{PROMPTS[document_type]}\\n\\n"
-        f"User request:\\n{query}\\n\\n"
-        f"Context:\\n{context}\\n\\n"
+        f"{PROMPTS[document_type]}\n\n"
+        f"User request:\n{query}\n\n"
+        f"Context:\n{context}\n\n"
         "Return only the requested document."
     )
     llm = await client.post_json(

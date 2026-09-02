@@ -104,11 +104,27 @@ INGEST_SCAN_INTERVAL_SECONDS=30
 INGEST_MAX_RETRIES=3
 REQUEST_TIMEOUT_SECONDS=300
 
+# Retrieval defaults. "mix" returns KG context AND raw source chunks;
+# "hybrid" returns only index-time entity/relation summaries.
+RETRIEVAL_MODE_DEFAULT=mix
+BRIDGE_TOP_K=40
+CHUNK_TOP_K=16
+CITATION_TOP_K=12
+BRIDGE_HISTORY_TURNS=3
+# Leave false until the synthesis prompt carries real edge content (Stage 6).
+GRAPH_SYNTHESIS_REPLACE_ANSWER=False
+
 PORT=9621
 WORKERS=2
 MAX_ASYNC=4
 MAX_PARALLEL_INSERT=2
 TIMEOUT=150
+
+# Context budget. Without these, entity and relation context can crowd
+# chunk text out of the window, which is what makes answers generic.
+MAX_ENTITY_TOKENS=6000
+MAX_RELATION_TOKENS=8000
+MAX_TOTAL_TOKENS=30000
 
 LIGHTRAG_API_KEY={lightrag_api_key}
 WHITELIST_PATHS=/health

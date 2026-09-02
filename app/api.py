@@ -34,7 +34,7 @@ from .graphrag import (
 from .graph_native import build_graph_native_metadata, fetch_graph_native_evidence
 from .graph_fusion import fuse_graph_and_vector_evidence
 from .graph_synthesis import is_graph_synthesis_answer_usable, synthesize_graph_aware_answer
-from .rerank import RERANK_TOP_K, rerank_citations, truncate_citations
+from .rerank import rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
     derive_readiness,
@@ -141,13 +141,47 @@ def extract_ollama_prompt(payload: dict[str, Any]) -> str:
     return ""
 
 
-async def answer_ollama_bridge_prompt(prompt: str, top_k: int = 4) -> str:
+def build_sources_block(citations: list[dict[str, Any]]) -> str:
+    """Render citations as a markdown Sources block for the OpenWebUI bridge.
+
+    The bridge returns a plain string, so citations are appended to the answer
+    body. Returns "" when there is nothing to show.
+    """
+    seen: set[str] = set()
+    lines: list[str] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        path = extract_citation_path(citation)
+        if not path:
+            continue
+        label = path.rsplit("/", 1)[-1]
+        if label in seen:
+            continue
+        seen.add(label)
+        company = citation.get("company")
+        suffix = f" — {company}" if isinstance(company, str) and company.strip() else ""
+        lines.append(f"{len(lines) + 1}. {label}{suffix}")
+    if not lines:
+        return ""
+    return "\n\n---\n\n**Sources**\n\n" + "\n".join(lines)
+
+
+async def answer_ollama_bridge_prompt(prompt: str, top_k: int | None = None) -> str:
     if not prompt.strip():
         return ""
-    envelope = await query(QueryRequest(query=prompt, top_k=top_k))
+    envelope = await query(
+        QueryRequest(query=prompt, top_k=top_k or settings.bridge_top_k)
+    )
     data = envelope.data if isinstance(envelope.data, dict) else {}
     answer = data.get("answer") if isinstance(data, dict) else None
-    return answer.strip() if isinstance(answer, str) else ""
+    answer = answer.strip() if isinstance(answer, str) else ""
+    if not answer:
+        return ""
+    citations = data.get("citations") if isinstance(data, dict) else None
+    if isinstance(citations, list):
+        answer += build_sources_block(citations)
+    return answer
 
 
 def build_ollama_chat_response(model: str, content: str) -> dict[str, Any]:
@@ -196,7 +230,7 @@ async def maybe_handle_ollama_bridge(raw_body: bytes, *, response_kind: str) -> 
         return None
 
     prompt = extract_ollama_prompt(payload)
-    answer = await answer_ollama_bridge_prompt(prompt, top_k=4)
+    answer = await answer_ollama_bridge_prompt(prompt)
     if response_kind == "chat":
         body = build_ollama_chat_response(str(model), answer)
     else:
@@ -696,9 +730,10 @@ async def upload(file: UploadFile = File(...), company: str | None = Form(defaul
 async def query(req: QueryRequest):
     requested_company = normalize_company(req.company)
     explicit_mode = req.mode is not None
-    retrieval_mode = req.mode or "hybrid"
+    retrieval_mode = req.mode or settings.retrieval_mode_default
     transcript_like = is_transcript_like_query(req.query)
     top_k = max(req.top_k, 24) if transcript_like else req.top_k
+    chunk_top_k = req.chunk_top_k or settings.chunk_top_k
 
     # Parse transcript keywords for multi-query trigger
     mq_transcript_keywords = parse_keywords_csv(settings.multi_query_transcript_keywords)
@@ -714,6 +749,7 @@ async def query(req: QueryRequest):
                 "query": query_text,
                 "mode": mode,
                 "top_k": top_k,
+                "chunk_top_k": chunk_top_k,
                 "include_references": True,
                 "include_chunk_content": True,
             },
@@ -768,11 +804,12 @@ async def query(req: QueryRequest):
             if rerank_meta.get("rerank_applied"):
                 scoped_citations = reranked_citations
 
-        scoped_citations = truncate_citations(scoped_citations, top_k=RERANK_TOP_K)
+        scoped_citations = truncate_citations(scoped_citations, top_k=settings.citation_top_k)
         return scoped_citations, rerank_meta
 
     fallback_used = False
     fallback_reason = None
+    fallback_answer_used = False
 
     # ── First pass: original query ──────────────────────────────────────
     answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
@@ -840,28 +877,36 @@ async def query(req: QueryRequest):
         total_before_dedupe = len(all_citations)
         total_after_dedupe = len(all_citations)
 
-    # ── Fallback logic (only for single-query or fail-open path) ────────
+    # ── Fallback (additive) ─────────────────────────────────────────────
+    # A weak primary pass ADDS evidence; it does not replace a good answer.
+    # A precise answer citing a single document is not a failure, so the
+    # naive-mode answer is only used when the primary answer is empty.
     weak_reason = None
     if first_weak_reason and retrieval_mode != "bypass":
         fallback_used = True
         fallback_reason = first_weak_reason
-        retrieval_mode = "naive"
-        # Re-run first pass with naive mode
-        answer, all_citations_fallback, _, _, _ = await execute_query_pass(retrieval_mode, req.query)
-        # If multi-query was triggered, re-merge with fallback
+        fallback_mode = "naive"
+        primary_answer = answer
+
+        fallback_answer, all_citations_fallback, _, _, _ = await execute_query_pass(
+            fallback_mode, req.query
+        )
+
+        # Primary citations stay first; fallback evidence is appended.
+        groups_fallback = [merged_citations, all_citations_fallback]
         if mq_triggered and not mq_error:
-            groups_fallback = [all_citations_fallback]
             for rw_query in (rewrites if rewrites else []):
                 try:
-                    _, rw_citations, _, _, _ = await execute_query_pass(retrieval_mode, rw_query)
+                    _, rw_citations, _, _, _ = await execute_query_pass(fallback_mode, rw_query)
                     groups_fallback.append(rw_citations)
                 except Exception:
                     mq_error = "rewrite_retrieval_failed"
-                    groups_fallback.append([])
                     break
-            merged_citations = merge_and_dedupe_citations(groups_fallback)
-        else:
-            merged_citations = all_citations_fallback
+        merged_citations = merge_and_dedupe_citations(groups_fallback)
+
+        if not primary_answer.strip():
+            answer = fallback_answer
+            fallback_answer_used = True
 
     # ── GraphRAG adaptive expansion (after merge, before scope filter) ───
     graph_enabled = settings.graph_expansion_enabled
@@ -972,9 +1017,11 @@ async def query(req: QueryRequest):
         "retrieval_mode_used": retrieval_mode,
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
+        "fallback_answer_used": fallback_answer_used,
         "explicit_mode": explicit_mode,
         "transcript_like_query": transcript_like,
         "top_k_used": top_k,
+        "chunk_top_k_used": chunk_top_k,
         "rerank_enabled": rerank_meta["rerank_enabled"],
         "rerank_applied": rerank_meta["rerank_applied"],
         "rerank_error": rerank_meta["rerank_error"],
@@ -1011,7 +1058,9 @@ async def query(req: QueryRequest):
 
     graph_synthesis_applied = False
     graph_synthesis_error = None
-    if graph_native_applied and combined_evidence:
+    if not settings.graph_synthesis_replace_answer:
+        graph_synthesis_error = "graph_synthesis_replacement_disabled"
+    elif graph_native_applied and combined_evidence:
         synthesized_answer, graph_synthesis_error = await synthesize_graph_aware_answer(client, req.query, combined_evidence)
         if is_graph_synthesis_answer_usable(synthesized_answer):
             answer = synthesized_answer

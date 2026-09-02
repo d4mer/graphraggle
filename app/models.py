@@ -14,6 +14,7 @@ class QueryRequest(BaseModel):
     query: str
     company: str | None = None
     top_k: int = 12
+    chunk_top_k: int | None = None
     mode: Literal["mix", "hybrid", "local", "global", "naive", "bypass"] | None = None
     thread_id: str | None = None
 
