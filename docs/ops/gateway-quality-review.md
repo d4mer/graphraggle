@@ -6,6 +6,16 @@ Branch reviewed: `packet-17-true-graphrag-reset` @ `0c23096`.
 
 ---
 
+> **Corrections (post-review).** Four claims in the original draft were overstated or
+> wrong and have been fixed inline: (1) A2 and B2 presented the graph-synthesis
+> replacement and the `bypass`-mode pseudo-graph expansion as always running. Both are
+> gated by flags that default to `false` (`GRAPH_NATIVE_ENABLED`, `GRAPH_EXPANSION_ENABLED`)
+> and the live `.env` was never inspected — they are defects *if enabled*. (2) A3 said
+> `hybrid` gives summaries only; KG modes also return entity-linked chunks. (3) The
+> proposed token-budget pins equal LightRAG's defaults (no-op). (4) The advice to disable
+> LightRAG's internal rerank is probably backwards. The flag-independent defects — A1,
+> A3 (mode default), A4, A5, A6, A7, B1 — stand as written.
+
 ## 0. Verdict
 
 The gap is **not** a model or index problem. The LightRAG WebUI calls
@@ -19,7 +29,7 @@ Ranked by expected impact on the OpenWebUI path:
 | # | Defect | File | Impact |
 |---|--------|------|--------|
 | A1 | Bridge hardcodes `top_k=4` | `api.py:190,144` | **Critical** |
-| A2 | Graph synthesis replaces the answer with a ≤60-word summary of node *counts* | `api.py:1012`, `graph_synthesis.py` | **Critical** |
+| A2 | Graph synthesis replaces the answer with a ≤60-word summary of node *counts* (**only if `GRAPH_NATIVE_ENABLED`; live value unverified**) | `api.py:1012`, `graph_synthesis.py` | **Critical** |
 | A3 | Default retrieval mode is `hybrid`, not `mix` | `api.py:700` | High |
 | A4 | Weak-signal fallback overwrites the answer with `naive` mode | `api.py:855` | High |
 | A5 | Conversation history dropped | `api.py:126` | High |
@@ -73,7 +83,7 @@ if graph_native_applied and combined_evidence:
 then the prompt uses only the counts. **The relationship content is retrieved and
 thrown away.** A relationship question cannot be answered from `nodes=12 edges=8`.
 
-Route breadth makes this the common case, not the edge case. `classify_graph_route`
+If the flag is enabled, route breadth makes this the common case rather than the edge case; if it is left at its default (`false`) this path never runs. `classify_graph_route`
 matches `GRAPH_QUERY_KEYWORDS` = process, shipment, code orange, ecommit, firm horizon,
 dashboard, exception, logistics, cmo, consolidation, transport, freight, **policy** —
 most real queries in this corpus.
@@ -93,8 +103,9 @@ Two fixes, in order of preference:
 retrieval_mode = req.mode or "hybrid"
 ```
 
-In LightRAG, `hybrid` = local + global KG retrieval. `mix` = KG **plus** vector chunks,
-and is what the WebUI uses by default. `"mix"` is already in the `QueryRequest` literal
+In LightRAG, `hybrid` = local + global KG retrieval (context weighted toward entity and
+relationship descriptions, plus the chunks linked to them). `mix` = KG **plus** directly
+vector-retrieved chunks, and is what the WebUI uses by default. `"mix"` is already in the `QueryRequest` literal
 but is never the default. Change the default to `mix` and make it configurable.
 
 ### A4 — the `naive` fallback overwrites a good answer
@@ -155,7 +166,8 @@ with `"\n\n"`.
 *"Find graph neighbors and relationships for: …"* to `/query` in **`bypass`** mode —
 which by definition skips retrieval — and parses the LLM's parametric reply as JSON.
 `merge_graph_expansion` then injects those into the citation list as `graph://`
-pseudo-citations. This is hallucination laundered into evidence. `graph_native.py`
+pseudo-citations. This is hallucination laundered into evidence **when
+`GRAPH_EXPANSION_ENABLED` is true** (default `false`; live value unverified). `graph_native.py`
 already does this correctly against `/graph/label/search` and `/graphs`; `graphrag.py`'s
 expansion path should be deleted or rewritten against those endpoints.
 

@@ -29,20 +29,35 @@ consequence.
 
 Underneath that, three structural causes:
 
-**1. The graph is built with the wrong schema.** No index-quality variable is set
-anywhere in the repo or the installer, so LightRAG runs its defaults:
-`ENTITY_TYPES = organization, person, geo, event, category`. The corpus is SAP/OMP
-implementation material — *firm horizon, eCommit, Code Orange interface, planned goods
-receipt date, CMO scope, S4 transition*. These are not people, places or organisations.
-They are force-fit into `category` or dropped entirely. Facts whose entities never enter
-the graph are unreachable by every KG retrieval mode, which is exactly the "misses facts
-that are in the corpus" symptom.
+**1. The graph schema is generic (hypothesis, not yet proven).** No index-quality
+variable is set anywhere in the repo or the installer, so LightRAG runs its v1.4.15
+defaults: `ENTITY_TYPES = Person, Creature, Organization, Location, Event, Concept,
+Method, Content, Data, Artifact, NaturalObject`. The corpus is SAP/OMP implementation
+material — *firm horizon, eCommit, Code Orange interface, planned goods receipt date, CMO
+scope, S4 transition*. Terms like these will most plausibly land in `Concept`, `Method`,
+`Data` or `Artifact`, so they are not dropped outright, but they are typed coarsely and
+several distinct kinds of thing share one bucket. Whether that costs recall is an
+empirical question. Stage 2 tests it against the probe set on a subset; it is not the
+diagnosed root cause. (An earlier draft of this PRD claimed the defaults were
+`organization, person, geo, event, category` and that domain terms were force-fit or
+dropped. That was wrong for v1.4.15 and has been corrected.)
 
-**2. Answers are synthesised from descriptions, not sources.** `hybrid` mode — the
-gateway default — returns entity and relationship *descriptions*, which are LLM-written
-summaries produced at index time. The pipeline therefore summarises a summary. That is
-the mechanism behind "vague and generic". `mix` mode, which adds the raw chunks back, is
-in the `QueryRequest` enum and is never the default.
+**2. Answers lean on descriptions more than on sources.** `hybrid` mode — the gateway
+default — builds its context primarily from entity and relationship *descriptions*, which
+are LLM-written summaries produced at index time. (KG modes also return the chunks linked
+to the retrieved entities, so "only summaries" overstates it; the split is a matter of
+weighting, and it has not been measured here.) `mix` mode adds vector-retrieved chunks
+directly, is what the LightRAG WebUI uses by default, is in the `QueryRequest` enum, and
+was never the gateway default. Moving the default to `mix` is cheap and reversible.
+
+**Live-flag caveat.** The pseudo-graph expansion path and the graph-synthesis answer
+replacement are both gated by feature flags that default to `false`
+(`GRAPH_EXPANSION_ENABLED`, `GRAPH_NATIVE_ENABLED`). The live `.env` has not been
+inspected. Earlier drafts said these paths "still run" and are "the common case"; that is
+only true if those flags are enabled in production. The flag-independent causes — bridge
+`top_k=4`, `hybrid` default, unconditional naive-fallback overwrite, truncation to five
+citations, dropped conversation history, dropped citations, and the `\n` bug — stand
+regardless.
 
 **3. Documents are ingested whole, with no chunking strategy.** `worker.py` submits
 entire files and polls the track. Workshop transcripts and multi-hundred-page specs are
@@ -117,8 +132,11 @@ untouched.
    `RETRIEVAL_MODE_DEFAULT`.
 2. Bridge `top_k` 4 → configurable `BRIDGE_TOP_K`, default 40. Add `chunk_top_k`
    (default 16) as a distinct request parameter.
-3. Set the LightRAG context budget explicitly — `MAX_ENTITY_TOKENS`,
-   `MAX_RELATION_TOKENS`, `MAX_TOTAL_TOKENS` — so that entity and relation context cannot
+3. Pin the LightRAG context budget explicitly — `MAX_ENTITY_TOKENS`,
+   `MAX_RELATION_TOKENS`, `MAX_TOTAL_TOKENS`. **Correction:** the values pinned (6000 /
+   8000 / 30000) equal LightRAG v1.4.15's own defaults, so this is a no-op pin that
+   documents intent, not a behaviour change. Any change to the split is a Stage 1+
+   experiment. The original intent was that entity and relation context cannot
    crowd chunk text out of the window. Chunks get the majority share.
 4. Graph synthesis no longer replaces the answer. Behind
    `GRAPH_SYNTHESIS_REPLACE_ANSWER=false` initially; in Stage 4 it is rewritten rather
@@ -132,16 +150,20 @@ untouched.
    `filter_graph_neighbors_for_query`). Packet 17's PRD called for this; the code was
    added alongside it rather than replacing it. It injects LLM-invented relationships
    into the citation list as `graph://` entries.
-8. Resolve the double rerank. `RERANK_BY_DEFAULT=True` is set in LightRAG's environment
-   and the gateway reranks again on the truncated five. Keep exactly one layer — prefer
-   the gateway's, applied to the full candidate set before truncation, and set
-   `RERANK_BY_DEFAULT=False`.
+8. Investigate the double rerank. `RERANK_BY_DEFAULT=True` is set in LightRAG's
+   environment and the gateway reranks again on the truncated set. **Correction:** the
+   original instruction to disable LightRAG's rerank is probably backwards — LightRAG's
+   internal rerank decides which chunks enter the answer context, whereas the gateway's
+   only reorders the citation list afterwards. Stage 0 leaves `RERANK_BY_DEFAULT=True`.
+   Whether to keep one layer, and which, is decided with the probe set in Stage 1.
 9. Truncation moves after reranking and rises from 5 to a configurable
    `CITATION_TOP_K`, default 12.
 10. The bridge returns citations. Append a compact markdown `**Sources**` block to the
     OpenWebUI response body.
 11. The bridge threads `conversation_history` and `history_turns` from
-    `payload["messages"]` into the LightRAG request.
+    `payload["messages"]` into the LightRAG request. **Status:** not implemented.
+    `BRIDGE_HISTORY_TURNS` was added to `app/config.py` and the installer in Stage 0 but
+    nothing reads it — a dead setting until this item is done or the setting is removed.
 12. The bridge short-circuits OpenWebUI's auxiliary calls (title, tag and follow-up
     generation — identifiable by their `### Task:` preamble) to a single `bypass` call
     instead of the full pipeline.
@@ -164,15 +186,18 @@ Nothing downstream can be proven without this, so it lands before Stage 2.
 
 ### Stage 2 — Domain schema and re-extraction (subset-proven)
 
-17. Define `ENTITY_TYPES` for the implementation domain. Proposed starting set:
+17. Test a domain-specific `ENTITY_TYPES` against the v1.4.15 default set (see Problem
+    Statement cause 1) on the probe set. Proposed candidate set:
     `system, interface, process, process_step, planning_horizon, master_data_object,
     data_field, org_unit, role, decision, requirement, open_question, risk, milestone,
     exception, metric`.
 18. Author a custom entity-extraction prompt with few-shot examples drawn from the
     actual corpus, so that *firm horizon* extracts as `planning_horizon` and *Code Orange
     Interface* as `interface`.
-19. Raise `ENTITY_EXTRACT_MAX_GLEANING` from 1 to 2. Transcript chunks are
-    information-dense and a single extraction pass under-recovers.
+19. Test raising `MAX_GLEANING` from its default (believed 1; confirm in the running
+    image) to 2. The setting is read by LightRAG v1.4.15 as `MAX_GLEANING`, not
+    `ENTITY_EXTRACT_MAX_GLEANING`. Transcript chunks are information-dense and a single
+    extraction pass may under-recover; a second pass costs extra LLM calls per chunk.
 20. Build the candidate index into a **separate LightRAG `workspace`**, on a subset of
     one company's documents. This is the mechanism for proving the change without
     touching the live index — `workspace` is used here for config isolation, not tenancy.
@@ -244,7 +269,7 @@ Nothing downstream can be proven without this, so it lands before Stage 2.
 |---|---|---|---|
 | 0 — Restore fidelity | no | hours | Vagueness (primary), recall (partial) |
 | 1 — Instrumentation | no | 1 day | Prerequisite for proof |
-| 2 — Domain schema | subset | 2–3 days + build | Recall (primary) |
+| 2 — Domain schema | subset | 2–3 days + build | Recall (hypothesis; proven only if the probe set moves) |
 | 3 — Chunking | subset | 2–3 days + build | Recall, precision of retrieved span |
 | 4 — Entity-anchored retrieval | no | 3–4 days | Recall (primary), vagueness |
 | 5 — Decomposition | no | 2 days | Multi-entity coverage |
