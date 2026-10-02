@@ -71,6 +71,12 @@ GRAPH_QUERY_KEYWORDS = (
 )
 WEAK_ANSWER_MARKERS = ("not enough information", "do not have enough information")
 OLLAMA_BRIDGE_MODEL = "lightrag:latest"
+# Marker separating an answer body from the appended Sources block. Defined
+# once; used by build_sources_block and by history extraction so prior-turn
+# Sources blocks are stripped before being sent back upstream.
+SOURCES_MARKER = "\n\n---\n\n**Sources**\n\n"
+OPENWEBUI_TASK_PREFIX = "### Task:"
+MAX_HISTORY_MESSAGE_CHARS = 2000
 
 
 def normalize_ollama_stream_response(raw_body: bytes, *, response_key: str) -> bytes:
@@ -164,37 +170,35 @@ def build_sources_block(citations: list[dict[str, Any]]) -> str:
         lines.append(f"{len(lines) + 1}. {label}{suffix}")
     if not lines:
         return ""
-    return "\n\n---\n\n**Sources**\n\n" + "\n".join(lines)
+    return SOURCES_MARKER + "\n".join(lines)
 
 
-# ── Direct LightRAG bridge (production hot-patch, imported verbatim) ─────
-# Production has run this variant of the bridge since a direct hot-patch;
-# it exists in no repo branch. This import preserves its behaviour exactly:
-# POST /query/stream with mode=mix, top_k=40, chunk_top_k=20,
-# max_entity/relation_tokens=10000, max_total_tokens=32000,
-# response_type="Multiple Paragraphs", enable_rerank=true,
-# conversation_history=[] (prior Open WebUI turns are NOT forwarded),
-# include_references=true but references ignored, no Sources block, and the
-# streamed chunks aggregated into one final answer.
+# ── Direct LightRAG bridge (production hot-patch, now settings-driven) ───
+# Production has run this variant of the bridge since a direct hot-patch; it
+# was imported verbatim in the previous commit. Its parameters are now
+# settings, with defaults equal to the hot-patch values so the deployed
+# payload is byte-for-byte what production sends today, plus three opt-out
+# additions: task short-circuit (GRAG-12), conversation history (GRAG-11),
+# and an appended Sources block. Each is behind its own setting.
 
-def build_ollama_bridge_query_payload(prompt: str) -> dict[str, Any]:
+def build_ollama_bridge_query_payload(prompt: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
     return {
         "query": prompt,
         "mode": "mix",
-        "top_k": 40,
-        "chunk_top_k": 20,
-        "max_entity_tokens": 10000,
-        "max_relation_tokens": 10000,
-        "max_total_tokens": 32000,
+        "top_k": settings.bridge_top_k,
+        "chunk_top_k": settings.bridge_chunk_top_k,
+        "max_entity_tokens": settings.bridge_max_entity_tokens,
+        "max_relation_tokens": settings.bridge_max_relation_tokens,
+        "max_total_tokens": settings.bridge_max_total_tokens,
         "response_type": "Multiple Paragraphs",
         "only_need_context": False,
         "only_need_prompt": False,
         "stream": True,
-        # LightRAG WebUI defaults to history_turns=0, so keep retrieval
-        # parity by not forwarding prior Open WebUI messages here.
-        "conversation_history": [],
+        # Filled from prior Open WebUI turns when BRIDGE_HISTORY_TURNS > 0.
+        # LightRAG sends history to the LLM only; it does not affect retrieval.
+        "conversation_history": history or [],
         "user_prompt": "",
-        "enable_rerank": True,
+        "enable_rerank": settings.bridge_enable_rerank,
         "include_references": True,
         "include_chunk_content": False,
     }
@@ -218,21 +222,143 @@ def extract_stream_response_text(raw_body: bytes) -> str:
     return "".join(parts).strip()
 
 
-async def answer_ollama_bridge_prompt(payload: dict[str, Any]) -> str:
+def extract_stream_references(raw_body: bytes) -> list[dict[str, Any]]:
+    """Pull the references list from a /query/stream NDJSON body.
+
+    LightRAG emits references once, as the first line, when
+    include_references=True. Returns [] when absent or malformed.
+    """
+    text = raw_body.decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("references"), list):
+            return [r for r in parsed["references"] if isinstance(r, dict)]
+    return []
+
+
+def is_openwebui_task_prompt(prompt: str) -> bool:
+    """True only for OpenWebUI task prompts, which begin with '### Task:'."""
+    return prompt.lstrip().startswith(OPENWEBUI_TASK_PREFIX)
+
+
+def extract_ollama_history(payload: dict[str, Any], turns: int) -> list[dict[str, str]]:
+    """Previous user/assistant turns for LightRAG conversation_history.
+
+    Excludes the final user message (used as the prompt), drops system
+    messages and empty/non-string content, keeps the most recent turns*2
+    messages, strips appended Sources blocks from assistant turns, and caps
+    each message at MAX_HISTORY_MESSAGE_CHARS.
+    """
+    if turns <= 0:
+        return []
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return []
+    # Drop the final user message that extract_ollama_prompt used as the prompt.
+    trimmed = list(messages)
+    for i in range(len(trimmed) - 1, -1, -1):
+        msg = trimmed[i]
+        if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str) and msg["content"].strip():
+            del trimmed[i]
+            break
+    history: list[dict[str, str]] = []
+    for msg in trimmed:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if SOURCES_MARKER in content:
+            content = content.split(SOURCES_MARKER, 1)[0]
+        content = content[:MAX_HISTORY_MESSAGE_CHARS]
+        if not content.strip():
+            continue
+        history.append({"role": role, "content": content})
+    return history[-(turns * 2):]
+
+
+async def answer_ollama_bridge_direct(payload: dict[str, Any]) -> str:
     prompt = extract_ollama_prompt(payload)
     if not prompt.strip():
         return ""
 
-    # Match LightRAG WebUI as closely as possible by using the same
-    # streaming retrieval path and UI defaults, then aggregating the chunks
-    # back into an Ollama-compatible final answer.
-    resp = await client.proxy(
-        "POST",
-        "/query/stream",
-        body=json.dumps(build_ollama_bridge_query_payload(prompt)).encode("utf-8"),
-        content_type="application/json",
+    # Task short-circuit (GRAG-12): one bypass call, no retrieval pipeline.
+    # A task prompt embeds the chat history OpenWebUI wants summarised, so
+    # no conversation history is extracted or attached here. A failing
+    # bypass call returns "" and must never fall through to retrieval.
+    if settings.bridge_task_shortcircuit and is_openwebui_task_prompt(prompt):
+        try:
+            resp = await client.proxy(
+                "POST",
+                "/query/stream",
+                body=json.dumps({
+                    "query": prompt,
+                    "mode": "bypass",
+                    "stream": True,
+                    "include_references": False,
+                }).encode("utf-8"),
+                content_type="application/json",
+            )
+        except Exception:
+            return ""
+        return extract_stream_response_text(resp.content)
+
+    history = extract_ollama_history(payload, settings.bridge_history_turns)
+    try:
+        resp = await client.proxy(
+            "POST",
+            "/query/stream",
+            body=json.dumps(build_ollama_bridge_query_payload(prompt, history)).encode("utf-8"),
+            content_type="application/json",
+        )
+    except Exception:
+        return ""
+    answer = extract_stream_response_text(resp.content)
+    if not answer:
+        return ""
+    if settings.bridge_sources_enabled:
+        citations = [{"file_path": ref.get("file_path")} for ref in extract_stream_references(resp.content)]
+        answer += build_sources_block(citations)
+    return answer
+
+
+async def answer_ollama_bridge_pipeline(prompt: str, history: list[dict[str, str]] | None = None) -> str:
+    """Stage 0 bridge: the full gateway /query pipeline (kept for comparison)."""
+    if not prompt.strip():
+        return ""
+    envelope = await query(
+        QueryRequest(
+            query=prompt,
+            top_k=settings.bridge_top_k,
+            conversation_history=history or None,
+        )
     )
-    return extract_stream_response_text(resp.content)
+    data = envelope.data if isinstance(envelope.data, dict) else {}
+    answer = data.get("answer") if isinstance(data, dict) else None
+    answer = answer.strip() if isinstance(answer, str) else ""
+    if not answer:
+        return ""
+    citations = data.get("citations") if isinstance(data, dict) else None
+    if isinstance(citations, list):
+        answer += build_sources_block(citations)
+    return answer
+
+
+async def answer_ollama_bridge_prompt(payload: dict[str, Any]) -> str:
+    if settings.bridge_backend == "gateway_pipeline":
+        prompt = extract_ollama_prompt(payload)
+        history = extract_ollama_history(payload, settings.bridge_history_turns)
+        return await answer_ollama_bridge_pipeline(prompt, history)
+    return await answer_ollama_bridge_direct(payload)
 
 
 def build_ollama_chat_response(model: str, content: str) -> dict[str, Any]:
@@ -793,17 +919,21 @@ async def query(req: QueryRequest):
         query_text: str,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any], dict[str, Any], str | None]:
         """Execute a single retrieval pass and return (answer, citations, query_scope, rerank_meta, weak_reason)."""
-        result = await client.post_json(
-            "/query",
-            {
-                "query": query_text,
-                "mode": mode,
-                "top_k": top_k,
-                "chunk_top_k": chunk_top_k,
-                "include_references": True,
-                "include_chunk_content": True,
-            },
-        )
+        payload: dict[str, Any] = {
+            "query": query_text,
+            "mode": mode,
+            "top_k": top_k,
+            "chunk_top_k": chunk_top_k,
+            "include_references": True,
+            "include_chunk_content": True,
+        }
+        # History keys are added only when present so the payload stays
+        # byte-for-byte identical when no history is threaded. LightRAG
+        # (v1.4.15 and v1.5.7) has no history_turns field; turn capping is
+        # gateway-side in extract_ollama_history.
+        if req.conversation_history:
+            payload["conversation_history"] = req.conversation_history
+        result = await client.post_json("/query", payload)
         answer = str(result.get("response", ""))
         # For multi-query, scope is applied after merge, so we return raw references
         # The scope_flag indicates whether to scope now or later
