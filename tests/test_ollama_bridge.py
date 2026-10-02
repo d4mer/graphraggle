@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import app.api as api
+
+# Existing test files importlib.reload(app.config), which replaces the
+# module-level settings object. Always reach settings through app.api so we
+# mutate the instance app.api actually reads.
+
+
+def _run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _stream_body(chunks: list[dict]) -> bytes:
+    return "\n".join(json.dumps(c) for c in chunks).encode("utf-8")
+
+
+class _Resp:
+    def __init__(self, content: bytes):
+        self.content = content
+
+
+class SettingsBackupMixin(unittest.TestCase):
+    def setUp(self):
+        self.settings = api.settings
+        self._saved = {
+            name: getattr(self.settings, name)
+            for name in (
+                "bridge_backend",
+                "bridge_task_shortcircuit",
+                "bridge_history_turns",
+                "bridge_sources_enabled",
+                "bridge_top_k",
+                "bridge_chunk_top_k",
+                "bridge_max_entity_tokens",
+                "bridge_max_relation_tokens",
+                "bridge_max_total_tokens",
+                "bridge_enable_rerank",
+                "multi_query_enabled",
+                "rerank_enabled",
+                "graph_expansion_enabled",
+                "graph_native_enabled",
+            )
+        }
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(self.settings, name, value)
+
+
+class TestTaskPromptDetection(SettingsBackupMixin):
+    def test_detects_openwebui_task_prompts(self):
+        for prompt in (
+            "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.",
+            "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the chat history.",
+            "### Task:\nSuggest 3-5 relevant follow-up questions or topics that the user might be interested in.",
+            "   \n  ### Task:\nGenerate a concise title.",
+        ):
+            self.assertTrue(
+                __import__("app.api", fromlist=["x"]).is_openwebui_task_prompt(prompt),
+                prompt,
+            )
+
+    def test_rejects_normal_prompts(self):
+        for prompt in (
+            "What is the firm horizon task for CMO?",
+            "Task: summarise",
+            "",
+            "## Task: not the OpenWebUI marker",
+        ):
+            self.assertFalse(
+                __import__("app.api", fromlist=["x"]).is_openwebui_task_prompt(prompt),
+                prompt,
+            )
+
+
+class TestDirectBridgeTaskShortCircuit(SettingsBackupMixin):
+    def test_task_prompt_makes_one_bypass_call_and_no_pipeline(self):
+        import app.api as api
+
+        self.settings.bridge_task_shortcircuit = True
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "Chat about eCommit."}])))
+        with patch.object(api, "client") as client, patch.object(api, "query", new=AsyncMock()) as query_mock:
+            client.proxy = proxy
+            answer = _run_async(
+                api.answer_ollama_bridge_direct(
+                    {
+                        "model": "lightrag:latest",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing the chat history.\n"
+                                    "### Chat History:\n<chat_history>\nUSER: What is eCommit?\n"
+                                    "ASSISTANT: eCommit is a manual trigger.\n</chat_history>"
+                                ),
+                            }
+                        ],
+                    }
+                )
+            )
+        self.assertEqual(answer, "Chat about eCommit.")
+        self.assertEqual(proxy.await_count, 1)
+        path = proxy.await_args.args[1]
+        body = json.loads(proxy.await_args.kwargs["body"])
+        self.assertEqual(path, "/query/stream")
+        self.assertEqual(body["mode"], "bypass")
+        self.assertFalse(body["include_references"])
+        query_mock.assert_not_awaited()
+
+    def test_task_prompt_with_setting_off_uses_normal_path(self):
+        import app.api as api
+
+        self.settings.bridge_task_shortcircuit = False
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "full answer"}])))
+        with patch.object(api, "client") as client:
+            client.proxy = proxy
+            answer = _run_async(
+                api.answer_ollama_bridge_direct(
+                    {"messages": [{"role": "user", "content": "### Task:\nGenerate a title."}]}
+                )
+            )
+        self.assertEqual(answer, "full answer")
+        body = json.loads(proxy.await_args.kwargs["body"])
+        self.assertEqual(body["mode"], "mix")
+
+    def test_failing_bypass_returns_empty_and_never_falls_through(self):
+        import app.api as api
+
+        self.settings.bridge_task_shortcircuit = True
+        proxy = AsyncMock(side_effect=RuntimeError("upstream down"))
+        with patch.object(api, "client") as client, patch.object(api, "query", new=AsyncMock()) as query_mock:
+            client.proxy = proxy
+            answer = _run_async(
+                api.answer_ollama_bridge_direct(
+                    {"messages": [{"role": "user", "content": "### Task:\nGenerate a title."}]}
+                )
+            )
+        self.assertEqual(answer, "")
+        self.assertEqual(proxy.await_count, 1)
+        query_mock.assert_not_awaited()
+
+
+class TestExtractOllamaHistory(SettingsBackupMixin):
+    def test_excludes_final_user_message_and_system_and_respects_turns(self):
+        import app.api as api
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": "ignore me"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"},
+                {"role": "assistant", "content": "second answer"},
+                {"role": "user", "content": "follow-up question"},
+            ]
+        }
+        history = api.extract_ollama_history(payload, turns=3)
+        self.assertEqual(
+            history,
+            [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"},
+                {"role": "assistant", "content": "second answer"},
+            ],
+        )
+        capped = api.extract_ollama_history(payload, turns=1)
+        self.assertEqual(
+            capped,
+            [
+                {"role": "user", "content": "second question"},
+                {"role": "assistant", "content": "second answer"},
+            ],
+        )
+
+    def test_strips_sources_blocks(self):
+        import app.api as api
+
+        marker = api.SOURCES_MARKER
+        payload = {
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {
+                    "role": "assistant",
+                    "content": "answer body" + marker + "1. doc.pdf — GSK\n2. other.pdf",
+                },
+                {"role": "user", "content": "q2"},
+            ]
+        }
+        history = api.extract_ollama_history(payload, turns=3)
+        self.assertEqual(history[1]["content"], "answer body")
+
+    def test_strips_sources_marker_mid_message(self):
+        import app.api as api
+
+        marker = api.SOURCES_MARKER
+        payload = {
+            "messages": [
+                {"role": "assistant", "content": "keep" + marker + "cut" + marker + "cut too"},
+                {"role": "user", "content": "prompt"},
+            ]
+        }
+        history = api.extract_ollama_history(payload, turns=3)
+        self.assertEqual(history[0]["content"], "keep")
+
+    def test_drops_empty_and_non_string_caps_long(self):
+        import app.api as api
+
+        payload = {
+            "messages": [
+                {"role": "user", "content": ""},
+                {"role": "assistant", "content": None},
+                {"role": "user", "content": 42},
+                {"role": "assistant", "content": "x" * 5000},
+                {"role": "user", "content": "prompt"},
+            ]
+        }
+        history = api.extract_ollama_history(payload, turns=5)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(len(history[0]["content"]), 2000)
+
+    def test_turns_zero_returns_empty(self):
+        import app.api as api
+
+        payload = {"messages": [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]}
+        self.assertEqual(api.extract_ollama_history(payload, turns=0), [])
+        self.assertEqual(api.extract_ollama_history(payload, turns=-1), [])
+
+
+class TestDirectBridgePayloadParity(SettingsBackupMixin):
+    def test_all_additions_off_sends_hot_patch_payload(self):
+        import app.api as api
+
+        self.settings.bridge_task_shortcircuit = False
+        self.settings.bridge_history_turns = 0
+        self.settings.bridge_sources_enabled = False
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "answer"}])))
+        with patch.object(api, "client") as client:
+            client.proxy = proxy
+            _run_async(
+                api.answer_ollama_bridge_direct(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "What is eCommit?"},
+                        ]
+                    }
+                )
+            )
+        body = json.loads(proxy.await_args.kwargs["body"])
+        self.assertEqual(
+            body,
+            {
+                "query": "What is eCommit?",
+                "mode": "mix",
+                "top_k": 40,
+                "chunk_top_k": 20,
+                "max_entity_tokens": 10000,
+                "max_relation_tokens": 10000,
+                "max_total_tokens": 32000,
+                "response_type": "Multiple Paragraphs",
+                "only_need_context": False,
+                "only_need_prompt": False,
+                "stream": True,
+                "conversation_history": [],
+                "user_prompt": "",
+                "enable_rerank": True,
+                "include_references": True,
+                "include_chunk_content": False,
+            },
+        )
+
+    def test_history_filled_into_direct_payload(self):
+        import app.api as api
+
+        self.settings.bridge_history_turns = 2
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "answer"}])))
+        with patch.object(api, "client") as client:
+            client.proxy = proxy
+            _run_async(
+                api.answer_ollama_bridge_direct(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "What is eCommit?"},
+                            {"role": "assistant", "content": "eCommit is a trigger."},
+                            {"role": "user", "content": "and who owns that step?"},
+                        ]
+                    }
+                )
+            )
+        body = json.loads(proxy.await_args.kwargs["body"])
+        self.assertEqual(
+            body["conversation_history"],
+            [
+                {"role": "user", "content": "What is eCommit?"},
+                {"role": "assistant", "content": "eCommit is a trigger."},
+            ],
+        )
+
+    def test_sources_block_appended_from_stream_references(self):
+        import app.api as api
+
+        self.settings.bridge_sources_enabled = True
+        body = _stream_body(
+            [
+                {"references": [{"reference_id": "1", "file_path": "docs/ecommit.pdf"}], "response": ""},
+                {"response": "eCommit is a manual trigger."},
+            ]
+        )
+        proxy = AsyncMock(return_value=_Resp(body))
+        with patch.object(api, "client") as client:
+            client.proxy = proxy
+            answer = _run_async(
+                api.answer_ollama_bridge_direct(
+                    {"messages": [{"role": "user", "content": "What is eCommit?"}]}
+                )
+            )
+        self.assertIn("eCommit is a manual trigger.", answer)
+        self.assertIn("**Sources**", answer)
+        self.assertIn("1. ecommit.pdf", answer)
+
+    def test_sources_off_means_no_block(self):
+        import app.api as api
+
+        self.settings.bridge_sources_enabled = False
+        body = _stream_body(
+            [
+                {"references": [{"reference_id": "1", "file_path": "docs/ecommit.pdf"}], "response": ""},
+                {"response": "answer"},
+            ]
+        )
+        proxy = AsyncMock(return_value=_Resp(body))
+        with patch.object(api, "client") as client:
+            client.proxy = proxy
+            answer = _run_async(
+                api.answer_ollama_bridge_direct(
+                    {"messages": [{"role": "user", "content": "What is eCommit?"}]}
+                )
+            )
+        self.assertNotIn("**Sources**", answer)
+
+
+class TestGatewayPipelineHistoryPayload(SettingsBackupMixin):
+    """QueryRequest.conversation_history reaches every LightRAG pass."""
+
+    def _run_query(self, conversation_history):
+        import app.api as api
+        from app.models import QueryRequest
+
+        self.settings.multi_query_enabled = True
+        self.settings.rerank_enabled = False
+        self.settings.graph_expansion_enabled = False
+        self.settings.graph_native_enabled = False
+
+        payloads: list[dict] = []
+
+        async def fake_post_json(path, payload):
+            payloads.append(payload)
+            return {"response": "", "references": []}
+
+        client = MagicMock()
+        client.post_json = AsyncMock(side_effect=fake_post_json)
+        with (
+            patch.object(api, "client", client),
+            patch.object(api, "get_documents_by_paths", new=AsyncMock(return_value=[])),
+            patch.object(api, "generate_rewrites_via_bypass", new=AsyncMock(return_value=["rewrite one"])),
+        ):
+            envelope = _run_async(api.query(QueryRequest(query="what about the second one?", conversation_history=conversation_history)))
+        return payloads, envelope
+
+    def test_no_history_keys_when_empty(self):
+        payloads, _ = self._run_query(None)
+        self.assertTrue(payloads)
+        for payload in payloads:
+            self.assertNotIn("conversation_history", payload)
+            self.assertNotIn("history_turns", payload)
+
+    def test_history_reaches_primary_multi_query_and_fallback_passes(self):
+        history = [{"role": "user", "content": "first"}, {"role": "assistant", "content": "second"}]
+        payloads, _ = self._run_query(history)
+        # primary + rewrite + naive fallback (weak signal: 0 citations)
+        self.assertGreaterEqual(len(payloads), 3)
+        modes = [p["mode"] for p in payloads]
+        self.assertIn("naive", modes)
+        for payload in payloads:
+            self.assertEqual(payload["conversation_history"], history)
+            self.assertNotIn("history_turns", payload)
+
+
+class TestGatewayPipelineBridge(SettingsBackupMixin):
+    def test_pipeline_backend_uses_query_and_sources_block(self):
+        import app.api as api
+        from app.models import Envelope
+
+        self.settings.bridge_backend = "gateway_pipeline"
+        envelope = Envelope(
+            ok=True,
+            data={"answer": "pipeline answer", "citations": [{"file_path": "docs/a.pdf"}]},
+            meta={},
+            error=None,
+        )
+        with patch.object(api, "query", new=AsyncMock(return_value=envelope)) as query_mock:
+            answer = _run_async(
+                api.answer_ollama_bridge_prompt(
+                    {"messages": [{"role": "user", "content": "normal question"}]}
+                )
+            )
+        query_mock.assert_awaited_once()
+        self.assertIn("pipeline answer", answer)
+        self.assertIn("**Sources**", answer)
+        self.assertIn("1. a.pdf", answer)
+
+
+class TestAliasCollisions(unittest.TestCase):
+    LIGHTRAG_NAMES = {
+        "TOP_K",
+        "CHUNK_TOP_K",
+        "MAX_ENTITY_TOKENS",
+        "MAX_RELATION_TOKENS",
+        "MAX_TOTAL_TOKENS",
+        "RERANK_BY_DEFAULT",
+        "COSINE_THRESHOLD",
+        "MAX_GLEANING",
+        "ENTITY_TYPES",
+        "CHUNK_SIZE",
+        "CHUNK_OVERLAP_SIZE",
+        "WORKERS",
+        "TIMEOUT",
+        "PORT",
+        "MAX_ASYNC",
+        "MAX_PARALLEL_INSERT",
+    }
+
+    def test_gateway_aliases_never_equal_lightrag_names(self):
+        from app.config import Settings
+
+        aliases = {field.alias for field in Settings.model_fields.values() if field.alias}
+        collisions = aliases & self.LIGHTRAG_NAMES
+        self.assertEqual(collisions, set(), f"gateway aliases collide with LightRAG env names: {collisions}")
+
+    def test_chunk_setting_uses_gateway_prefix(self):
+        from app.config import Settings
+
+        self.assertEqual(Settings.model_fields["chunk_top_k"].alias, "GATEWAY_CHUNK_TOP_K")
+
+
+if __name__ == "__main__":
+    unittest.main()
