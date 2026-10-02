@@ -45,15 +45,40 @@ class Settings(BaseSettings):
     graph_native_max_nodes: int = Field(default=50, alias="GRAPH_NATIVE_MAX_NODES")
 
     # ── Stage 0: precision-first retrieval ──────────────────────────────
-    # Default retrieval mode. "mix" returns KG context *and* raw source
-    # chunks; "hybrid" returns only index-time entity/relation summaries.
+    # Default retrieval mode for the gateway /query pipeline (not the
+    # bridge). "mix" returns KG context *and* raw source chunks; "hybrid"
+    # weights context toward entity and relation descriptions.
     retrieval_mode_default: str = Field(default="mix", alias="RETRIEVAL_MODE_DEFAULT")
     # Evidence budget. The Ollama bridge previously hardcoded top_k=4.
     bridge_top_k: int = Field(default=40, alias="BRIDGE_TOP_K")
-    chunk_top_k: int = Field(default=16, alias="CHUNK_TOP_K")
+    # GATEWAY_ prefix: bare CHUNK_TOP_K is LightRAG's own variable (default
+    # 20) and the stack shares one .env file, so the gateway alias must not
+    # collide with it. Applies to the gateway /query pipeline only.
+    chunk_top_k: int = Field(default=16, alias="GATEWAY_CHUNK_TOP_K")
     citation_top_k: int = Field(default=12, alias="CITATION_TOP_K")
-    # Conversation turns forwarded from the bridge to LightRAG.
+    # Number of previous user/assistant exchanges forwarded from the bridge
+    # to LightRAG as conversation_history. 0 disables history entirely.
+    # LightRAG sends history to the LLM only; it does not affect retrieval.
     bridge_history_turns: int = Field(default=3, alias="BRIDGE_HISTORY_TURNS")
+
+    # ── Bridge backend selection ────────────────────────────────────────
+    # "lightrag_direct" = the direct /query/stream bridge (production
+    # hot-patch behaviour, the deployed default). "gateway_pipeline" = the
+    # Stage 0 bridge through the gateway query pipeline, kept for later
+    # comparison.
+    bridge_backend: str = Field(default="lightrag_direct", alias="BRIDGE_BACKEND")
+    # Direct-bridge retrieval parameters. Defaults equal the production
+    # hot-patch values so the deployed payload is unchanged.
+    bridge_chunk_top_k: int = Field(default=20, alias="BRIDGE_CHUNK_TOP_K")
+    bridge_max_entity_tokens: int = Field(default=10000, alias="BRIDGE_MAX_ENTITY_TOKENS")
+    bridge_max_relation_tokens: int = Field(default=10000, alias="BRIDGE_MAX_RELATION_TOKENS")
+    bridge_max_total_tokens: int = Field(default=32000, alias="BRIDGE_MAX_TOTAL_TOKENS")
+    bridge_enable_rerank: bool = Field(default=True, alias="BRIDGE_ENABLE_RERANK")
+    # GRAG-12: short-circuit OpenWebUI "### Task:" prompts with one bypass
+    # call instead of running retrieval.
+    bridge_task_shortcircuit: bool = Field(default=True, alias="BRIDGE_TASK_SHORTCIRCUIT")
+    # Append a markdown Sources block to direct-bridge answers.
+    bridge_sources_enabled: bool = Field(default=True, alias="BRIDGE_SOURCES_ENABLED")
     # When false, LightRAG's own grounded answer is never replaced by the
     # graph-synthesis pass. Re-enabled in Stage 6 once that prompt carries
     # real edge content instead of node counts.

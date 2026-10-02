@@ -17,6 +17,9 @@ class QueryRequest(BaseModel):
     chunk_top_k: int | None = None
     mode: Literal["mix", "hybrid", "local", "global", "naive", "bypass"] | None = None
     thread_id: str | None = None
+    # Prior turns forwarded to LightRAG (LLM context only; LightRAG v1.4.15
+    # and v1.5.7 have no history_turns field, so turn capping is gateway-side).
+    conversation_history: list[dict[str, str]] | None = None
 
 
 class GenerateDocumentRequest(BaseModel):
