@@ -105,12 +105,16 @@ INGEST_MAX_RETRIES=3
 REQUEST_TIMEOUT_SECONDS=300
 
 # Retrieval defaults. "mix" returns KG context AND raw source chunks;
-# "hybrid" returns only index-time entity/relation summaries.
+# "hybrid" weights context toward entity and relation descriptions; "mix"
+# also adds directly retrieved chunks.
 RETRIEVAL_MODE_DEFAULT=mix
 BRIDGE_TOP_K=40
-CHUNK_TOP_K=16
+# GATEWAY_ prefix: bare CHUNK_TOP_K is LightRAG's own variable (default 20)
+# and all services share this .env, so the gateway alias must not collide.
+GATEWAY_CHUNK_TOP_K=16
 CITATION_TOP_K=12
 BRIDGE_HISTORY_TURNS=3
+BRIDGE_TASK_SHORTCIRCUIT=True
 # Leave false until the synthesis prompt carries real edge content (Stage 6).
 GRAPH_SYNTHESIS_REPLACE_ANSWER=False
 
@@ -120,8 +124,8 @@ MAX_ASYNC=4
 MAX_PARALLEL_INSERT=2
 TIMEOUT=150
 
-# Context budget. Without these, entity and relation context can crowd
-# chunk text out of the window, which is what makes answers generic.
+# Context budget. These values equal LightRAG v1.4.15's defaults and are
+# pinned here to document intent.
 MAX_ENTITY_TOKENS=6000
 MAX_RELATION_TOKENS=8000
 MAX_TOTAL_TOKENS=30000
