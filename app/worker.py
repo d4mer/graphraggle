@@ -26,6 +26,20 @@ SUPPORTED = {".txt", ".md", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json", 
 TEXT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json", ".csv"}
 TERMINAL_SUCCESS = {"ingested"}
 LIGHTRAG_INTERNAL_DIRS = {"__enqueued__"}
+
+# macOS / Windows metadata sidecar files that should never be ingested.
+# AppleDouble: "._" prefix on macOS preserves resource forks in non-APFS
+# filesystems; they share the suffix of the real file (e.g. "._foo.txt"),
+# so the extension check would otherwise let them through.
+# .DS_Store and Thumbs.db are directory metadata written by Finder/Explorer.
+METADATA_FILE_BASENAMES = frozenset({
+    ".DS_Store",
+    "._.DS_Store",
+    "Thumbs.db",
+    "._Thumbs.db",
+    "desktop.ini",
+})
+METADATA_FILE_PREFIXES = ("._",)
 ACTIVE_DUPLICATE_STATUSES = {"accepted", "submitted", "processing", "ingested"}
 NON_RETRYABLE_FAILURE_CODES = {
     "decode_failed",
@@ -63,6 +77,19 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+def is_metadata_file(path: Path) -> bool:
+    """Return True if path is a metadata sidecar that should be ignored.
+
+    Catches macOS AppleDouble (``._`` prefix) and OS-generated junk
+    (``.DS_Store``, ``Thumbs.db``, ``desktop.ini``). Used by both the
+    filesystem scanner and the validation gate.
+    """
+    name = path.name
+    if name in METADATA_FILE_BASENAMES:
+        return True
+    return name.startswith(METADATA_FILE_PREFIXES)
+
+
 def should_skip_path(path: Path, root: Path, source_type: str) -> bool:
     if source_type != "filesystem":
         return False
@@ -70,7 +97,11 @@ def should_skip_path(path: Path, root: Path, source_type: str) -> bool:
         relative_parts = path.relative_to(root).parts
     except ValueError:
         return False
-    return any(part in LIGHTRAG_INTERNAL_DIRS for part in relative_parts)
+    if any(part in LIGHTRAG_INTERNAL_DIRS for part in relative_parts):
+        return True
+    if is_metadata_file(path):
+        return True
+    return False
 
 
 def infer_company_from_path(path: Path, root: Path, source_type: str) -> tuple[str | None, str, str]:

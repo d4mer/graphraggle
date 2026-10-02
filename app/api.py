@@ -167,21 +167,72 @@ def build_sources_block(citations: list[dict[str, Any]]) -> str:
     return "\n\n---\n\n**Sources**\n\n" + "\n".join(lines)
 
 
-async def answer_ollama_bridge_prompt(prompt: str, top_k: int | None = None) -> str:
+# ── Direct LightRAG bridge (production hot-patch, imported verbatim) ─────
+# Production has run this variant of the bridge since a direct hot-patch;
+# it exists in no repo branch. This import preserves its behaviour exactly:
+# POST /query/stream with mode=mix, top_k=40, chunk_top_k=20,
+# max_entity/relation_tokens=10000, max_total_tokens=32000,
+# response_type="Multiple Paragraphs", enable_rerank=true,
+# conversation_history=[] (prior Open WebUI turns are NOT forwarded),
+# include_references=true but references ignored, no Sources block, and the
+# streamed chunks aggregated into one final answer.
+
+def build_ollama_bridge_query_payload(prompt: str) -> dict[str, Any]:
+    return {
+        "query": prompt,
+        "mode": "mix",
+        "top_k": 40,
+        "chunk_top_k": 20,
+        "max_entity_tokens": 10000,
+        "max_relation_tokens": 10000,
+        "max_total_tokens": 32000,
+        "response_type": "Multiple Paragraphs",
+        "only_need_context": False,
+        "only_need_prompt": False,
+        "stream": True,
+        # LightRAG WebUI defaults to history_turns=0, so keep retrieval
+        # parity by not forwarding prior Open WebUI messages here.
+        "conversation_history": [],
+        "user_prompt": "",
+        "enable_rerank": True,
+        "include_references": True,
+        "include_chunk_content": False,
+    }
+
+
+def extract_stream_response_text(raw_body: bytes) -> str:
+    text = raw_body.decode("utf-8", errors="replace")
+    parts: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            chunk = parsed.get("response")
+            if isinstance(chunk, str):
+                parts.append(chunk)
+    return "".join(parts).strip()
+
+
+async def answer_ollama_bridge_prompt(payload: dict[str, Any]) -> str:
+    prompt = extract_ollama_prompt(payload)
     if not prompt.strip():
         return ""
-    envelope = await query(
-        QueryRequest(query=prompt, top_k=top_k or settings.bridge_top_k)
+
+    # Match LightRAG WebUI as closely as possible by using the same
+    # streaming retrieval path and UI defaults, then aggregating the chunks
+    # back into an Ollama-compatible final answer.
+    resp = await client.proxy(
+        "POST",
+        "/query/stream",
+        body=json.dumps(build_ollama_bridge_query_payload(prompt)).encode("utf-8"),
+        content_type="application/json",
     )
-    data = envelope.data if isinstance(envelope.data, dict) else {}
-    answer = data.get("answer") if isinstance(data, dict) else None
-    answer = answer.strip() if isinstance(answer, str) else ""
-    if not answer:
-        return ""
-    citations = data.get("citations") if isinstance(data, dict) else None
-    if isinstance(citations, list):
-        answer += build_sources_block(citations)
-    return answer
+    return extract_stream_response_text(resp.content)
 
 
 def build_ollama_chat_response(model: str, content: str) -> dict[str, Any]:
@@ -229,8 +280,7 @@ async def maybe_handle_ollama_bridge(raw_body: bytes, *, response_kind: str) -> 
     if model != OLLAMA_BRIDGE_MODEL:
         return None
 
-    prompt = extract_ollama_prompt(payload)
-    answer = await answer_ollama_bridge_prompt(prompt)
+    answer = await answer_ollama_bridge_prompt(payload)
     if response_kind == "chat":
         body = build_ollama_chat_response(str(model), answer)
     else:

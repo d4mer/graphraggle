@@ -60,6 +60,25 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+# macOS / Windows metadata sidecars — shared definition with worker.py.
+# AppleDouble "._" prefix files share the real file's extension, so the
+# extension-based classification alone cannot reject them.
+METADATA_FILE_BASENAMES = frozenset({
+    ".DS_Store",
+    "._.DS_Store",
+    "Thumbs.db",
+    "._Thumbs.db",
+    "desktop.ini",
+})
+METADATA_FILE_PREFIXES = ("._",)
+
+
+def is_metadata_sidecar(name: str) -> bool:
+    """Return True if a filename is a metadata sidecar that should be rejected."""
+    if name in METADATA_FILE_BASENAMES:
+        return True
+    return name.startswith(METADATA_FILE_PREFIXES)
+
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
@@ -163,6 +182,7 @@ def validate_upload(filename: str, file_size: int) -> ValidationVerdict:
     This function does NOT check duplicates because the database is not
     available at upload time. It checks:
 
+    0. AppleDouble / metadata sidecar filter
     1. Supported extension
     2. Non-empty
     3. Large text-like threshold (auto_split)
@@ -178,6 +198,21 @@ def validate_upload(filename: str, file_size: int) -> ValidationVerdict:
     -------
     ValidationVerdict
     """
+    # 0. AppleDouble / metadata sidecar filter (defense-in-depth)
+    if is_metadata_sidecar(Path(filename).name):
+        return ValidationVerdict(
+            "reject",
+            {
+                "error_code": "metadata_sidecar_file",
+                "file_class": "unsupported",
+                "error_message": (
+                    "Metadata sidecar file (macOS AppleDouble, .DS_Store, "
+                    "Thumbs.db, etc.); rename by dropping the '._' prefix to "
+                    "ingest the real file"
+                ),
+            },
+        )
+
     file_class = classify_file(filename)
 
     # 1. Unsupported extension
@@ -273,6 +308,23 @@ def validate_file(
         file_size = path.stat().st_size
     if sha256 is None:
         sha256 = _compute_sha256(path)
+
+    # 0. AppleDouble / metadata sidecar filter (defense-in-depth)
+    if is_metadata_sidecar(filename):
+        return ValidationVerdict(
+            "reject",
+            {
+                "error_code": "metadata_sidecar_file",
+                "file_class": "unsupported",
+                "file_size": file_size,
+                "sha256": sha256,
+                "error_message": (
+                    "Metadata sidecar file (macOS AppleDouble, .DS_Store, "
+                    "Thumbs.db, etc.); drop the '._' prefix to ingest the "
+                    "real file"
+                ),
+            },
+        )
 
     file_class = classify_file(filename)
 
