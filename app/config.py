@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     bridge_task_shortcircuit: bool = Field(default=True, alias="BRIDGE_TASK_SHORTCIRCUIT")
     # Append a markdown Sources block to direct-bridge answers.
     bridge_sources_enabled: bool = Field(default=True, alias="BRIDGE_SOURCES_ENABLED")
+    # Strip complete reasoning regions (recognized boundary pairs only) from
+    # aggregated /query/stream text. qwen3.6-35b on the MLX server emits its
+    # chain-of-thought inline in the streamed response; the non-stream path
+    # does not carry it. Orphan markers are never stripped.
+    bridge_strip_reasoning: bool = Field(default=True, alias="BRIDGE_STRIP_REASONING")
     # When false, LightRAG's own grounded answer is never replaced by the
     # graph-synthesis pass. Re-enabled in Stage 6 once that prompt carries
     # real edge content instead of node counts.

@@ -76,6 +76,18 @@ OLLAMA_BRIDGE_MODEL = "lightrag:latest"
 # Sources blocks are stripped before being sent back upstream.
 SOURCES_MARKER = "\n\n---\n\n**Sources**\n\n"
 OPENWEBUI_TASK_PREFIX = "### Task:"
+
+# Recognized reasoning boundary pairs (opening, closing). Built by
+# concatenation so the literal ChatML control tokens do not appear verbatim
+# in this source file. The strip rule is strict: a region is removed ONLY
+# when a complete, recognized pair is present. An isolated opening marker
+# with no matching close is left alone — guessing where reasoning ends
+# risks cutting real answer text.
+_REASONING_OPEN = "<" + "think" + ">"
+_REASONING_CLOSE = "<" + "/think" + ">"
+REASONING_BOUNDARY_PAIRS: tuple[tuple[str, str], ...] = (
+    (_REASONING_OPEN, _REASONING_CLOSE),
+)
 MAX_HISTORY_MESSAGE_CHARS = 2000
 
 
@@ -204,6 +216,31 @@ def build_ollama_bridge_query_payload(prompt: str, history: list[dict[str, str]]
     }
 
 
+def strip_reasoning_regions(text: str) -> str:
+    """Remove complete reasoning regions from aggregated stream text.
+
+    Only removes a span delimited by a complete, recognized boundary pair
+    (see REASONING_BOUNDARY_PAIRS). Orphan markers are left untouched: an
+    isolated opening marker is not sufficient evidence of a reasoning
+    region, and stripping from it could delete real answer text.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for open_marker, close_marker in REASONING_BOUNDARY_PAIRS:
+            start = text.find(open_marker)
+            if start == -1:
+                continue
+            end = text.find(close_marker, start + len(open_marker))
+            if end == -1:
+                continue
+            text = text[:start] + text[end + len(close_marker):]
+            changed = True
+            break
+    # only trim outer whitespace the markers themselves introduced
+    return text.strip()
+
+
 def extract_stream_response_text(raw_body: bytes) -> str:
     text = raw_body.decode("utf-8", errors="replace")
     parts: list[str] = []
@@ -219,7 +256,10 @@ def extract_stream_response_text(raw_body: bytes) -> str:
             chunk = parsed.get("response")
             if isinstance(chunk, str):
                 parts.append(chunk)
-    return "".join(parts).strip()
+    text = "".join(parts).strip()
+    if settings.bridge_strip_reasoning:
+        text = strip_reasoning_regions(text)
+    return text
 
 
 def extract_stream_references(raw_body: bytes) -> list[dict[str, Any]]:

@@ -40,6 +40,7 @@ class SettingsBackupMixin(unittest.TestCase):
                 "bridge_task_shortcircuit",
                 "bridge_history_turns",
                 "bridge_sources_enabled",
+                "bridge_strip_reasoning",
                 "bridge_top_k",
                 "bridge_chunk_top_k",
                 "bridge_max_entity_tokens",
@@ -452,6 +453,54 @@ class TestAliasCollisions(unittest.TestCase):
         from app.config import Settings
 
         self.assertEqual(Settings.model_fields["chunk_top_k"].alias, "GATEWAY_CHUNK_TOP_K")
+
+
+class StripReasoningTests(SettingsBackupMixin):
+    """BRIDGE_STRIP_REASONING: only complete, recognized boundary pairs are
+    stripped; orphan markers are left alone."""
+
+    OPEN = "<" + "think" + ">"
+    CLOSE = "<" + "/think" + ">"
+
+    def test_complete_pair_stripped(self):
+        text = self.OPEN + "\nHere's a thinking process:\n1. blah [1]\n" + self.CLOSE + "\nThe answer is 42 [3]."
+        self.assertEqual(api.strip_reasoning_regions(text), "The answer is 42 [3].")
+
+    def test_orphan_open_not_stripped(self):
+        text = self.OPEN + "\nthe model rambles but never closes the region"
+        self.assertEqual(api.strip_reasoning_regions(text), text)
+
+    def test_orphan_close_not_stripped(self):
+        text = "answer text [2]" + self.CLOSE + " trailing"
+        self.assertEqual(api.strip_reasoning_regions(text), text)
+
+    def test_multiple_complete_regions_stripped(self):
+        text = (self.OPEN + "r1" + self.CLOSE + " A1 " + self.OPEN + "r2" + self.CLOSE + " A2")
+        # surrounding whitespace is answer text and is preserved verbatim
+        self.assertEqual(api.strip_reasoning_regions(text), "A1  A2")
+
+    def test_answer_markers_untouched(self):
+        text = "The answer is 42 [3][8][10]."
+        self.assertEqual(api.strip_reasoning_regions(text), text)
+
+    def test_extract_stream_applies_strip_when_enabled(self):
+        self.settings.bridge_strip_reasoning = True
+        raw = (
+            json.dumps({"references": []}).encode() + b"\n"
+            + json.dumps({"response": self.OPEN + "thinking [1]" + self.CLOSE}).encode() + b"\n"
+            + json.dumps({"response": " real answer [2]."}).encode() + b"\n"
+        )
+        self.assertEqual(api.extract_stream_response_text(raw), "real answer [2].")
+
+    def test_extract_stream_no_strip_when_disabled(self):
+        self.settings.bridge_strip_reasoning = False
+        raw = (
+            json.dumps({"response": self.OPEN + "thinking [1]" + self.CLOSE}).encode() + b"\n"
+            + json.dumps({"response": " real answer [2]."}).encode() + b"\n"
+        )
+        out = api.extract_stream_response_text(raw)
+        self.assertIn(self.OPEN, out)
+        self.assertIn("real answer [2].", out)
 
 
 if __name__ == "__main__":
