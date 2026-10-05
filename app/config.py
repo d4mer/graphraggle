@@ -91,5 +91,31 @@ class Settings(BaseSettings):
         default=False, alias="GRAPH_SYNTHESIS_REPLACE_ANSWER"
     )
 
+    # ── Issue-08 keyword fix: gateway supplies the bridge keywords ──────
+    # Master switch. Off means today's behaviour exactly (LightRAG extracts
+    # its own keywords). BRIDGE_KEYWORD_* names cannot collide with LightRAG
+    # variables (LightRAG's keyword call has no env knobs).
+    bridge_keyword_supply: bool = Field(default=True, alias="BRIDGE_KEYWORD_SUPPLY")
+    # Extra attempts after the first rejected/failed keyword call.
+    bridge_keyword_retries: int = Field(default=2, alias="BRIDGE_KEYWORD_RETRIES")
+    bridge_keyword_timeout: int = Field(default=120, alias="BRIDGE_KEYWORD_TIMEOUT")
+    bridge_keyword_max_items: int = Field(default=10, alias="BRIDGE_KEYWORD_MAX_ITEMS")
+    # Optional overrides; when empty the keyword call falls back to the same
+    # LLM_BINDING_HOST / LLM_MODEL / LLM_BINDING_API_KEY values LightRAG is
+    # configured with (already in the shared .env; never logged).
+    bridge_keyword_llm_base_url: Optional[str] = Field(
+        default=None, alias="BRIDGE_KEYWORD_LLM_BASE_URL")
+    bridge_keyword_llm_model: Optional[str] = Field(
+        default=None, alias="BRIDGE_KEYWORD_LLM_MODEL")
+    bridge_keyword_llm_api_key: Optional[str] = Field(
+        default=None, alias="BRIDGE_KEYWORD_LLM_API_KEY")
+    # Per-request thinking switch for the keyword call only (see report for
+    # what oMLX honours). Off by default; never touches thinking elsewhere.
+    bridge_keyword_no_think: bool = Field(default=False, alias="BRIDGE_KEYWORD_NO_THINK")
+    # Fallback sources: the LightRAG LLM endpoint the keyword call reuses.
+    llm_binding_host: Optional[str] = Field(default=None, alias="LLM_BINDING_HOST")
+    llm_model: Optional[str] = Field(default=None, alias="LLM_MODEL")
+    llm_binding_api_key: Optional[str] = Field(default=None, alias="LLM_BINDING_API_KEY")
+
 
 settings = Settings()
