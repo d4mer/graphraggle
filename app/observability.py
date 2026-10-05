@@ -28,6 +28,14 @@ Bridge field meanings:
 ``answer_words_final`` final answer word count
 ``reference_count``    LightRAG references returned
 ``canned_failure``     answer equals LightRAG's canned no-context response
+``keyword_source``     keyword step outcome: llm | llm_unwrapped | fallback |
+                       rejected | error | off (issue-08 keyword fix)
+``keyword_attempts``   keyword LLM attempts made (1 + retries used)
+``keyword_failure_reasons``  enum strings only, never payload or query text
+``keyword_hl_count`` / ``keyword_ll_count``  supplied keyword list sizes
+``keyword_step_ms``    wall time of the whole keyword step
+``honest_failure``     user saw the explicit keyword-failure message instead
+                       of a canned or blank answer
 """
 
 from __future__ import annotations
@@ -39,7 +47,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 # LightRAG's canned no-context answer, taken from PROMPTS["fail_response"] in
 # the installed LightRAG v1.5.7 source (/app/lightrag/prompt.py). Kept as a
@@ -141,6 +149,13 @@ def emit_bridge_log(
     answer_words_final: int = 0,
     reference_count: int = 0,
     canned_failure: bool = False,
+    honest_failure: bool = False,
+    keyword_source: str = "off",
+    keyword_attempts: int = 0,
+    keyword_failure_reasons: Optional[list] = None,
+    keyword_hl_count: int = 0,
+    keyword_ll_count: int = 0,
+    keyword_step_ms: int = 0,
 ) -> None:
     """Finish and write a bridge log line. Swallows all logging errors."""
     try:
@@ -170,6 +185,15 @@ def emit_bridge_log(
                     and answer_chars_final == 0
                     and reasoning_chars_removed > 0
                 ),
+                # Issue-08 keyword fix. Counts and enum strings only: keyword
+                # lists are query-text derivatives and are never logged.
+                "honest_failure": bool(honest_failure),
+                "keyword_source": keyword_source,
+                "keyword_attempts": keyword_attempts,
+                "keyword_failure_reasons": list(keyword_failure_reasons or []),
+                "keyword_hl_count": keyword_hl_count,
+                "keyword_ll_count": keyword_ll_count,
+                "keyword_step_ms": keyword_step_ms,
             }
         )
         _emit(line)
