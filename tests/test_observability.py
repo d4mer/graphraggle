@@ -215,6 +215,38 @@ class BridgeLoggingTests(SettingsBackupMixin):
         self.assertEqual(lines[0]["status"], "exception")
         self.assertEqual(lines[0]["exception_class"], "RuntimeError")
 
+    def test_answer_empty_after_strip_and_reasoning_only_fields(self):
+        # G3 category 4: the whole completion is one reasoning region, so the
+        # stripped answer is empty. Both new fields must be true.
+        self.settings.bridge_strip_reasoning = True
+        open_t = "<" + "think" + ">"
+        close_t = "<" + "/think" + ">"
+        raw_answer = open_t + "all of this is reasoning and nothing else" + close_t
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": raw_answer}])))
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            answer = _run_async(api.answer_ollama_bridge_direct(self._chat_payload("q")))
+        self.assertEqual(answer, "")
+        line = cap.lines()[0]
+        self.assertGreater(line["answer_chars_raw"], 0)
+        self.assertEqual(line["answer_chars_final"], 0)
+        self.assertTrue(line["answer_empty_after_strip"])
+        self.assertTrue(line["reasoning_only"])
+
+    def test_normal_answer_has_empty_after_strip_false(self):
+        self.settings.bridge_strip_reasoning = True
+        open_t = "<" + "think" + ">"
+        close_t = "<" + "/think" + ">"
+        raw_answer = open_t + "reasoning" + close_t + " real answer body"
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": raw_answer}])))
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            answer = _run_async(api.answer_ollama_bridge_direct(self._chat_payload("q")))
+        self.assertEqual(answer, "real answer body")
+        line = cap.lines()[0]
+        self.assertFalse(line["answer_empty_after_strip"])
+        self.assertFalse(line["reasoning_only"])
+
     def test_task_prompt_short_circuit_logged_as_task(self):
         self.settings.bridge_task_shortcircuit = True
         proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "Title: eCommit Chat"}])))
@@ -358,6 +390,34 @@ class LogStagesScriptTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_parse_ts_handles_nanosecond_fractions_on_any_version(self):
+        # Docker emits nine fractional digits; datetime.fromisoformat only
+        # accepts them from Python 3.11 on. parse_ts must normalise them so
+        # results are identical on 3.8-3.14.
+        from datetime import datetime, timezone
+        mod = self._script()
+        cases = [
+            ("2026-10-04T19:05:52.311732500Z", 311732),   # 9 digits, Z
+            ("2026-10-04T19:05:52.311732Z", 311732),      # 6 digits, Z
+            ("2026-10-04T19:05:52Z", 0),                  # no fraction, Z
+            ("2026-10-04T19:05:52.311732500+00:00", 311732),  # 9 digits, offset
+            ("2026-10-04T19:05:52.3Z", 300000),           # 1 digit
+        ]
+        for text, expected_micro in cases:
+            got = mod.parse_ts(text)
+            self.assertIsNotNone(got, text)
+            self.assertEqual(got.tzinfo, timezone.utc, text)
+            self.assertEqual(got.microsecond, expected_micro, text)
+        # nine-digit and six-digit spellings of the same instant agree
+        nine = mod.parse_ts("2026-10-04T19:05:52.311732500Z")
+        six = mod.parse_ts("2026-10-04T19:05:52.311732Z")
+        self.assertEqual(nine, six)
+        self.assertIsNone(mod.parse_ts("not a timestamp"))
+        # and a full block with nanosecond stamps still yields durations
+        blocks = mod.parse_lines(self.SAMPLE)
+        self.assertEqual(len(blocks), 1)
+        self.assertNotEqual(blocks[0]["rerank_duration_ms"], "not in log")
 
     def test_timeout_block_parsed_with_candidates_and_duration(self):
         mod = self._script()

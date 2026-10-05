@@ -159,6 +159,17 @@ def emit_bridge_log(
                 "answer_words_final": answer_words_final,
                 "reference_count": reference_count,
                 "canned_failure": bool(canned_failure),
+                # Reasoning-only completion (G3 category 4): the raw stream had
+                # text but the stripped answer is empty. ``reasoning_only`` is
+                # the stricter case where the strip removed (almost) all of it.
+                "answer_empty_after_strip": bool(
+                    answer_chars_raw > 0 and answer_chars_final == 0
+                ),
+                "reasoning_only": bool(
+                    answer_chars_raw > 0
+                    and answer_chars_final == 0
+                    and reasoning_chars_removed > 0
+                ),
             }
         )
         _emit(line)

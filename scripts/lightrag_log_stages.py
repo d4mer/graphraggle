@@ -63,8 +63,24 @@ NOT_IN_LOG = "not in log"
 
 
 def parse_ts(text: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp with 0-9 fractional digits and optional Z.
+
+    ``datetime.fromisoformat`` accepts at most six fractional digits before
+    Python 3.11, while Docker log timestamps carry nanoseconds (nine digits).
+    Normalise the fraction here so parsing never depends on the interpreter
+    version (works on 3.8+).
+    """
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(.*)$", text)
+        if not m:
+            return None
+        base, frac, rest = m.group(1), m.group(2), m.group(3)
+        if frac is not None:
+            # 3.8-3.10 accept only exactly 3 or 6 fractional digits; 3.11+
+            # accepts 1-6. Normalise to exactly six.
+            frac = (frac + "000000")[:6]
+            base = base + "." + frac
+        return datetime.fromisoformat(base + rest.replace("Z", "+00:00"))
     except ValueError:
         return None
 
