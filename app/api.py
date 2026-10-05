@@ -43,6 +43,7 @@ from .observability import (
     new_request_id,
     start_bridge_log,
 )
+from .keywords import KeywordResult, extract_keywords
 from .rerank import rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -85,6 +86,13 @@ OLLAMA_BRIDGE_MODEL = "lightrag:latest"
 # Sources blocks are stripped before being sent back upstream.
 SOURCES_MARKER = "\n\n---\n\n**Sources**\n\n"
 OPENWEBUI_TASK_PREFIX = "### Task:"
+# Honest failure (issue-08 keyword fix): shown only when the keyword step fell
+# back AND retrieval still produced the canned no-context answer (or nothing).
+# A request whose keywords came from the LLM never sees this message.
+KEYWORD_HONEST_FAILURE_MESSAGE = (
+    "I couldn't retrieve context for that question (the keyword step failed). "
+    "Please try rephrasing or ask again."
+)
 
 # Recognized reasoning boundary pairs (opening, closing). Built by
 # concatenation so the literal ChatML control tokens do not appear verbatim
@@ -362,6 +370,31 @@ def _safe_emit_bridge(log_fields: dict[str, Any], **kwargs: Any) -> None:
         pass
 
 
+def _keyword_log_fields(kw: Any, kw_step_ms: int) -> dict[str, Any]:
+    """Keyword-step observability for the bridge log line (issue-08 fix).
+
+    Counts and enum strings only - keyword lists are query-text derivatives
+    and are never logged.
+    """
+    if kw is None:
+        return {
+            "keyword_source": "off",
+            "keyword_attempts": 0,
+            "keyword_failure_reasons": [],
+            "keyword_hl_count": 0,
+            "keyword_ll_count": 0,
+            "keyword_step_ms": 0,
+        }
+    return {
+        "keyword_source": kw.source,
+        "keyword_attempts": kw.attempts,
+        "keyword_failure_reasons": list(kw.failure_reasons),
+        "keyword_hl_count": len(kw.hl),
+        "keyword_ll_count": len(kw.ll),
+        "keyword_step_ms": kw_step_ms,
+    }
+
+
 async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str | None = None) -> str:
     prompt = extract_ollama_prompt(payload)
     if not prompt.strip():
@@ -407,11 +440,34 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
             answer_words_final=len(answer.split()),
             reference_count=0,
             canned_failure=is_canned_failure(answer),
+            **_keyword_log_fields(None, 0),
         )
         return answer
 
     history = extract_ollama_history(payload, settings.bridge_history_turns)
     bridge_payload = build_ollama_bridge_query_payload(prompt, history)
+
+    # Issue-08 keyword fix: the bridge produces validated keywords itself and
+    # passes them upstream, so LightRAG skips its fragile own extraction
+    # (operate.py ~4865-4866). Task prompts never reach here. The step must
+    # never make the bridge less available: any unexpected error falls back to
+    # today's behaviour (no supplied keywords).
+    kw = None
+    kw_step_ms = 0
+    if settings.bridge_keyword_supply:
+        kw_t0 = time.perf_counter()
+        try:
+            kw = await extract_keywords(prompt)
+        except Exception:
+            # extract_keywords is designed never to raise; this is a last
+            # resort: log the failure (keyword_source=error) and send the
+            # request without supplied keywords - today's behaviour.
+            kw = KeywordResult([], [], "error", 0, ["unexpected_error"])
+        kw_step_ms = int(round((time.perf_counter() - kw_t0) * 1000))
+        if kw is not None and kw.source in ("llm", "llm_unwrapped", "fallback"):
+            bridge_payload["hl_keywords"] = kw.hl
+            bridge_payload["ll_keywords"] = kw.ll
+
     log_fields = start_bridge_log(
         request_id,
         prompt=prompt,
@@ -419,6 +475,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         history_count=len(history),
         payload_params=bridge_payload,
     )
+    kw_log = _keyword_log_fields(kw, kw_step_ms)
     try:
         resp = await client.proxy(
             "POST",
@@ -429,24 +486,39 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     except Exception as exc:
         # Explicit marker for the silent-empty failure mode: the bridge still
         # returns "" this round, but the error line names the exception class.
-        _safe_emit_bridge(log_fields, exception=exc)
+        _safe_emit_bridge(log_fields, exception=exc, **kw_log)
         return ""
     raw_text, stripped = extract_stream_response_parts(resp.content)
     answer = stripped
+    honest_failure = False
     if not answer:
+        # Honest failure: the keyword step fell back and retrieval produced
+        # nothing - say so instead of returning a blank answer.
+        if kw is not None and kw.source == "fallback":
+            honest_failure = True
+            answer = KEYWORD_HONEST_FAILURE_MESSAGE
         _safe_emit_bridge(
             log_fields,
             status=getattr(resp, "status_code", None),
             answer_chars_raw=len(raw_text),
             reasoning_chars_removed=max(0, len(raw_text) - len(stripped)),
-            answer_chars_final=0,
-            answer_words_final=0,
+            answer_chars_final=len(answer),
+            answer_words_final=len(answer.split()),
             reference_count=0,
             canned_failure=False,
+            honest_failure=honest_failure,
+            **kw_log,
         )
-        return ""
+        return answer
+    canned = is_canned_failure(stripped)
     citations = [{"file_path": ref.get("file_path")} for ref in extract_stream_references(resp.content)]
-    if settings.bridge_sources_enabled:
+    if canned and kw is not None and kw.source == "fallback":
+        # Honest failure: fallback keywords and still the canned no-context
+        # text. A successful LLM-keyword request never gets this message.
+        honest_failure = True
+        answer = KEYWORD_HONEST_FAILURE_MESSAGE
+        canned = False
+    elif settings.bridge_sources_enabled:
         answer += build_sources_block(citations)
     _safe_emit_bridge(
         log_fields,
@@ -456,7 +528,9 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         answer_chars_final=len(answer),
         answer_words_final=len(answer.split()),
         reference_count=len(citations),
-        canned_failure=is_canned_failure(stripped),
+        canned_failure=canned,
+        honest_failure=honest_failure,
+        **kw_log,
     )
     return answer
 
