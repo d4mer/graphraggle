@@ -64,8 +64,14 @@ class SettingsBackupMixin(unittest.TestCase):
                 "rerank_enabled",
                 "graph_expansion_enabled",
                 "graph_native_enabled",
+                "bridge_keyword_supply",
+                "bridge_keyword_retries",
             )
         }
+        # Pin the keyword-supply step off so existing observability tests
+        # exercise the pre-fix path with no network call. New keyword tests
+        # opt in with a mocked extract_keywords.
+        self.settings.bridge_keyword_supply = False
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -471,6 +477,68 @@ class LogStagesScriptTests(unittest.TestCase):
             self.assertIn("not in log", out)
         finally:
             os.unlink(path)
+
+
+class KeywordFieldLoggingTests(SettingsBackupMixin):
+    """Issue-08 keyword fix: the bridge log line carries the keyword fields."""
+
+    def _chat_payload(self, content: str):
+        return {"model": "lightrag:latest", "messages": [{"role": "user", "content": content}]}
+
+    def test_keyword_fields_present_and_no_keyword_text(self):
+        from app.keywords import KeywordResult
+        self.settings.bridge_keyword_supply = True
+        kw = KeywordResult(["eCommit workflow"], ["eCommit"], "llm", 2,
+                           ["array_non_dict_element"])
+        proxy = AsyncMock(return_value=_Resp(
+            _stream_body([{"response": "answer body"}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "extract_keywords", AsyncMock(return_value=kw)), \
+             _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(
+                self._chat_payload("What is eCommit?")))
+        lines = cap.lines()
+        self.assertEqual(len(lines), 1)
+        line = lines[0]
+        for field in ("keyword_source", "keyword_attempts", "keyword_failure_reasons",
+                      "keyword_hl_count", "keyword_ll_count", "keyword_step_ms",
+                      "honest_failure"):
+            self.assertIn(field, line)
+        self.assertEqual(line["keyword_source"], "llm")
+        self.assertEqual(line["keyword_attempts"], 2)
+        self.assertEqual(line["keyword_failure_reasons"], ["array_non_dict_element"])
+        self.assertEqual(line["keyword_hl_count"], 1)
+        self.assertEqual(line["keyword_ll_count"], 1)
+        dumped = json.dumps(line)
+        self.assertNotIn("eCommit", dumped)
+
+    def test_supply_off_logs_keyword_source_off(self):
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "answer"}])))
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(self._chat_payload("what is 42?")))
+        line = cap.lines()[0]
+        self.assertEqual(line["keyword_source"], "off")
+        self.assertEqual(line["keyword_attempts"], 0)
+        self.assertFalse(line["honest_failure"])
+
+    def test_honest_failure_flag_logged(self):
+        from app.keywords import KeywordResult
+        self.settings.bridge_keyword_supply = True
+        kw = KeywordResult(["cmo"], ["scope"], "fallback", 3, ["array_non_dict_element"])
+        proxy = AsyncMock(return_value=_Resp(_stream_body(
+            [{"response": CANNED_FAILURE_RESPONSE}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "extract_keywords", AsyncMock(return_value=kw)), \
+             _LogCapture() as cap:
+            client.proxy = proxy
+            answer = _run_async(api.answer_ollama_bridge_direct(
+                self._chat_payload("What did the workshop say about CMO scope?")))
+        line = cap.lines()[0]
+        self.assertIn("keyword step failed", answer)
+        self.assertTrue(line["honest_failure"])
+        self.assertEqual(line["keyword_source"], "fallback")
 
 
 if __name__ == "__main__":

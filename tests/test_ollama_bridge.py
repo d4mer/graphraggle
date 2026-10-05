@@ -51,8 +51,13 @@ class SettingsBackupMixin(unittest.TestCase):
                 "rerank_enabled",
                 "graph_expansion_enabled",
                 "graph_native_enabled",
+                "bridge_keyword_supply",
+                "bridge_keyword_retries",
             )
         }
+        # Existing bridge tests predate the keyword-supply step; pin it off so
+        # they exercise exactly the pre-fix path. New keyword tests opt in.
+        self.settings.bridge_keyword_supply = False
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -501,6 +506,127 @@ class StripReasoningTests(SettingsBackupMixin):
         out = api.extract_stream_response_text(raw)
         self.assertIn(self.OPEN, out)
         self.assertIn("real answer [2].", out)
+
+
+CANNED_ANSWER = "Sorry, I'm not able to provide an answer to that question.[no-context]"
+
+
+class TestKeywordSupplyBridge(SettingsBackupMixin):
+    """Bridge integration for the issue-08 keyword-supply step."""
+
+    def _payload(self, content="What is the firm horizon task for CMO?"):
+        return {"model": "lightrag:latest",
+                "messages": [{"role": "user", "content": content}]}
+
+    def _run(self, kw_result, stream_chunks, *, kw_raises=False, supply=True):
+        import app.api as api
+        from app.keywords import KeywordResult
+
+        self.settings.bridge_keyword_supply = supply
+        proxy = AsyncMock(return_value=_Resp(_stream_body(stream_chunks)))
+        captured: list[dict] = []
+        kw_mock = AsyncMock(side_effect=RuntimeError("kw boom") if kw_raises
+                            else None, return_value=kw_result)
+        with patch.object(api, "client") as client, \
+             patch.object(api, "extract_keywords", kw_mock), \
+             patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = lambda fields, **kw: captured.append(kw)
+            answer = _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        return answer, proxy, kw_mock, captured
+
+    def test_supply_on_adds_keywords_to_payload(self):
+        from app.keywords import KeywordResult
+        kw = KeywordResult(["firm horizon"], ["CMO"], "llm", 1, [])
+        chunks = [{"references": [{"file_path": "a.txt"}]},
+                  {"response": "Real answer about the firm horizon."}]
+        answer, proxy, kw_mock, captured = self._run(kw, chunks)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertEqual(body["hl_keywords"], ["firm horizon"])
+        self.assertEqual(body["ll_keywords"], ["CMO"])
+        self.assertIn("Real answer", answer)
+        self.assertIn(api.SOURCES_MARKER, answer)
+        self.assertEqual(captured[-1]["keyword_source"], "llm")
+        self.assertEqual(captured[-1]["keyword_hl_count"], 1)
+        self.assertFalse(captured[-1]["honest_failure"])
+
+    def test_supply_off_no_keywords(self):
+        chunks = [{"response": "answer"}]
+        answer, proxy, kw_mock, captured = self._run(None, chunks, supply=False)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertNotIn("hl_keywords", body)
+        kw_mock.assert_not_awaited()
+        self.assertEqual(captured[-1]["keyword_source"], "off")
+
+    def test_task_prompt_gets_no_keywords(self):
+        import app.api as api
+        from app.keywords import KeywordResult
+        self.settings.bridge_task_shortcircuit = True
+        self.settings.bridge_keyword_supply = True
+        captured: list[dict] = []
+        kw_mock = AsyncMock(return_value=KeywordResult(["x"], ["y"], "llm", 1, []))
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "Title."}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "extract_keywords", kw_mock), \
+             patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = lambda fields, **kw: captured.append(kw)
+            answer = _run_async(api.answer_ollama_bridge_direct(
+                self._payload("### Task:\nGenerate a concise title.\n"
+                              "### Chat History:\n<chat_history>\nUSER: hi\n</chat_history>")))
+        self.assertEqual(answer, "Title.")
+        kw_mock.assert_not_awaited()
+        self.assertEqual(captured[-1]["keyword_source"], "off")
+
+    def test_keyword_step_exception_still_queries_normally(self):
+        chunks = [{"response": "normal answer"}]
+        answer, proxy, kw_mock, captured = self._run(None, chunks, kw_raises=True)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertNotIn("hl_keywords", body)
+        self.assertIn("normal answer", answer)
+        self.assertEqual(captured[-1]["keyword_source"], "error")
+
+    def test_fallback_plus_canned_returns_honest_message(self):
+        from app.keywords import KeywordResult
+        kw = KeywordResult(["cmo"], ["scope"], "fallback", 3, ["array_non_dict_element"])
+        chunks = [{"response": CANNED_ANSWER}]
+        answer, proxy, kw_mock, captured = self._run(kw, chunks)
+        self.assertIn("keyword step failed", answer)
+        self.assertNotIn(CANNED_ANSWER, answer)
+        self.assertTrue(captured[-1]["honest_failure"])
+        self.assertFalse(captured[-1]["canned_failure"])
+
+    def test_fallback_plus_good_answer_is_normal(self):
+        from app.keywords import KeywordResult
+        kw = KeywordResult(["cmo"], ["scope"], "fallback", 3, ["array_non_dict_element"])
+        chunks = [{"references": [{"file_path": "a.txt"}]},
+                  {"response": "A good grounded answer."}]
+        answer, proxy, kw_mock, captured = self._run(kw, chunks)
+        self.assertIn("A good grounded answer.", answer)
+        self.assertFalse(captured[-1]["honest_failure"])
+
+    def test_llm_keywords_plus_canned_keeps_canned(self):
+        from app.keywords import KeywordResult
+        kw = KeywordResult(["cmo"], ["scope"], "llm", 1, [])
+        chunks = [{"response": CANNED_ANSWER}]
+        answer, proxy, kw_mock, captured = self._run(kw, chunks)
+        self.assertIn(CANNED_ANSWER, answer)
+        self.assertFalse(captured[-1]["honest_failure"])
+        self.assertTrue(captured[-1]["canned_failure"])
+
+    def test_log_line_has_keyword_fields_and_no_keyword_text(self):
+        from app.keywords import KeywordResult
+        kw = KeywordResult(["eCommit workflow"], ["eCommit"], "llm", 1, [])
+        chunks = [{"response": "answer about eCommit"}]
+        answer, proxy, kw_mock, captured = self._run(kw, chunks)
+        line = captured[-1]
+        for field in ("keyword_source", "keyword_attempts", "keyword_failure_reasons",
+                      "keyword_hl_count", "keyword_ll_count", "keyword_step_ms",
+                      "honest_failure"):
+            self.assertIn(field, line)
+        dumped = json.dumps(line)
+        self.assertNotIn("eCommit", dumped)
+        self.assertNotIn("firm horizon", dumped)
 
 
 if __name__ == "__main__":
