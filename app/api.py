@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,14 @@ from .graphrag import (
 from .graph_native import build_graph_native_metadata, fetch_graph_native_evidence
 from .graph_fusion import fuse_graph_and_vector_evidence
 from .graph_synthesis import is_graph_synthesis_answer_usable, synthesize_graph_aware_answer
+from .observability import (
+    StageTimer,
+    emit_bridge_log,
+    emit_query_log,
+    is_canned_failure,
+    new_request_id,
+    start_bridge_log,
+)
 from .rerank import rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -241,7 +250,8 @@ def strip_reasoning_regions(text: str) -> str:
     return text.strip()
 
 
-def extract_stream_response_text(raw_body: bytes) -> str:
+def aggregate_stream_response_text(raw_body: bytes) -> str:
+    """Join the ``response`` chunks of a /query/stream NDJSON body, unstripped."""
     text = raw_body.decode("utf-8", errors="replace")
     parts: list[str] = []
     for line in text.splitlines():
@@ -256,10 +266,23 @@ def extract_stream_response_text(raw_body: bytes) -> str:
             chunk = parsed.get("response")
             if isinstance(chunk, str):
                 parts.append(chunk)
-    text = "".join(parts).strip()
+    return "".join(parts).strip()
+
+
+def extract_stream_response_parts(raw_body: bytes) -> tuple[str, str]:
+    """Return (aggregated text, text after the reasoning strip).
+
+    When BRIDGE_STRIP_REASONING is off both values are identical, so the
+    observability layer can report reasoning_chars_removed as 0.
+    """
+    raw_text = aggregate_stream_response_text(raw_body)
     if settings.bridge_strip_reasoning:
-        text = strip_reasoning_regions(text)
-    return text
+        return raw_text, strip_reasoning_regions(raw_text)
+    return raw_text, raw_text
+
+
+def extract_stream_response_text(raw_body: bytes) -> str:
+    return extract_stream_response_parts(raw_body)[1]
 
 
 def extract_stream_references(raw_body: bytes) -> list[dict[str, Any]]:
@@ -326,16 +349,38 @@ def extract_ollama_history(payload: dict[str, Any], turns: int) -> list[dict[str
     return history[-(turns * 2):]
 
 
-async def answer_ollama_bridge_direct(payload: dict[str, Any]) -> str:
+def _safe_emit_bridge(log_fields: dict[str, Any], **kwargs: Any) -> None:
+    """Emit a bridge log line, swallowing any logging failure.
+
+    GRAG-14 requirement: logging must never break a query. emit_bridge_log
+    already guards internally; this second guard covers a patched or broken
+    emit itself.
+    """
+    try:
+        emit_bridge_log(log_fields, **kwargs)
+    except Exception:
+        pass
+
+
+async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str | None = None) -> str:
     prompt = extract_ollama_prompt(payload)
     if not prompt.strip():
         return ""
+
+    request_id = request_id or new_request_id()
 
     # Task short-circuit (GRAG-12): one bypass call, no retrieval pipeline.
     # A task prompt embeds the chat history OpenWebUI wants summarised, so
     # no conversation history is extracted or attached here. A failing
     # bypass call returns "" and must never fall through to retrieval.
     if settings.bridge_task_shortcircuit and is_openwebui_task_prompt(prompt):
+        log_fields = start_bridge_log(
+            request_id,
+            prompt=prompt,
+            task_prompt=True,
+            history_count=0,
+            payload_params={"mode": "bypass", "include_references": False},
+        )
         try:
             resp = await client.proxy(
                 "POST",
@@ -348,26 +393,71 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any]) -> str:
                 }).encode("utf-8"),
                 content_type="application/json",
             )
-        except Exception:
+        except Exception as exc:
+            _safe_emit_bridge(log_fields, exception=exc)
             return ""
-        return extract_stream_response_text(resp.content)
+        raw_text, stripped = extract_stream_response_parts(resp.content)
+        answer = stripped
+        _safe_emit_bridge(
+            log_fields,
+            status=getattr(resp, "status_code", None),
+            answer_chars_raw=len(raw_text),
+            reasoning_chars_removed=max(0, len(raw_text) - len(stripped)),
+            answer_chars_final=len(answer),
+            answer_words_final=len(answer.split()),
+            reference_count=0,
+            canned_failure=is_canned_failure(answer),
+        )
+        return answer
 
     history = extract_ollama_history(payload, settings.bridge_history_turns)
+    bridge_payload = build_ollama_bridge_query_payload(prompt, history)
+    log_fields = start_bridge_log(
+        request_id,
+        prompt=prompt,
+        task_prompt=False,
+        history_count=len(history),
+        payload_params=bridge_payload,
+    )
     try:
         resp = await client.proxy(
             "POST",
             "/query/stream",
-            body=json.dumps(build_ollama_bridge_query_payload(prompt, history)).encode("utf-8"),
+            body=json.dumps(bridge_payload).encode("utf-8"),
             content_type="application/json",
         )
-    except Exception:
+    except Exception as exc:
+        # Explicit marker for the silent-empty failure mode: the bridge still
+        # returns "" this round, but the error line names the exception class.
+        _safe_emit_bridge(log_fields, exception=exc)
         return ""
-    answer = extract_stream_response_text(resp.content)
+    raw_text, stripped = extract_stream_response_parts(resp.content)
+    answer = stripped
     if not answer:
+        _safe_emit_bridge(
+            log_fields,
+            status=getattr(resp, "status_code", None),
+            answer_chars_raw=len(raw_text),
+            reasoning_chars_removed=max(0, len(raw_text) - len(stripped)),
+            answer_chars_final=0,
+            answer_words_final=0,
+            reference_count=0,
+            canned_failure=False,
+        )
         return ""
+    citations = [{"file_path": ref.get("file_path")} for ref in extract_stream_references(resp.content)]
     if settings.bridge_sources_enabled:
-        citations = [{"file_path": ref.get("file_path")} for ref in extract_stream_references(resp.content)]
         answer += build_sources_block(citations)
+    _safe_emit_bridge(
+        log_fields,
+        status=getattr(resp, "status_code", None),
+        answer_chars_raw=len(raw_text),
+        reasoning_chars_removed=max(0, len(raw_text) - len(stripped)),
+        answer_chars_final=len(answer),
+        answer_words_final=len(answer.split()),
+        reference_count=len(citations),
+        canned_failure=is_canned_failure(stripped),
+    )
     return answer
 
 
@@ -393,12 +483,12 @@ async def answer_ollama_bridge_pipeline(prompt: str, history: list[dict[str, str
     return answer
 
 
-async def answer_ollama_bridge_prompt(payload: dict[str, Any]) -> str:
+async def answer_ollama_bridge_prompt(payload: dict[str, Any], request_id: str | None = None) -> str:
     if settings.bridge_backend == "gateway_pipeline":
         prompt = extract_ollama_prompt(payload)
         history = extract_ollama_history(payload, settings.bridge_history_turns)
         return await answer_ollama_bridge_pipeline(prompt, history)
-    return await answer_ollama_bridge_direct(payload)
+    return await answer_ollama_bridge_direct(payload, request_id=request_id)
 
 
 def build_ollama_chat_response(model: str, content: str) -> dict[str, Any]:
@@ -446,7 +536,9 @@ async def maybe_handle_ollama_bridge(raw_body: bytes, *, response_kind: str) -> 
     if model != OLLAMA_BRIDGE_MODEL:
         return None
 
-    answer = await answer_ollama_bridge_prompt(payload)
+    # The bridge answer goes to OpenWebUI, whose response schema has no meta
+    # field, so the request id is carried in the log line only.
+    answer = await answer_ollama_bridge_prompt(payload, request_id=new_request_id())
     if response_kind == "chat":
         body = build_ollama_chat_response(str(model), answer)
     else:
@@ -944,6 +1036,41 @@ async def upload(file: UploadFile = File(...), company: str | None = Form(defaul
 
 @app.post("/query", response_model=Envelope, dependencies=[Depends(require_bearer)])
 async def query(req: QueryRequest):
+    """Gateway query route. GRAG-14: exactly one structured log line per call.
+
+    The id is generated here so a failing upstream call can still be logged
+    with the same handle the caller would have received.
+    """
+    request_id = new_request_id()
+    timer = StageTimer()
+    t_start = time.perf_counter()
+    try:
+        return await _query_core(req, request_id=request_id, timer=timer, t_start=t_start)
+    except Exception as exc:
+        try:
+            emit_query_log(
+                request_id=request_id,
+                query=req.query,
+                company=normalize_company(req.company),
+                mode_requested=req.mode,
+                mode_used=req.mode or settings.retrieval_mode_default,
+                top_k=req.top_k,
+                chunk_top_k=req.chunk_top_k or settings.chunk_top_k,
+                query_scope={},
+                citations_raw=0,
+                citations_merged=0,
+                citations_final=0,
+                answer="",
+                timer=timer,
+                started=t_start,
+                exception=exc,
+            )
+        except Exception:
+            pass
+        raise
+
+
+async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, t_start: float):
     requested_company = normalize_company(req.company)
     explicit_mode = req.mode is not None
     retrieval_mode = req.mode or settings.retrieval_mode_default
@@ -1032,7 +1159,10 @@ async def query(req: QueryRequest):
     fallback_answer_used = False
 
     # ── First pass: original query ──────────────────────────────────────
+    timer.start("first_pass")
     answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
+    timer.stop("first_pass")
+    citations_raw = len(all_citations)
 
     # Compute weak signal from first pass
     first_weak_signal = first_weak_reason is not None
@@ -1056,6 +1186,7 @@ async def query(req: QueryRequest):
     merged_citations = all_citations  # default: single-query path
 
     if mq_triggered:
+        timer.start("multi_query")
         groups = [all_citations]
         total_before_dedupe = len(all_citations)
         total_after_dedupe = len(all_citations)
@@ -1093,6 +1224,7 @@ async def query(req: QueryRequest):
             merged_citations = all_citations
             total_before_dedupe = len(all_citations)
             total_after_dedupe = len(all_citations)
+        timer.stop("multi_query")
     else:
         total_before_dedupe = len(all_citations)
         total_after_dedupe = len(all_citations)
@@ -1208,6 +1340,7 @@ async def query(req: QueryRequest):
     graph_evidence: list[dict[str, Any]] = []
 
     if graph_native_enabled and graph_native_route == "graph":
+        timer.start("graph_native")
         graph_evidence, graph_native_error, graph_native_seed_labels = await fetch_graph_native_evidence(
             client,
             req.query,
@@ -1215,13 +1348,17 @@ async def query(req: QueryRequest):
             max_depth=settings.graph_native_max_depth,
             max_nodes=settings.graph_native_max_nodes,
         )
+        timer.stop("graph_native")
         graph_native_result_count = len(graph_evidence)
         graph_native_applied = graph_native_result_count > 0 and graph_native_error is None
     elif graph_native_enabled:
         graph_native_error = "graph_native_query_family_skipped"
 
     # ── Apply scope filter, rerank, truncate on merged citations ────────
+    citations_merged = len(merged_citations)
+    timer.start("rerank")
     final_citations, rerank_meta = await apply_scope_rerank_truncate(merged_citations, req.query)
+    timer.stop("rerank")
 
     # ── Build query_scope metadata ──────────────────────────────────────
     query_scope: dict[str, Any] = {
@@ -1278,6 +1415,7 @@ async def query(req: QueryRequest):
 
     graph_synthesis_applied = False
     graph_synthesis_error = None
+    timer.start("synthesis")
     if not settings.graph_synthesis_replace_answer:
         graph_synthesis_error = "graph_synthesis_replacement_disabled"
     elif graph_native_applied and combined_evidence:
@@ -1287,6 +1425,7 @@ async def query(req: QueryRequest):
             graph_synthesis_applied = True
         elif synthesized_answer:
             graph_synthesis_error = "weak_graph_synthesis_answer"
+    timer.stop("synthesis")
 
     query_scope.update({
         "graph_synthesis_applied": graph_synthesis_applied,
@@ -1296,7 +1435,27 @@ async def query(req: QueryRequest):
     if requested_company is not None:
         query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
 
-    return ok({"answer": answer, "citations": final_citations, "graph_evidence": graph_evidence, "combined_evidence": combined_evidence, "query_scope": query_scope})
+    emit_query_log(
+        request_id=request_id,
+        query=req.query,
+        company=requested_company,
+        mode_requested=req.mode,
+        mode_used=retrieval_mode,
+        top_k=top_k,
+        chunk_top_k=chunk_top_k,
+        query_scope=query_scope,
+        citations_raw=citations_raw,
+        citations_merged=citations_merged,
+        citations_final=len(final_citations),
+        answer=answer if isinstance(answer, str) else "",
+        timer=timer,
+        started=t_start,
+    )
+
+    envelope = ok({"answer": answer, "citations": final_citations, "graph_evidence": graph_evidence, "combined_evidence": combined_evidence, "query_scope": query_scope})
+    # The caller needs the same handle the log line carries.
+    envelope.meta["request_id"] = request_id
+    return envelope
 
 
 @app.post("/generate-document", response_model=Envelope, dependencies=[Depends(require_bearer)])
