@@ -66,12 +66,17 @@ class SettingsBackupMixin(unittest.TestCase):
                 "graph_native_enabled",
                 "bridge_keyword_supply",
                 "bridge_keyword_retries",
+                "bridge_rewrite_enabled",
+                "bridge_rewrite_turns",
+                "bridge_rewrite_retries",
             )
         }
         # Pin the keyword-supply step off so existing observability tests
         # exercise the pre-fix path with no network call. New keyword tests
-        # opt in with a mocked extract_keywords.
+        # opt in with a mocked extract_keywords. Same for the GRAG-41
+        # rewrite step.
         self.settings.bridge_keyword_supply = False
+        self.settings.bridge_rewrite_enabled = False
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -540,6 +545,58 @@ class KeywordFieldLoggingTests(SettingsBackupMixin):
         self.assertTrue(line["honest_failure"])
         self.assertEqual(line["keyword_source"], "fallback")
 
+
+
+class RewriteFieldLoggingTests(SettingsBackupMixin):
+    """GRAG-41: the bridge log line carries the rewrite fields, never text."""
+
+    def _multi_turn_payload(self):
+        return {"model": "lightrag:latest", "messages": [
+            {"role": "user", "content": "what was said about forecast accuracy?"},
+            {"role": "assistant", "content": "Forecast accuracy reached 92% at the workshop."},
+            {"role": "user", "content": "and for the other site?"},
+        ]}
+
+    def test_rewrite_fields_present_and_no_text_leak(self):
+        from app.rewrite import RewriteResult
+        self.settings.bridge_rewrite_enabled = True
+        rw = RewriteResult(
+            "What was said about forecast accuracy at the consolidation hub site?",
+            "rewritten", 2, ["multi_line"], 2.4)
+        proxy = AsyncMock(return_value=_Resp(
+            _stream_body([{"response": "answer body"}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "rewrite_query", AsyncMock(return_value=rw)), \
+             _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(self._multi_turn_payload()))
+        line = cap.lines()[0]
+        for field in ("rewrite_source", "rewrite_attempts", "rewrite_failure_reasons",
+                      "rewrite_step_ms", "rewrite_len_ratio", "rewrite_changed"):
+            self.assertIn(field, line)
+        self.assertEqual(line["rewrite_source"], "rewritten")
+        self.assertEqual(line["rewrite_attempts"], 2)
+        self.assertEqual(line["rewrite_failure_reasons"], ["multi_line"])
+        self.assertTrue(line["rewrite_changed"])
+        self.assertAlmostEqual(line["rewrite_len_ratio"], 2.4)
+        dumped = json.dumps(line)
+        # none of the prompt, history, rewritten or answer text may appear
+        for leak in ("forecast accuracy", "consolidation hub", "92%",
+                     "other site", "workshop"):
+            self.assertNotIn(leak, dumped)
+
+    def test_rewrite_off_logs_source_off(self):
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "answer"}])))
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(
+                {"model": "lightrag:latest",
+                 "messages": [{"role": "user", "content": "what is 42?"}]}))
+        line = cap.lines()[0]
+        self.assertEqual(line["rewrite_source"], "off")
+        self.assertEqual(line["rewrite_attempts"], 0)
+        self.assertIsNone(line["rewrite_len_ratio"])
+        self.assertFalse(line["rewrite_changed"])
 
 if __name__ == "__main__":
     unittest.main()

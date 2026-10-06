@@ -53,11 +53,17 @@ class SettingsBackupMixin(unittest.TestCase):
                 "graph_native_enabled",
                 "bridge_keyword_supply",
                 "bridge_keyword_retries",
+                "bridge_rewrite_enabled",
+                "bridge_rewrite_turns",
+                "bridge_rewrite_retries",
             )
         }
         # Existing bridge tests predate the keyword-supply step; pin it off so
         # they exercise exactly the pre-fix path. New keyword tests opt in.
         self.settings.bridge_keyword_supply = False
+        # Same for the GRAG-41 rewrite step: existing tests exercise the
+        # pre-rewrite payload exactly. New rewrite tests opt in.
+        self.settings.bridge_rewrite_enabled = False
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -628,6 +634,142 @@ class TestKeywordSupplyBridge(SettingsBackupMixin):
         self.assertNotIn("eCommit", dumped)
         self.assertNotIn("firm horizon", dumped)
 
+
+
+class TestStandaloneRewriteBridge(SettingsBackupMixin):
+    """Bridge integration for the GRAG-41 standalone-query rewrite step."""
+
+    def _payload(self, followup="and for the other site?"):
+        return {"model": "lightrag:latest", "messages": [
+            {"role": "user", "content": "what was said about forecast accuracy?"},
+            {"role": "assistant", "content": "Forecast accuracy reached 92% at the workshop."},
+            {"role": "user", "content": followup},
+        ]}
+
+    def _run(self, rewrite_text, stream_chunks, *, rewrite_raises=False, enabled=True):
+        import app.api as api
+        from app.rewrite import RewriteResult
+
+        self.settings.bridge_rewrite_enabled = enabled
+        proxy = AsyncMock(return_value=_Resp(_stream_body(stream_chunks)))
+        captured: list[dict] = []
+        rw_mock = AsyncMock(side_effect=RuntimeError("rw boom") if rewrite_raises
+                            else None)
+        if not rewrite_raises:
+            rw_mock.return_value = RewriteResult(
+                rewrite_text, "rewritten" if rewrite_text != "and for the other site?" else "unchanged",
+                1, [], 2.0)
+        with patch.object(api, "client") as client, \
+             patch.object(api, "rewrite_query", rw_mock), \
+             patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = lambda fields, **kw: captured.append(kw)
+            answer = _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        return answer, proxy, rw_mock, captured
+
+    def test_rewritten_text_reaches_query_and_user_prompt(self):
+        chunks = [{"references": [{"file_path": "workshop.docx"}]},
+                  {"response": "Real answer about the other site."}]
+        answer, proxy, rw_mock, captured = self._run(
+            "What was said about forecast accuracy at the other site?", chunks)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertEqual(body["query"],
+                         "What was said about forecast accuracy at the other site?")
+        # A3: the user's actual wording rides along so the answer step sees it.
+        self.assertEqual(body["user_prompt"], "and for the other site?")
+        self.assertIn("Real answer", answer)
+        self.assertEqual(captured[-1]["rewrite_source"], "rewritten")
+        self.assertTrue(captured[-1]["rewrite_changed"])
+
+    def test_keyword_step_sees_rewritten_query(self):
+        import app.api as api
+        from app.keywords import KeywordResult
+        from app.rewrite import RewriteResult
+        self.settings.bridge_rewrite_enabled = True
+        self.settings.bridge_keyword_supply = True
+        seen: list[str] = []
+        async def kw_side(query):
+            seen.append(query)
+            return KeywordResult(["forecast accuracy"], ["other site"], "llm", 1, [])
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "a"}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "rewrite_query",
+                          AsyncMock(return_value=RewriteResult(
+                              "What was said about forecast accuracy at the other site?",
+                              "rewritten", 1, [], 2.0))), \
+             patch.object(api, "extract_keywords", side_effect=kw_side), \
+             patch.object(api, "emit_bridge_log"):
+            _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        self.assertEqual(seen, ["What was said about forecast accuracy at the other site?"])
+
+    def test_unchanged_keeps_today_payload(self):
+        chunks = [{"response": "answer"}]
+        answer, proxy, rw_mock, captured = self._run("and for the other site?", chunks)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertEqual(body["query"], "and for the other site?")
+        self.assertEqual(body["user_prompt"], "")  # byte-identical to pre-GRAG-41
+        self.assertEqual(captured[-1]["rewrite_source"], "unchanged")
+        self.assertFalse(captured[-1]["rewrite_changed"])
+
+    def test_switch_off_payload_identical(self):
+        chunks = [{"response": "answer"}]
+        answer, proxy, rw_mock, captured = self._run("ignored", chunks, enabled=False)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertEqual(body["query"], "and for the other site?")
+        self.assertEqual(body["user_prompt"], "")
+        rw_mock.assert_not_awaited()
+        self.assertEqual(captured[-1]["rewrite_source"], "off")
+
+    def test_task_prompt_never_rewrites(self):
+        import app.api as api
+        self.settings.bridge_task_shortcircuit = True
+        self.settings.bridge_rewrite_enabled = True
+        captured: list[dict] = []
+        rw_mock = AsyncMock(return_value=None)
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "Title."}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "rewrite_query", rw_mock), \
+             patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = lambda fields, **kw: captured.append(kw)
+            answer = _run_async(api.answer_ollama_bridge_direct(
+                self._payload("### Task:\nGenerate a concise title.\n"
+                              "### Chat History:\n<chat_history>\nUSER: hi\n</chat_history>")))
+        self.assertEqual(answer, "Title.")
+        rw_mock.assert_not_awaited()
+        self.assertEqual(captured[-1]["rewrite_source"], "off")
+
+    def test_rewrite_exception_still_queries_normally(self):
+        chunks = [{"response": "normal answer"}]
+        answer, proxy, rw_mock, captured = self._run("x", chunks, rewrite_raises=True)
+        body = json.loads(proxy.call_args.kwargs["body"])
+        self.assertEqual(body["query"], "and for the other site?")
+        self.assertIn("normal answer", answer)
+        self.assertEqual(captured[-1]["rewrite_source"], "error")
+
+    def test_no_history_skips_rewrite_call(self):
+        import app.api as api
+        self.settings.bridge_rewrite_enabled = True
+        payload = {"model": "lightrag:latest",
+                   "messages": [{"role": "user", "content": "what is the vx planning process"}]}
+        rw_mock = AsyncMock()
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "a"}])))
+        with patch.object(api, "client") as client, \
+             patch.object(api, "rewrite_query", rw_mock), \
+             patch.object(api, "emit_bridge_log"):
+            _run_async(api.answer_ollama_bridge_direct(payload))
+        # rewrite_query is still invoked (it owns the skip rule) but must not
+        # hit the network; the real function returns skipped_no_history.
+        self.assertEqual(rw_mock.await_count, 1)
+
+    def test_real_rewrite_skips_without_network(self):
+        # No fake post: with no endpoint configured the real rewrite_query
+        # must return skipped_no_history for a single-turn chat, never raise.
+        import app.api as api
+        from app.rewrite import rewrite_query
+        r = _run_async(rewrite_query("what is the vx planning process",
+                                     [{"role": "user", "content": "what is the vx planning process"}]))
+        self.assertEqual(r.source, "skipped_no_history")
 
 if __name__ == "__main__":
     unittest.main()
