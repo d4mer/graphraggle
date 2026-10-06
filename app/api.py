@@ -44,6 +44,7 @@ from .observability import (
     start_bridge_log,
 )
 from .keywords import KeywordResult, extract_keywords
+from .rewrite import RewriteResult, rewrite_query
 from .rerank import rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
@@ -395,6 +396,31 @@ def _keyword_log_fields(kw: Any, kw_step_ms: int) -> dict[str, Any]:
     }
 
 
+def _rewrite_log_fields(rw: Any, rw_step_ms: int) -> dict[str, Any]:
+    """Rewrite-step observability for the bridge log line (GRAG-41).
+
+    Counts, enum strings and a length ratio only - the rewritten query,
+    the conversation and the prompt are never logged.
+    """
+    if rw is None:
+        return {
+            "rewrite_source": "off",
+            "rewrite_attempts": 0,
+            "rewrite_failure_reasons": [],
+            "rewrite_step_ms": 0,
+            "rewrite_len_ratio": None,
+            "rewrite_changed": False,
+        }
+    return {
+        "rewrite_source": rw.source,
+        "rewrite_attempts": rw.attempts,
+        "rewrite_failure_reasons": list(rw.failure_reasons),
+        "rewrite_step_ms": rw_step_ms,
+        "rewrite_len_ratio": rw.length_ratio,
+        "rewrite_changed": rw.source == "rewritten",
+    }
+
+
 async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str | None = None) -> str:
     prompt = extract_ollama_prompt(payload)
     if not prompt.strip():
@@ -441,11 +467,40 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
             reference_count=0,
             canned_failure=is_canned_failure(answer),
             **_keyword_log_fields(None, 0),
+            **_rewrite_log_fields(None, 0),
         )
         return answer
 
     history = extract_ollama_history(payload, settings.bridge_history_turns)
-    bridge_payload = build_ollama_bridge_query_payload(prompt, history)
+
+    # GRAG-41: rewrite a context-dependent follow-up into one standalone
+    # question before the keyword step, so retrieval runs on a self-contained
+    # query (LightRAG uses history only when writing the answer, never when
+    # retrieving). The rewrite call goes only to the local model. Any
+    # failure keeps today's behaviour (retrieve on the literal message):
+    # the bridge must never become less available. Task prompts never
+    # reach here.
+    rw = None
+    rw_step_ms = 0
+    retrieval_query = prompt
+    if settings.bridge_rewrite_enabled:
+        rw_t0 = time.perf_counter()
+        try:
+            rw = await rewrite_query(prompt, payload.get("messages"))
+        except Exception:
+            # rewrite_query is designed never to raise; last resort.
+            rw = RewriteResult(prompt, "error", 0, ["unexpected_error"])
+        rw_step_ms = int(round((time.perf_counter() - rw_t0) * 1000))
+        if rw.source == "rewritten":
+            retrieval_query = rw.query
+    bridge_payload = build_ollama_bridge_query_payload(retrieval_query, history)
+    if rw is not None and rw.source == "rewritten":
+        # A0 decision (operate.py:4712 `user_query = query`; the only other
+        # slot in the rag_response template is the "Additional Instructions"
+        # {user_prompt} placeholder, prompt.py:380): the rewritten text must
+        # be the retrieval query, and the user's actual wording rides along
+        # in user_prompt so the answer step still sees what the user typed.
+        bridge_payload["user_prompt"] = prompt
 
     # Issue-08 keyword fix: the bridge produces validated keywords itself and
     # passes them upstream, so LightRAG skips its fragile own extraction
@@ -457,7 +512,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     if settings.bridge_keyword_supply:
         kw_t0 = time.perf_counter()
         try:
-            kw = await extract_keywords(prompt)
+            kw = await extract_keywords(retrieval_query)
         except Exception:
             # extract_keywords is designed never to raise; this is a last
             # resort: log the failure (keyword_source=error) and send the
@@ -476,6 +531,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         payload_params=bridge_payload,
     )
     kw_log = _keyword_log_fields(kw, kw_step_ms)
+    rw_log = _rewrite_log_fields(rw, rw_step_ms)
     try:
         resp = await client.proxy(
             "POST",
@@ -486,7 +542,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     except Exception as exc:
         # Explicit marker for the silent-empty failure mode: the bridge still
         # returns "" this round, but the error line names the exception class.
-        _safe_emit_bridge(log_fields, exception=exc, **kw_log)
+        _safe_emit_bridge(log_fields, exception=exc, **kw_log, **rw_log)
         return ""
     raw_text, stripped = extract_stream_response_parts(resp.content)
     answer = stripped
@@ -508,6 +564,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
             canned_failure=False,
             honest_failure=honest_failure,
             **kw_log,
+            **rw_log,
         )
         return answer
     canned = is_canned_failure(stripped)
@@ -531,6 +588,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         canned_failure=canned,
         honest_failure=honest_failure,
         **kw_log,
+        **rw_log,
     )
     return answer
 
