@@ -112,6 +112,28 @@ class Settings(BaseSettings):
     # Per-request thinking switch for the keyword call only (see report for
     # what oMLX honours). Off by default; never touches thinking elsewhere.
     bridge_keyword_no_think: bool = Field(default=False, alias="BRIDGE_KEYWORD_NO_THINK")
+
+    # ── GRAG-41: rewrite follow-ups into standalone retrieval queries ──
+    # Master switch. Off means today's behaviour exactly (retrieve on the
+    # literal last user message). BRIDGE_REWRITE_* names cannot collide with
+    # LightRAG variables (LightRAG has no rewrite knobs).
+    bridge_rewrite_enabled: bool = Field(default=True, alias="BRIDGE_REWRITE_ENABLED")
+    # Prior exchanges (user+assistant pairs) shown to the rewrite call.
+    bridge_rewrite_turns: int = Field(default=3, alias="BRIDGE_REWRITE_TURNS")
+    # Extra attempts after the first rejected/failed rewrite call.
+    bridge_rewrite_retries: int = Field(default=1, alias="BRIDGE_REWRITE_RETRIES")
+    bridge_rewrite_timeout: int = Field(default=120, alias="BRIDGE_REWRITE_TIMEOUT")
+    # Assistant answers run 500+ words and swamp the rewrite prompt; cap
+    # them hard. User turns are short already; cap is a guard.
+    bridge_rewrite_max_assistant_chars: int = Field(
+        default=1200, alias="BRIDGE_REWRITE_MAX_ASSISTANT_CHARS")
+    bridge_rewrite_max_user_chars: int = Field(
+        default=600, alias="BRIDGE_REWRITE_MAX_USER_CHARS")
+    # Per-request thinking switch for the rewrite call only (same finding as
+    # the keyword step: oMLX honours it per-request). Off by default.
+    bridge_rewrite_no_think: bool = Field(default=False, alias="BRIDGE_REWRITE_NO_THINK")
+    # Model/URL/key: deliberately no new settings - the rewrite call reuses
+    # the BRIDGE_KEYWORD_LLM_* overrides and LLM_BINDING_* defaults above.
     # Fallback sources: the LightRAG LLM endpoint the keyword call reuses.
     llm_binding_host: Optional[str] = Field(default=None, alias="LLM_BINDING_HOST")
     llm_model: Optional[str] = Field(default=None, alias="LLM_MODEL")
