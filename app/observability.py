@@ -36,6 +36,14 @@ Bridge field meanings:
 ``keyword_step_ms``    wall time of the whole keyword step
 ``honest_failure``     user saw the explicit keyword-failure message instead
                        of a canned or blank answer
+``rewrite_source``     standalone-query rewrite outcome: rewritten |
+                       unchanged | fallback | skipped_no_history | off |
+                       error (GRAG-41)
+``rewrite_attempts``   rewrite LLM attempts made (1 + retries used)
+``rewrite_failure_reasons``  enum strings only, never prompt/history/query text
+``rewrite_step_ms``    wall time of the whole rewrite step
+``rewrite_len_ratio``  rewritten length / original length, or null
+``rewrite_changed``    True when retrieval ran on a rewritten query
 """
 
 from __future__ import annotations
@@ -156,6 +164,12 @@ def emit_bridge_log(
     keyword_hl_count: int = 0,
     keyword_ll_count: int = 0,
     keyword_step_ms: int = 0,
+    rewrite_source: str = "off",
+    rewrite_attempts: int = 0,
+    rewrite_failure_reasons: Optional[list] = None,
+    rewrite_step_ms: int = 0,
+    rewrite_len_ratio: Optional[float] = None,
+    rewrite_changed: bool = False,
 ) -> None:
     """Finish and write a bridge log line. Swallows all logging errors."""
     try:
@@ -194,6 +208,14 @@ def emit_bridge_log(
                 "keyword_hl_count": keyword_hl_count,
                 "keyword_ll_count": keyword_ll_count,
                 "keyword_step_ms": keyword_step_ms,
+                # GRAG-41 rewrite step: counts/enums/ratio only - the
+                # rewritten query, conversation and prompt are never logged.
+                "rewrite_source": rewrite_source,
+                "rewrite_attempts": rewrite_attempts,
+                "rewrite_failure_reasons": list(rewrite_failure_reasons or []),
+                "rewrite_step_ms": rewrite_step_ms,
+                "rewrite_len_ratio": rewrite_len_ratio,
+                "rewrite_changed": bool(rewrite_changed),
             }
         )
         _emit(line)
