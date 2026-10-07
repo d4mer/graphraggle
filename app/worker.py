@@ -228,7 +228,9 @@ def pick_duplicate_candidate(documents: list[dict[str, Any]], current_path: str)
     candidates = [
         doc
         for doc in documents
-        if doc.get("path") != current_path and doc.get("status") in ACTIVE_DUPLICATE_STATUSES
+        if doc.get("path") != current_path
+        and doc.get("status") in ACTIVE_DUPLICATE_STATUSES
+        and doc.get("error_code") != "duplicate_content"
     ]
     if not candidates:
         return None
@@ -818,8 +820,12 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
         return
     if same_content and existing.get("validation_state") == "auto_split" and not reindex_requested:
         return
-    if same_content and existing.get("error_code") == "duplicate_content" and not existing.get("track_id") and not reindex_requested:
-        return
+    duplicate_row = bool(
+        same_content
+        and existing.get("error_code") == "duplicate_content"
+        and not existing.get("track_id")
+        and not reindex_requested
+    )
 
     if content_changed:
         await update_document_state(
@@ -863,8 +869,51 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
 
     duplicate_of = pick_duplicate_candidate(await get_documents_by_sha256(digest), str(path))
     if duplicate_of is not None:
+        if duplicate_row:
+            return
         await mark_duplicate_candidate(path, digest, duplicate_of, existing)
         return
+
+    orphaned_duplicate = False
+    if duplicate_row:
+        await update_document_state(
+            str(path),
+            sha256=digest,
+            status="validating",
+            error_stage=None,
+            error_code=None,
+            error_message=None,
+            error_detail=None,
+            last_error=None,
+            track_id=None,
+            query_ready=False,
+            content_hash=digest,
+            byte_size=path.stat().st_size,
+            retry_count=0,
+            ingested_at=None,
+            warnings_json=merge_warning_metadata(
+                existing.get("warnings_json"),
+                duplicate_of=None,
+                worker_updates=cleared_reindex_updates({
+                    "dedupe_action": None,
+                    "dedupe_basis": None,
+                    "duplicate_match_count": None,
+                    "duplicate_match_paths": None,
+                    "duplicate_status": None,
+                    "previous_duplicate_status": existing.get("status"),
+                    "retry_reason": "duplicate_original_removed",
+                    "stale_track_id": None,
+                    "stale_track_marker": None,
+                    "stale_track_reason": None,
+                    "submission_blocked": None,
+                    "track_id_policy": None,
+                    "track_poll_payload": None,
+                }),
+            ),
+        )
+        existing = await get_document_by_path(str(path)) or existing
+        status = existing.get("status")
+        orphaned_duplicate = True
 
     if status in {"submitted", "processing"} and existing.get("track_id") and not reindex_requested:
         await poll_track(existing)
@@ -873,8 +922,8 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
             return
         if refreshed and refreshed.get("status") in {"submitted", "processing"}:
             return
-            existing = refreshed or existing
-            status = existing.get("status")
+        existing = refreshed or existing
+        status = existing.get("status")
 
     if status == "failed" and existing.get("track_id") and existing.get("error_code") == "track_status_transient" and not reindex_requested:
         await poll_track(existing)
@@ -902,6 +951,8 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
         retry_reason = "content_changed"
     elif reindex_requested:
         retry_reason = "operator_reindex"
+    elif orphaned_duplicate:
+        retry_reason = "duplicate_original_removed"
     elif status == "failed":
         retry_reason = str(existing.get("error_code") or "retry")
 
