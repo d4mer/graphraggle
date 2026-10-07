@@ -18,6 +18,7 @@ from app.keywords import (
     extract_keywords,
     fallback_keywords,
     parse_keyword_payload,
+    seed_ll_keywords,
 )
 
 OPEN_T = "<" + "think" + ">"
@@ -251,6 +252,47 @@ class TestFallbackExtractor(SettingsMixin):
         hl, ll = fallback_keywords("")
         self.assertEqual(hl, [])
         self.assertEqual(ll, [])
+
+
+class TestSeedLlKeywords(SettingsMixin):
+    """seed_ll_keywords: pure helper keeping the user's wording in ll (GRAG-41)."""
+
+    def test_appends_last(self):
+        out = seed_ll_keywords(["other site"], "and for the other site?", 10)
+        self.assertEqual(out, ["other site", "and for the other site?"])
+
+    def test_empty_original_returns_copy_unchanged(self):
+        ll = ["other site"]
+        out = seed_ll_keywords(ll, "   \n\t ", 10)
+        self.assertEqual(out, ["other site"])
+        self.assertIsNot(out, ll)
+
+    def test_whitespace_collapsed(self):
+        out = seed_ll_keywords([], "and   for\n the  other\r\nsite?", 10)
+        self.assertEqual(out, ["and for the other site?"])
+
+    def test_duplicate_case_insensitive_not_added(self):
+        out = seed_ll_keywords(["Other Site?"], "other site?", 10)
+        self.assertEqual(out, ["Other Site?"])
+
+    def test_cap_respected_when_full(self):
+        # Brief rule: keep the first max_items-1 items, seed last.
+        out = seed_ll_keywords(["a", "b", "c", "d"], "the original wording", 4)
+        self.assertEqual(out, ["a", "b", "c", "the original wording"])
+        self.assertEqual(len(out), 4)
+
+    def test_cap_of_one_keeps_only_the_seed(self):
+        self.assertEqual(seed_ll_keywords(["a"], "the original wording", 1),
+                         ["the original wording"])
+
+    def test_long_original_truncated_to_200(self):
+        out = seed_ll_keywords([], "x" * 500, 10)
+        self.assertEqual(out, ["x" * 200])
+
+    def test_input_list_not_mutated(self):
+        ll = ["a", "b"]
+        seed_ll_keywords(ll, "the original wording", 2)
+        self.assertEqual(ll, ["a", "b"])
 
 
 if __name__ == "__main__":

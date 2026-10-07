@@ -338,6 +338,36 @@ def fallback_keywords(query: str, max_items: Optional[int] = None):
     return dedupe(hl), dedupe(ll)
 
 
+# ── Seeding: keep the user's own wording in the low-level list ─────────────
+
+# Cap for the seeded original wording, in characters.
+SEED_MAX_CHARS = 200
+
+
+def seed_ll_keywords(ll: list, original: str, max_items: int) -> list:
+    """Append the user's original wording to ``ll`` (GRAG-41, pure).
+
+    When the bridge rewrites a follow-up into a standalone question, the
+    rewritten text becomes the retrieval query and the input to keyword
+    extraction, so the user's own wording never reaches retrieval. Adding it
+    as the last low-level keyword widens the joined keyword string LightRAG
+    embeds for entity search without touching ``query``.
+
+    The seed is always kept and always last; the result never exceeds
+    ``max_items``. Returns a new list; never mutates ``ll``. No I/O, never
+    raises.
+    """
+    items = list(ll or [])
+    seed = " ".join((original or "").split())[:SEED_MAX_CHARS]
+    if not seed:
+        return items
+    if any(isinstance(item, str) and item.lower() == seed.lower() for item in items):
+        return items
+    if len(items) >= max_items:
+        return items[:max_items - 1] + [seed]
+    return items + [seed]
+
+
 # ── Async client (never raises) ────────────────────────────────────────────
 
 def _resolve_endpoint():
