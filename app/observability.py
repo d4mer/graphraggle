@@ -44,6 +44,8 @@ Bridge field meanings:
 ``rewrite_step_ms``    wall time of the whole rewrite step
 ``rewrite_len_ratio``  rewritten length / original length, or null
 ``rewrite_changed``    True when retrieval ran on a rewritten query
+``rewrite_ll_seeded``  True when the user's original wording was appended to
+                       the supplied ll_keywords after a rewrite (GRAG-41)
 """
 
 from __future__ import annotations
@@ -170,6 +172,7 @@ def emit_bridge_log(
     rewrite_step_ms: int = 0,
     rewrite_len_ratio: Optional[float] = None,
     rewrite_changed: bool = False,
+    rewrite_ll_seeded: bool = False,
 ) -> None:
     """Finish and write a bridge log line. Swallows all logging errors."""
     try:
@@ -216,6 +219,9 @@ def emit_bridge_log(
                 "rewrite_step_ms": rewrite_step_ms,
                 "rewrite_len_ratio": rewrite_len_ratio,
                 "rewrite_changed": bool(rewrite_changed),
+                # Boolean only: the seeded wording is prompt text and is
+                # never logged.
+                "rewrite_ll_seeded": bool(rewrite_ll_seeded),
             }
         )
         _emit(line)

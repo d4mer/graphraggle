@@ -43,7 +43,7 @@ from .observability import (
     new_request_id,
     start_bridge_log,
 )
-from .keywords import KeywordResult, extract_keywords
+from .keywords import KeywordResult, extract_keywords, seed_ll_keywords
 from .rewrite import RewriteResult, rewrite_query
 from .rerank import rerank_citations, truncate_citations
 from .state_store import (
@@ -396,11 +396,11 @@ def _keyword_log_fields(kw: Any, kw_step_ms: int) -> dict[str, Any]:
     }
 
 
-def _rewrite_log_fields(rw: Any, rw_step_ms: int) -> dict[str, Any]:
+def _rewrite_log_fields(rw: Any, rw_step_ms: int, ll_seeded: bool = False) -> dict[str, Any]:
     """Rewrite-step observability for the bridge log line (GRAG-41).
 
     Counts, enum strings and a length ratio only - the rewritten query,
-    the conversation and the prompt are never logged.
+    the conversation, the prompt and any keyword text are never logged.
     """
     if rw is None:
         return {
@@ -410,6 +410,7 @@ def _rewrite_log_fields(rw: Any, rw_step_ms: int) -> dict[str, Any]:
             "rewrite_step_ms": 0,
             "rewrite_len_ratio": None,
             "rewrite_changed": False,
+            "rewrite_ll_seeded": False,
         }
     return {
         "rewrite_source": rw.source,
@@ -418,6 +419,7 @@ def _rewrite_log_fields(rw: Any, rw_step_ms: int) -> dict[str, Any]:
         "rewrite_step_ms": rw_step_ms,
         "rewrite_len_ratio": rw.length_ratio,
         "rewrite_changed": rw.source == "rewritten",
+        "rewrite_ll_seeded": bool(ll_seeded),
     }
 
 
@@ -509,6 +511,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     # today's behaviour (no supplied keywords).
     kw = None
     kw_step_ms = 0
+    ll_seeded = False
     if settings.bridge_keyword_supply:
         kw_t0 = time.perf_counter()
         try:
@@ -522,6 +525,16 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         if kw is not None and kw.source in ("llm", "llm_unwrapped", "fallback"):
             bridge_payload["hl_keywords"] = kw.hl
             bridge_payload["ll_keywords"] = kw.ll
+            # GRAG-41 follow-up: after a rewrite the user's own wording only
+            # reaches the answer step (user_prompt); retrieval and the keyword
+            # step see the rewritten text alone, and a narrowing rewrite can
+            # drop cited documents. Seed the original wording as the last
+            # low-level keyword. `query` and `hl_keywords` are untouched.
+            if (settings.bridge_rewrite_seed_ll and rw is not None
+                    and rw.source == "rewritten"):
+                bridge_payload["ll_keywords"] = seed_ll_keywords(
+                    kw.ll, prompt, settings.bridge_keyword_max_items)
+                ll_seeded = True
 
     log_fields = start_bridge_log(
         request_id,
@@ -531,7 +544,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         payload_params=bridge_payload,
     )
     kw_log = _keyword_log_fields(kw, kw_step_ms)
-    rw_log = _rewrite_log_fields(rw, rw_step_ms)
+    rw_log = _rewrite_log_fields(rw, rw_step_ms, ll_seeded)
     try:
         resp = await client.proxy(
             "POST",

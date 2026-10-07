@@ -56,6 +56,7 @@ class SettingsBackupMixin(unittest.TestCase):
                 "bridge_rewrite_enabled",
                 "bridge_rewrite_turns",
                 "bridge_rewrite_retries",
+                "bridge_rewrite_seed_ll",
             )
         }
         # Existing bridge tests predate the keyword-supply step; pin it off so
@@ -770,6 +771,101 @@ class TestStandaloneRewriteBridge(SettingsBackupMixin):
         r = _run_async(rewrite_query("what is the vx planning process",
                                      [{"role": "user", "content": "what is the vx planning process"}]))
         self.assertEqual(r.source, "skipped_no_history")
+
+class TestRewriteLlSeedBridge(SettingsBackupMixin):
+    """GRAG-41 follow-up: after a rewrite, seed the user's own wording into
+    ll_keywords so entity search still sees what the user typed."""
+
+    REWRITTEN = "What was said about forecast accuracy at the other site?"
+    # Distinctive marker: must never appear in the log line.
+    ORIGINAL = "and for the other site, quokka-plum-pudding?"
+    HL = ["forecast accuracy", "reporting"]
+    LL = ["other site", "workshop"]
+
+    def _payload(self):
+        return {"model": "lightrag:latest", "messages": [
+            {"role": "user", "content": "what was said about forecast accuracy?"},
+            {"role": "assistant", "content": "Forecast accuracy reached 92% at the workshop."},
+            {"role": "user", "content": self.ORIGINAL},
+        ]}
+
+    def _run(self, *, seed=True, rewrite_source="rewritten", kw_source="llm",
+             supply=True):
+        import app.api as api
+        from app.keywords import KeywordResult
+        from app.rewrite import RewriteResult
+
+        self.settings.bridge_rewrite_enabled = True
+        self.settings.bridge_keyword_supply = supply
+        self.settings.bridge_rewrite_seed_ll = seed
+
+        rw = RewriteResult(self.REWRITTEN if rewrite_source == "rewritten"
+                           else self.ORIGINAL, rewrite_source, 1, [], 2.0)
+        kw = (KeywordResult(list(self.HL), list(self.LL), kw_source, 1, [])
+              if kw_source else None)
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "a"}])))
+        captured: list[dict] = []
+        with patch.object(api, "client") as client, \
+             patch.object(api, "rewrite_query", AsyncMock(return_value=rw)), \
+             patch.object(api, "extract_keywords", AsyncMock(return_value=kw)), \
+             patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = lambda fields, **kwarg: captured.append(kwarg)
+            _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        body = json.loads(proxy.call_args.kwargs["body"]) if proxy.call_args else None
+        return body, captured[-1]
+
+    def test_seeded_original_is_last_and_query_untouched(self):
+        body, line = self._run()
+        self.assertEqual(body["ll_keywords"], self.LL + [self.ORIGINAL])
+        self.assertEqual(body["ll_keywords"][-1], self.ORIGINAL)
+        self.assertEqual(body["query"], self.REWRITTEN)
+        self.assertEqual(body["hl_keywords"], self.HL)
+        self.assertEqual(body["user_prompt"], self.ORIGINAL)
+        self.assertTrue(line["rewrite_ll_seeded"])
+
+    def test_flag_off_payload_identical_to_today(self):
+        body, line = self._run(seed=False)
+        self.assertEqual(body["ll_keywords"], self.LL)
+        self.assertFalse(line["rewrite_ll_seeded"])
+
+    def test_non_rewritten_sources_never_seed(self):
+        for source in ("unchanged", "fallback", "skipped_no_history", "off", "error"):
+            body, line = self._run(rewrite_source=source)
+            self.assertEqual(body["ll_keywords"], self.LL, msg=source)
+            self.assertFalse(line["rewrite_ll_seeded"], msg=source)
+            self.assertEqual(line["rewrite_source"], source)
+
+    def test_keyword_supply_off_sends_no_keywords_at_all(self):
+        body, line = self._run(supply=False)
+        self.assertNotIn("ll_keywords", body)
+        self.assertNotIn("hl_keywords", body)
+        self.assertFalse(line["rewrite_ll_seeded"])
+
+    def test_rejected_keyword_supply_not_seeded_alone(self):
+        # kw.source 'rejected'/'error' keeps today's payload: no keywords at all.
+        for kw_source in ("rejected", "error"):
+            body, line = self._run(kw_source=kw_source)
+            self.assertNotIn("ll_keywords", body)
+            self.assertFalse(line["rewrite_ll_seeded"], msg=kw_source)
+
+    def test_log_line_has_boolean_only_never_the_seed_text(self):
+        _, line = self._run()
+        dumped = json.dumps(line)
+        self.assertIn("rewrite_ll_seeded", dumped)
+        self.assertTrue(line["rewrite_ll_seeded"])
+        for text in (self.ORIGINAL, "quokka-plum-pudding", "workshop",
+                     "forecast accuracy"):
+            self.assertNotIn(text, dumped)
+
+    def test_log_field_false_when_rewrite_step_off(self):
+        # The task-prompt path and the rw-is-None path must still carry the
+        # field (default False), not omit it.
+        import app.api as api
+        fields = api._rewrite_log_fields(None, 0)
+        self.assertIn("rewrite_ll_seeded", fields)
+        self.assertFalse(fields["rewrite_ll_seeded"])
+
 
 if __name__ == "__main__":
     unittest.main()
