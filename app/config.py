@@ -132,6 +132,9 @@ class Settings(BaseSettings):
     # Per-request thinking switch for the rewrite call only (same finding as
     # the keyword step: oMLX honours it per-request). Off by default.
     bridge_rewrite_no_think: bool = Field(default=False, alias="BRIDGE_REWRITE_NO_THINK")
+    # When a rewrite happened, also seed the user's original wording into
+    # ll_keywords so entity search still sees what the user typed (GRAG-41).
+    bridge_rewrite_seed_ll: bool = Field(default=False, alias="BRIDGE_REWRITE_SEED_LL")
     # Model/URL/key: deliberately no new settings - the rewrite call reuses
     # the BRIDGE_KEYWORD_LLM_* overrides and LLM_BINDING_* defaults above.
     # Fallback sources: the LightRAG LLM endpoint the keyword call reuses.
