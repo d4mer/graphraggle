@@ -31,7 +31,10 @@ models); latency is not a concern; thinking is controlled per request only.
 
 None in the queue. packet-23 (`BRIDGE_EMPTY_RETRIES`, default 1, retry once on an empty 200 stream) verified 2026-10-08:
 branch `packet-23-empty-retry` (`9a7bb9a`, off `376af5e`), 447 tests pass, 71 fail on old app code,
-not pushed, not deployed. Rows `qitem-20261008062345-2dcac58f` and `qitem-20261008063132-fb40e55e` closed.
+pushed to origin and DEPLOYED to the Thinkpad 2026-10-08 (operator go; image `local/rag-gateway:p23` `68c1631d7dd3`,
+rollback tag `pre-packet-23` = `31395c52e22e`, acceptance 2/2 with `empty_retries_used=0`, retry path not exercised live,
+test containers removed; report `docs/ops/runs/stage0-empty-retry-deploy.md` on the Thinkpad; rollback:
+`docker tag local/rag-gateway:pre-packet-23 local/rag-gateway:latest && docker compose up -d --no-deps gateway-api`). Rows `qitem-20261008062345-2dcac58f` and `qitem-20261008063132-fb40e55e` closed.
 
 Done 2026-10-07: `qitem-20261007144357-dfa1720e` (worker seed work),
 closed via handoff `qitem-20261007150408-931a1aeb` and recovery row
@@ -64,9 +67,9 @@ time out (~6 min) and do not reach the operator reliably; keep briefs free of
 
 ## Next three actions
 
-1. Push packet-23 on the operator's go and ask the Thinkpad agent to deploy it; also find out why 2 of 40 Part C
+1. Find out why 2 of 40 Part C
    keyword steps fell back.
 2. Docs reconciliation (review/PRD describe the repo bridge, not production); Plane: update
    GRAG-41/GRAG-11 with the seed result (needs the Plane tools).
 3. Operator items: probe set of 30-50 questions (GRAG-15/16), oMLX memory policy (GRAG-42),
-   stop the two test containers on the Thinkpad.
+   (test containers already removed).
