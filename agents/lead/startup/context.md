@@ -12,9 +12,9 @@ models); latency is not a concern; thinking is controlled per request only.
 ## Current state
 
 - Repo `git@github.com:d4mer/graphraggle.git` on sigma at `~/work/graphraggle`.
-  Active dev branch: `packet-21-standalone-query` at `376af5e` (includes the merged
-  worker dedupe fix `2f74255`). Work happens on packet branches, not `master`
-  (operator preference: separate branches for code changes).
+  Active branch (operator correction 2026-10-08; CLAUDE.md's "master" is stale):
+  `packet-22-ll-seed`, HEAD `4cd7e09` (contains packet-21 + dedupe fix `2f74255`). Work happens on
+  packet branches, not `master`.
 - Production is the **Thinkpad** (`~/rag-project`), not this machine. Per the operator
   message of 2026-10-07 (not verified from here): packet-20 keyword supply and
   packet-21 standalone-query rewrite are DEPLOYED (gateway image `31395c52e22e`,
@@ -29,7 +29,7 @@ models); latency is not a concern; thinking is controlled per request only.
 
 ## In flight
 
-None in the queue. packet-23 (`BRIDGE_EMPTY_RETRIES`, default 1, retry once on an empty 200 stream) verified 2026-10-08:
+Nothing in flight; all queue items terminal (stale pending row `qitem-20261007104613-3a8ea104` closed 2026-10-08). packet-23 (`BRIDGE_EMPTY_RETRIES`, default 1, retry once on an empty 200 stream) verified 2026-10-08:
 branch `packet-23-empty-retry` (`9a7bb9a`, off `376af5e`), 447 tests pass, 71 fail on old app code,
 pushed to origin and DEPLOYED to the Thinkpad 2026-10-08 (operator go; image `local/rag-gateway:p23` `68c1631d7dd3`,
 rollback tag `pre-packet-23` = `31395c52e22e`, acceptance 2/2 with `empty_retries_used=0`, retry path not exercised live,
@@ -51,8 +51,7 @@ Would need >=4 draws to read a delta under ~0.25. Branch `packet-22-ll-seed` sta
 with the flag off (or can be dropped). Test containers `rag-gateway-p22-S0/S1` (:8021/:8022)
 were left running on the Thinkpad; stop with `docker rm -f rag-gateway-p22-S0 rag-gateway-p22-S1`.
 
-Reaching the Thinkpad agent: it is not on this rig; use `rig send --host thinkpad
-ops-hermes@thinkpad-ops "..."` and `rig capture --host thinkpad ...`. Its approval prompts
+Reaching the Thinkpad agent (live): `rig send ops-hermes@thinkpad-ops@host-765234ea "<msg>"`. Its approval prompts
 time out (~6 min) and do not reach the operator reliably; keep briefs free of
 `pipeline_status`-style checks (that endpoint hangs on the Thinkpad).
 
