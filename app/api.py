@@ -532,6 +532,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     )
     kw_log = _keyword_log_fields(kw, kw_step_ms)
     rw_log = _rewrite_log_fields(rw, rw_step_ms)
+    empty_retries_used = 0
     try:
         resp = await client.proxy(
             "POST",
@@ -542,9 +543,33 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     except Exception as exc:
         # Explicit marker for the silent-empty failure mode: the bridge still
         # returns "" this round, but the error line names the exception class.
-        _safe_emit_bridge(log_fields, exception=exc, **kw_log, **rw_log)
+        # A raised request is never retried - only a 200 with no answer text.
+        _safe_emit_bridge(log_fields, exception=exc, empty_retries_used=empty_retries_used,
+                          **kw_log, **rw_log)
         return ""
     raw_text, stripped = extract_stream_response_parts(resp.content)
+    # oMLX on the production host sometimes ends the answer stream early:
+    # HTTP 200, zero answer words (seen once in 40 requests, after 641 s), and
+    # OpenWebUI shows a blank reply. A second attempt with the identical
+    # payload almost always completes (the re-run returned 523 words), so
+    # re-send the same request sequentially before deciding the answer is
+    # empty. A canned (non-empty) answer is never retried, and neither is a
+    # raised request. The last response wins for everything downstream.
+    while not stripped and empty_retries_used < settings.bridge_empty_retries:
+        empty_retries_used += 1
+        try:
+            resp = await client.proxy(
+                "POST",
+                "/query/stream",
+                body=json.dumps(bridge_payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        except Exception:
+            # A retry that raises keeps the last good (empty) response: same
+            # outcome as today, and no exception line for a request that did
+            # return 200.
+            break
+        raw_text, stripped = extract_stream_response_parts(resp.content)
     answer = stripped
     honest_failure = False
     if not answer:
@@ -563,6 +588,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
             reference_count=0,
             canned_failure=False,
             honest_failure=honest_failure,
+            empty_retries_used=empty_retries_used,
             **kw_log,
             **rw_log,
         )
@@ -587,6 +613,7 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
         reference_count=len(citations),
         canned_failure=canned,
         honest_failure=honest_failure,
+        empty_retries_used=empty_retries_used,
         **kw_log,
         **rw_log,
     )
