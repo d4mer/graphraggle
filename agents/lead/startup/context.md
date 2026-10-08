@@ -1,39 +1,69 @@
 # Handoff — lead
 
-Last updated: 2026-10-07 (rig bootstrap, no work done yet)
+Last updated: 2026-10-08
 
 ## Goal
 
-Take the GraphRAG implementation repo forward end to end, using the worker seat
-for implementation and testing. Keep `master` on GitHub green at all times.
+Make the GraphRAG/LightRAG document-query stack give far more precise answers
+(OpenWebUI via the Ollama-compatible bridge). Lead delegates all code to
+`dev-worker@graphraggle`, verifies, and integrates. Data stays local (no outside
+models); latency is not a concern; thinking is controlled per request only.
 
 ## Current state
 
-- Fresh clone on sigma at `~/work/graphraggle`, branch `master`, HEAD `05ff985`.
-- `.venv/` created with fastapi, pydantic, pydantic-settings, httpx, aiosqlite,
-  aiofiles, pytest. Full suite passes: **273 passed in ~0.3s**.
-- No work items started yet. No commits made yet.
+- Repo `git@github.com:d4mer/graphraggle.git` on sigma at `~/work/graphraggle`.
+  Active dev branch: `packet-21-standalone-query` at `376af5e` (includes the merged
+  worker dedupe fix `2f74255`). Work happens on packet branches, not `master`
+  (operator preference: separate branches for code changes).
+- Production is the **Thinkpad** (`~/rag-project`), not this machine. Per the operator
+  message of 2026-10-07 (not verified from here): packet-20 keyword supply and
+  packet-21 standalone-query rewrite are DEPLOYED (gateway image `31395c52e22e`,
+  `BRIDGE_REWRITE_NO_THINK=true` in `.env`, acceptance 4/4, rollback tag
+  `pre-packet-21`, gate report `docs/ops/runs/stage0-standalone-query-report.md`
+  on the Thinkpad). Do not deploy anything from here.
+- Test suite here: **435 passed** with env vars `RAG_API_KEY=test
+  LIGHTRAG_INTERNAL_API_KEY=test LIGHTRAG_BASE_URL=http://localhost:9621
+  SOURCE_DOCS_DIR=/tmp/src UPLOADS_DIR=/tmp/up STATE_DB_PATH=/tmp/state.db` and
+  `python-multipart` installed in `.venv` (it was missing; installed 2026-10-07).
+- Live services are not running on sigma; only offline unit tests.
 
 ## In flight
 
-None. qitem-20261007103353-e2fafb7b (worker dedupe hardening) closed done and pushed 2026-10-07; suite 287 passed.
+None in the queue. Done 2026-10-07: `qitem-20261007144357-dfa1720e` (worker seed work),
+closed via handoff `qitem-20261007150408-931a1aeb` and recovery row
+`qitem-recovery-80b5e9af32b4884b`. Verified: `packet-22-ll-seed` (`d4c31cc`, off `376af5e`),
+450 tests pass, new tests fail on old code, pushed to origin. Flag `BRIDGE_REWRITE_SEED_LL`
+defaults off.
+
+**Seed measured 2026-10-07 (Thinkpad agent ops-hermes@thinkpad-ops, report
+`docs/ops/runs/stage0-ll-seed-report.md` there): NO EVIDENCE it helps; keep default off.**
+10 conversations x 2 draws x 2 arms. Mean overlap with P3: S0 0.663, S1 0.617 (delta -0.046,
+median draw spread 0.268). c01 NOT recovered (0.562 -> 0.500, within spread 0.125).
+Mechanism fires correctly (`rewrite_ll_seeded` true 16/16 rewritten S1, never otherwise).
+Would need >=4 draws to read a delta under ~0.25. Branch `packet-22-ll-seed` stays unmerged
+with the flag off (or can be dropped). Test containers `rag-gateway-p22-S0/S1` (:8021/:8022)
+were left running on the Thinkpad; stop with `docker rm -f rag-gateway-p22-S0 rag-gateway-p22-S1`.
+
+Reaching the Thinkpad agent: it is not on this rig; use `rig send --host thinkpad
+ops-hermes@thinkpad-ops "..."` and `rig capture --host thinkpad ...`. Its approval prompts
+time out (~6 min) and do not reach the operator reliably; keep briefs free of
+`pipeline_status`-style checks (that endpoint hangs on the Thinkpad).
 
 ## Decisions and constraints
 
-- Lead delegates all code changes to `dev-worker@graphraggle`; lead verifies and
-  pushes.
-- Test command is `.venv/bin/python -m pytest tests/ -q`. Tests are offline and
-  fast; there is no reason to skip them.
-- `TODO.md` near-term list is the default backlog: worker dedupe hardening,
-  SQLite status transitions / stale `track_id`, upload vs source-doc ingestion
-  semantics, end-to-end ingestion path validation (PDF/DOCX/PPTX/XLSX),
-  generate-document prompt templates.
-- Live services (LightRAG, Open WebUI) are NOT running on sigma. Only the
-  offline test suite is available here. Do not brief the worker on anything that
-  needs live services.
+- Do not brief the worker on anything needing live services; measurement of the seed
+  on real retrieval is a separate job for the Thinkpad agent (Part C harness
+  `~/rag-project/c21`), after the flag exists. Default stays off until measured.
+- Verify before closing: run the suite myself, read the diff, and confirm new tests
+  fail on the old code.
+- Logs never carry prompt, history, rewrite or keyword text (counts/enums only).
 
 ## Next three actions
 
-1. Pick TODO.md near-term #2 (SQLite status transitions / stale `track_id` replacement); read app/state_store.py + worker stale-track paths, write a tight brief, create queue item.
-2. Verify worker result (diff + full suite; re-run new tests against old code to confirm they fail pre-fix).
-3. Commit and push to `origin master`.
+1. Retry on empty oMLX completions (bridge returns a blank answer today; the seed run saw
+   one 200/0-word reply after 641 s). Brief the worker; also find out why 2 of 40 Part C
+   keyword steps fell back.
+2. Docs reconciliation (review/PRD describe the repo bridge, not production); Plane: update
+   GRAG-41/GRAG-11 with the seed result (needs the Plane tools).
+3. Operator items: probe set of 30-50 questions (GRAG-15/16), oMLX memory policy (GRAG-42),
+   stop the two test containers on the Thinkpad.
