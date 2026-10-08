@@ -69,14 +69,16 @@ class SettingsBackupMixin(unittest.TestCase):
                 "bridge_rewrite_enabled",
                 "bridge_rewrite_turns",
                 "bridge_rewrite_retries",
+                "bridge_empty_retries",
             )
         }
         # Pin the keyword-supply step off so existing observability tests
         # exercise the pre-fix path with no network call. New keyword tests
         # opt in with a mocked extract_keywords. Same for the GRAG-41
-        # rewrite step.
+        # rewrite step, and for the empty-answer retry (new tests opt in).
         self.settings.bridge_keyword_supply = False
         self.settings.bridge_rewrite_enabled = False
+        self.settings.bridge_empty_retries = 0
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -597,6 +599,43 @@ class RewriteFieldLoggingTests(SettingsBackupMixin):
         self.assertEqual(line["rewrite_attempts"], 0)
         self.assertIsNone(line["rewrite_len_ratio"])
         self.assertFalse(line["rewrite_changed"])
+
+class EmptyRetryLoggingTests(SettingsBackupMixin):
+    """The bridge log line reports empty-answer retries as a count, never text."""
+
+    def _payload(self):
+        return {"model": "lightrag:latest",
+                "messages": [{"role": "user", "content": "what is the vx planning process"}]}
+
+    def test_no_retry_logs_zero(self):
+        proxy = AsyncMock(return_value=_Resp(
+            _stream_body([{"response": "the vx planning answer body"}])))
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        line = cap.lines()[0]
+        self.assertIn("empty_retries_used", line)
+        self.assertEqual(line["empty_retries_used"], 0)
+        self.assertIsInstance(line["empty_retries_used"], int)
+        self.assertNotIsInstance(line["empty_retries_used"], bool)
+
+    def test_retry_logs_count_only_never_the_stream_text(self):
+        self.settings.bridge_empty_retries = 2
+        proxy = AsyncMock(side_effect=[
+            _Resp(_stream_body([{"response": ""}])),
+            _Resp(_stream_body([{"response": ""}])),
+            _Resp(_stream_body([{"response": "the vx planning answer body"}])),
+        ])
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        lines = cap.lines()
+        self.assertEqual(len(lines), 1)  # one line per request, retries included
+        self.assertEqual(lines[0]["empty_retries_used"], 2)
+        dumped = json.dumps(lines[0])
+        for leak in ("vx planning", "answer body"):
+            self.assertNotIn(leak, dumped)
+
 
 if __name__ == "__main__":
     unittest.main()
