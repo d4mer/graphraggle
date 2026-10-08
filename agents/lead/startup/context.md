@@ -29,7 +29,12 @@ models); latency is not a concern; thinking is controlled per request only.
 
 ## In flight
 
-None in the queue. Done 2026-10-07: `qitem-20261007144357-dfa1720e` (worker seed work),
+`qitem-20261008062345-2dcac58f` (dev-worker): packet-23 retry once on empty `/query/stream`
+answer, branch `packet-23-empty-retry` off `packet-21-standalone-query`, brief
+`agents/lead/briefs/brief-empty-retry.md`. Verify on handback: suite green, new tests fail on old
+code, diff limited to the brief's files.
+
+Done 2026-10-07: `qitem-20261007144357-dfa1720e` (worker seed work),
 closed via handoff `qitem-20261007150408-931a1aeb` and recovery row
 `qitem-recovery-80b5e9af32b4884b`. Verified: `packet-22-ll-seed` (`d4c31cc`, off `376af5e`),
 450 tests pass, new tests fail on old code, pushed to origin. Flag `BRIDGE_REWRITE_SEED_LL`
@@ -60,8 +65,7 @@ time out (~6 min) and do not reach the operator reliably; keep briefs free of
 
 ## Next three actions
 
-1. Retry on empty oMLX completions (bridge returns a blank answer today; the seed run saw
-   one 200/0-word reply after 641 s). Brief the worker; also find out why 2 of 40 Part C
+1. Verify and close packet-23 (empty-completion retry) when the worker hands it back; also find out why 2 of 40 Part C
    keyword steps fell back.
 2. Docs reconciliation (review/PRD describe the repo bridge, not production); Plane: update
    GRAG-41/GRAG-11 with the seed result (needs the Plane tools).
