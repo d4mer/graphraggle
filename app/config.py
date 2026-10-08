@@ -79,10 +79,11 @@ class Settings(BaseSettings):
     bridge_task_shortcircuit: bool = Field(default=True, alias="BRIDGE_TASK_SHORTCIRCUIT")
     # Cap on the OpenWebUI task prompt the bridge forwards (title/tag/
     # follow-up generation). Those prompts embed the whole chat, and they go
-    # upstream in mode=bypass where no retrieval truncation runs. 24000 chars
-    # is ~6k tokens; the cap protects the LLM prefix cache and decode speed.
-    # 0 disables the cap.
-    bridge_task_max_chars: int = Field(default=24000, alias="BRIDGE_TASK_MAX_CHARS")
+    # upstream in mode=bypass where no retrieval truncation runs. 0 = off
+    # (shipped default); set e.g. 24000 to enable, which is ~6k tokens and
+    # protects the LLM prefix cache and decode speed. The prompt_chars /
+    # forwarded_chars log fields are on regardless.
+    bridge_task_max_chars: int = Field(default=0, alias="BRIDGE_TASK_MAX_CHARS")
     # Append a markdown Sources block to direct-bridge answers.
     bridge_sources_enabled: bool = Field(default=True, alias="BRIDGE_SOURCES_ENABLED")
     # Strip complete reasoning regions (recognized boundary pairs only) from

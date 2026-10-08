@@ -977,6 +977,22 @@ class TestTaskPromptCap(SettingsBackupMixin):
         _, query, _ = self._run(prompt)
         self.assertEqual(query, prompt)
 
+    def test_shipped_default_of_the_setting_is_off(self):
+        from app.config import Settings
+
+        self.assertEqual(Settings.model_fields["bridge_task_max_chars"].default, 0)
+
+    def test_default_settings_forward_a_100k_task_prompt_unchanged(self):
+        from app.config import Settings
+
+        self.settings.bridge_task_max_chars = Settings.model_fields[
+            "bridge_task_max_chars"].default
+        prompt = self._task_prompt(100_000)
+        _, query, line = self._run(prompt)
+        self.assertEqual(query, prompt)
+        self.assertEqual(line["forwarded_chars"], line["prompt_chars"])
+        self.assertGreater(line["prompt_chars"], 100_000 - 100)
+
     def test_log_records_prompt_chars_and_forwarded_chars(self):
         self.settings.bridge_task_max_chars = 24000
         prompt = self._task_prompt(100_000)
