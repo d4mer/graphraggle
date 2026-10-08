@@ -44,6 +44,8 @@ Bridge field meanings:
 ``rewrite_step_ms``    wall time of the whole rewrite step
 ``rewrite_len_ratio``  rewritten length / original length, or null
 ``rewrite_changed``    True when retrieval ran on a rewritten query
+``empty_retries_used`` extra /query/stream attempts made because the answer
+                       stream came back empty (0 when none were needed)
 """
 
 from __future__ import annotations
@@ -170,6 +172,7 @@ def emit_bridge_log(
     rewrite_step_ms: int = 0,
     rewrite_len_ratio: Optional[float] = None,
     rewrite_changed: bool = False,
+    empty_retries_used: int = 0,
 ) -> None:
     """Finish and write a bridge log line. Swallows all logging errors."""
     try:
@@ -216,6 +219,9 @@ def emit_bridge_log(
                 "rewrite_step_ms": rewrite_step_ms,
                 "rewrite_len_ratio": rewrite_len_ratio,
                 "rewrite_changed": bool(rewrite_changed),
+                # Count only: the retried request body and the empty stream
+                # content are never logged.
+                "empty_retries_used": int(empty_retries_used),
             }
         )
         _emit(line)
