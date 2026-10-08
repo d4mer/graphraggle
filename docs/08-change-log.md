@@ -33,3 +33,7 @@ podman exec rag-gateway-api curl -i http://lightrag-server:9621/health
 ```
 
 10. Final smoke test validated full retrieval and citations from `rag-smoke.txt`
+
+## Packet-24 — OpenWebUI task prompts are capped before forwarding
+
+1. `BRIDGE_TASK_MAX_CHARS` (default `24000`, `0` disables) bounds the `### Task:` prompt the bridge forwards to LightRAG `mode=bypass`, where no retrieval truncation runs. The bridge keeps the first 25% of the budget (the task header) and the last 75% (the most recent chat turns), joined by `[...truncated...]`, and the bridge log line gains `prompt_chars` and `forwarded_chars` — lengths only, never prompt text.

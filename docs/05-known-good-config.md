@@ -73,3 +73,7 @@ The system successfully:
 2. ingested the full file body
 3. retrieved grounded content
 4. returned citations containing the full text
+
+## Gateway Bridge Setting Added In Packet-24
+
+1. `BRIDGE_TASK_MAX_CHARS=24000` (default) caps the OpenWebUI `### Task:` prompt the bridge forwards to LightRAG `mode=bypass` — about 6k tokens, which protects the LLM prefix cache and decode speed. `0` disables the cap. Normal (non-task) requests are unaffected. The bridge log line reports `prompt_chars` and `forwarded_chars` so the cap's effect is visible without logging prompt text.

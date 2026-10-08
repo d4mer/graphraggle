@@ -873,5 +873,137 @@ class TestEmptyAnswerRetry(SettingsBackupMixin):
             self.assertNotIn(text, dumped)
 
 
+class TestCapTaskPromptPure(unittest.TestCase):
+    """packet-24: cap_task_prompt is pure and never exceeds the budget."""
+
+    MARKER = api.TASK_PROMPT_TRUNCATION_MARKER
+
+    def _prompt(self, n: int) -> str:
+        return "### Task:\nGenerate a title.\n" + "".join(
+            f"turn{i} " for i in range(n // 7 + 1))
+
+    def test_below_limit_returned_unchanged(self):
+        prompt = self._prompt(1000)
+        self.assertEqual(api.cap_task_prompt(prompt, 24000), prompt)
+
+    def test_exactly_at_limit_returned_unchanged(self):
+        prompt = self._prompt(1000)
+        self.assertEqual(api.cap_task_prompt(prompt, len(prompt)), prompt)
+
+    def test_above_limit_keeps_25pct_head_and_75pct_tail(self):
+        prompt, cap = self._prompt(100_000), 24000
+        capped = api.cap_task_prompt(prompt, cap)
+        self.assertLessEqual(len(capped), cap)
+        self.assertTrue(capped.startswith(prompt[: cap // 4]))
+        tail_len = cap - cap // 4 - len(self.MARKER)
+        self.assertTrue(capped.endswith(prompt[-tail_len:]))
+        self.assertEqual(capped.count(self.MARKER), 1)
+
+    def test_max_zero_disables_capping(self):
+        prompt = self._prompt(100_000)
+        self.assertEqual(api.cap_task_prompt(prompt, 0), prompt)
+
+    def test_negative_max_disables_capping(self):
+        prompt = self._prompt(5000)
+        self.assertEqual(api.cap_task_prompt(prompt, -1), prompt)
+
+    def test_degenerate_tiny_budget_still_within_budget(self):
+        capped = api.cap_task_prompt(self._prompt(1000), 10)
+        self.assertLessEqual(len(capped), 10)
+
+    def test_empty_prompt_unchanged(self):
+        self.assertEqual(api.cap_task_prompt("", 24000), "")
+
+
+class TestTaskPromptCap(SettingsBackupMixin):
+    """packet-24: BRIDGE_TASK_MAX_CHARS bounds the task prompt forwarded upstream."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_task_max = self.settings.bridge_task_max_chars
+        self.settings.bridge_task_shortcircuit = True
+
+    def tearDown(self):
+        self.settings.bridge_task_max_chars = self._saved_task_max
+        super().tearDown()
+
+    def _task_prompt(self, approx_chars: int) -> str:
+        header = "### Task:\nGenerate a concise title.\n### Chat History:\n<chat_history>\n"
+        tail = "\n</chat_history>"
+        turn = "USER: what changed in the eCommit rollout? ASSISTANT: the schedule moved."
+        repeats = max(1, (approx_chars - len(header) - len(tail)) // (len(turn) + 1))
+        return header + "".join(turn + " " for _ in range(repeats)) + tail
+
+    def _run(self, content: str):
+        """Return (answer, query sent upstream, log line) for one task request."""
+        import app.api as api
+
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "Title: rollout"}])))
+        captured: list[dict] = []
+
+        def _capture(fields, **kwargs):
+            line = {k: v for k, v in fields.items() if not k.startswith("_")}
+            line.update(kwargs)
+            captured.append(line)
+
+        payload = {"model": "lightrag:latest",
+                   "messages": [{"role": "user", "content": content}]}
+        with patch.object(api, "client") as client, patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = _capture
+            answer = _run_async(api.answer_ollama_bridge_direct(payload))
+        self.assertEqual(proxy.await_count, 1)
+        body = json.loads(proxy.await_args.kwargs["body"])
+        return answer, body["query"], captured[-1]
+
+    def test_short_task_prompt_is_forwarded_verbatim(self):
+        self.settings.bridge_task_max_chars = 24000
+        prompt = self._task_prompt(1000)
+        answer, query, line = self._run(prompt)
+        self.assertEqual(query, prompt)
+        self.assertEqual(answer, "Title: rollout")
+
+    def test_100k_task_prompt_is_capped_in_the_forwarded_body(self):
+        self.settings.bridge_task_max_chars = 24000
+        prompt = self._task_prompt(100_000)
+        _, query, _ = self._run(prompt)
+        self.assertLessEqual(len(query), 24000)
+        self.assertLess(len(query), len(prompt))
+        self.assertIn(api.TASK_PROMPT_TRUNCATION_MARKER, query)
+
+    def test_cap_zero_forwards_the_whole_prompt(self):
+        self.settings.bridge_task_max_chars = 0
+        prompt = self._task_prompt(30_000)
+        _, query, _ = self._run(prompt)
+        self.assertEqual(query, prompt)
+
+    def test_log_records_prompt_chars_and_forwarded_chars(self):
+        self.settings.bridge_task_max_chars = 24000
+        prompt = self._task_prompt(100_000)
+        _, query, line = self._run(prompt)
+        self.assertEqual(line["prompt_chars"], len(prompt))
+        self.assertEqual(line["forwarded_chars"], len(query))
+        self.assertLessEqual(line["forwarded_chars"], self.settings.bridge_task_max_chars)
+        self.assertTrue(line["task_prompt"])
+
+    def test_log_carries_no_prompt_text(self):
+        self.settings.bridge_task_max_chars = 24000
+        line = self._run(self._task_prompt(100_000))[2]
+        dumped = json.dumps(line)
+        for text in ("eCommit", "rollout", "chat_history", "### Task"):
+            self.assertNotIn(text, dumped)
+
+    def test_non_task_request_payload_and_log_unchanged_apart_from_length(self):
+        import app.api as api
+
+        self.settings.bridge_task_shortcircuit = True
+        self.settings.bridge_task_max_chars = 24000
+        answer, query, line = self._run("What is the eCommit manual trigger?")
+        self.assertEqual(query, "What is the eCommit manual trigger?")
+        self.assertFalse(line["task_prompt"])
+        self.assertNotIn("forwarded_chars", line)
+        self.assertEqual(line["prompt_chars"], len("What is the eCommit manual trigger?"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -115,6 +115,8 @@ GATEWAY_CHUNK_TOP_K=16
 CITATION_TOP_K=12
 BRIDGE_HISTORY_TURNS=3
 BRIDGE_TASK_SHORTCIRCUIT=True
+# Cap on the OpenWebUI task prompt the bridge forwards (~6k tokens); 0 disables.
+BRIDGE_TASK_MAX_CHARS=24000
 # Leave false until the synthesis prompt carries real edge content (Stage 6).
 GRAPH_SYNTHESIS_REPLACE_ANSWER=False
 

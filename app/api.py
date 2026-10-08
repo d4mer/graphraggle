@@ -319,6 +319,31 @@ def is_openwebui_task_prompt(prompt: str) -> bool:
     return prompt.lstrip().startswith(OPENWEBUI_TASK_PREFIX)
 
 
+# Inserted between the kept head and tail of a capped task prompt.
+TASK_PROMPT_TRUNCATION_MARKER = "\n[...truncated...]\n"
+
+
+def cap_task_prompt(prompt: str, max_chars: int) -> str:
+    """Shorten an OpenWebUI task prompt to at most ``max_chars`` (pure, no I/O).
+
+    A task prompt embeds the whole chat, and it goes upstream in mode=bypass
+    where no retrieval truncation runs, so the only bound is this one. The task
+    header and instructions sit at the start while the most recent chat turns
+    and the closing instruction sit at the end, so the budget is split 25% head
+    / 75% tail joined by a marker line. ``max_chars <= 0`` disables capping and
+    a prompt already within budget is returned unchanged. The result is never
+    longer than ``max_chars``.
+    """
+    if max_chars <= 0 or len(prompt) <= max_chars:
+        return prompt
+    head_len = max_chars // 4
+    tail_len = max_chars - head_len - len(TASK_PROMPT_TRUNCATION_MARKER)
+    if tail_len <= 0:
+        # Budget too small to hold both parts plus the marker: hard cut.
+        return prompt[:max_chars]
+    return prompt[:head_len] + TASK_PROMPT_TRUNCATION_MARKER + prompt[-tail_len:]
+
+
 def extract_ollama_history(payload: dict[str, Any], turns: int) -> list[dict[str, str]]:
     """Previous user/assistant turns for LightRAG conversation_history.
 
@@ -433,19 +458,24 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     # no conversation history is extracted or attached here. A failing
     # bypass call returns "" and must never fall through to retrieval.
     if settings.bridge_task_shortcircuit and is_openwebui_task_prompt(prompt):
+        # packet-24: bound the forwarded prompt. The log keeps the ORIGINAL
+        # prompt for prompt_sha256 (same identity as before) and records both
+        # lengths so the cap's effect is visible without logging any text.
+        forwarded_prompt = cap_task_prompt(prompt, settings.bridge_task_max_chars)
         log_fields = start_bridge_log(
             request_id,
             prompt=prompt,
             task_prompt=True,
             history_count=0,
             payload_params={"mode": "bypass", "include_references": False},
+            forwarded_chars=len(forwarded_prompt),
         )
         try:
             resp = await client.proxy(
                 "POST",
                 "/query/stream",
                 body=json.dumps({
-                    "query": prompt,
+                    "query": forwarded_prompt,
                     "mode": "bypass",
                     "stream": True,
                     "include_references": False,

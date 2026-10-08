@@ -16,6 +16,10 @@ Logging must never break a query: every emit is wrapped and swallowed.
 Bridge field meanings:
 
 ``prompt_sha256``      first 16 hex chars of sha256(prompt); never the prompt
+``prompt_chars``       characters in the prompt the bridge received (never the text)
+``forwarded_chars``    characters actually forwarded after the task-prompt cap
+                       (packet-24); present only when the caller passed it, i.e.
+                       on the ``### Task:`` short-circuit path
 ``task_prompt``        True when the prompt is an OpenWebUI ``### Task:`` call
 ``history_messages``   conversation_history entries actually sent upstream
 ``payload_params``     retrieval parameters sent to LightRAG (never the query)
@@ -127,9 +131,15 @@ def start_bridge_log(
     history_count: int,
     payload_params: dict[str, Any],
     backend: str = "lightrag_direct",
+    forwarded_chars: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Open a bridge log record. Call emit_bridge_log to finish it."""
-    return {
+    """Open a bridge log record. Call emit_bridge_log to finish it.
+
+    Only lengths are recorded, never prompt text. ``forwarded_chars`` is the
+    length actually sent upstream after capping; it is omitted unless the
+    caller supplies it (the task short-circuit path does).
+    """
+    record: dict[str, Any] = {
         "request_id": request_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "endpoint": "bridge",
@@ -137,6 +147,7 @@ def start_bridge_log(
         "task_prompt": task_prompt,
         "history_messages": history_count,
         "prompt_sha256": prompt_sha256(prompt),
+        "prompt_chars": len(prompt or ""),
         "payload_params": {
             k: v
             for k, v in payload_params.items()
@@ -146,6 +157,9 @@ def start_bridge_log(
         },
         "_t0": time.perf_counter(),
     }
+    if forwarded_chars is not None:
+        record["forwarded_chars"] = forwarded_chars
+    return record
 
 
 def emit_bridge_log(

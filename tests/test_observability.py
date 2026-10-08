@@ -637,5 +637,73 @@ class EmptyRetryLoggingTests(SettingsBackupMixin):
             self.assertNotIn(leak, dumped)
 
 
+class PromptLengthLoggingTests(SettingsBackupMixin):
+    """packet-24: prompt_chars / forwarded_chars are lengths, never text."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_task_max = self.settings.bridge_task_max_chars
+
+    def tearDown(self):
+        self.settings.bridge_task_max_chars = self._saved_task_max
+        super().tearDown()
+
+    def _chat_payload(self, content: str):
+        return {"model": "lightrag:latest", "messages": [{"role": "user", "content": content}]}
+
+    def _run(self, content: str):
+        proxy = AsyncMock(return_value=_Resp(_stream_body([{"response": "answer body"}])))
+        with patch.object(api, "client") as client, _LogCapture() as cap:
+            client.proxy = proxy
+            _run_async(api.answer_ollama_bridge_direct(self._chat_payload(content)))
+        return cap.lines()
+
+    def test_start_bridge_log_always_records_prompt_chars(self):
+        from app.observability import start_bridge_log
+
+        record = start_bridge_log("rid", prompt="x" * 4321, task_prompt=False,
+                                  history_count=0, payload_params={})
+        self.assertEqual(record["prompt_chars"], 4321)
+        self.assertNotIn("forwarded_chars", record)
+
+    def test_forwarded_chars_only_when_supplied(self):
+        from app.observability import start_bridge_log
+
+        record = start_bridge_log("rid", prompt="x" * 100, task_prompt=True, history_count=0,
+                                  payload_params={}, forwarded_chars=40)
+        self.assertEqual(record["forwarded_chars"], 40)
+        self.assertEqual(record["prompt_chars"], 100)
+
+    def test_normal_bridge_line_has_prompt_chars_and_no_forwarded_chars(self):
+        lines = self._run("What does the AcmeCorp merger clause say?")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["prompt_chars"], len("What does the AcmeCorp merger clause say?"))
+        self.assertNotIn("forwarded_chars", lines[0])
+        self.assertNotIn("merger clause", json.dumps(lines[0]))
+
+    def test_task_line_reports_both_lengths(self):
+        self.settings.bridge_task_shortcircuit = True
+        self.settings.bridge_task_max_chars = 500
+        prompt = "### Task:\nSummarise the AcmeCorp merger clause.\n" + "turn text " * 400 + "end"
+        lines = self._run(prompt)
+        line = lines[0]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(line["task_prompt"])
+        self.assertEqual(line["prompt_chars"], len(prompt))
+        self.assertLessEqual(line["forwarded_chars"], 500)
+        self.assertIsInstance(line["prompt_chars"], int)
+        self.assertIsInstance(line["forwarded_chars"], int)
+        dumped = json.dumps(line)
+        for leak in ("AcmeCorp", "merger clause", "turn text", "### Task"):
+            self.assertNotIn(leak, dumped)
+
+    def test_cap_disabled_reports_equal_lengths(self):
+        self.settings.bridge_task_shortcircuit = True
+        self.settings.bridge_task_max_chars = 0
+        prompt = "### Task:\nGenerate a title.\n" + "turn text " * 50 + "end"
+        line = self._run(prompt)[0]
+        self.assertEqual(line["forwarded_chars"], line["prompt_chars"])
+
+
 if __name__ == "__main__":
     unittest.main()
