@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     # chain-of-thought inline in the streamed response; the non-stream path
     # does not carry it. Orphan markers are never stripped.
     bridge_strip_reasoning: bool = Field(default=True, alias="BRIDGE_STRIP_REASONING")
+    # Extra attempts after the first /query/stream call when it comes back
+    # HTTP 200 with an empty answer (oMLX early stop). 0 disables retrying.
+    bridge_empty_retries: int = Field(default=1, alias="BRIDGE_EMPTY_RETRIES")
     # When false, LightRAG's own grounded answer is never replaced by the
     # graph-synthesis pass. Re-enabled in Stage 6 once that prompt carries
     # real edge content instead of node counts.
