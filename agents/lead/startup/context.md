@@ -27,7 +27,19 @@ models); latency is not a concern; thinking is controlled per request only.
   `python-multipart` installed in `.venv` (it was missing; installed 2026-10-07).
 - Live services are not running on sigma; only offline unit tests.
 
-## In flight
+## In flight (updated 2026-10-08 evening)
+
+- `qitem-20261008193140-7f2bdffa` packet-24 (cap OpenWebUI task prompts, `BRIDGE_TASK_MAX_CHARS` default 24000, log
+  `prompt_chars`/`forwarded_chars`) with dev-worker on branch `packet-24-task-prompt-cap` (off packet-23). OPERATOR
+  AUTHORISED DEPLOY once I verify (suite, diff, tests fail on old code). Deploy via ops-hermes with rollback tag
+  `pre-packet-24`, acceptance, then report.
+- ops-hermes (Thinkpad, `rig send --host thinkpad ops-hermes@thinkpad-ops`): Part A quality run (draw 2/3), then Part B
+  backup/restore drill, Part C cleanup (`docs/briefs/gate2-gate3-ops.md`); addenda: oMLX tps study (ssh macbookm1 read-only
+  approved) and task_prompt correlation. Finding so far: slow decode = 45k-80k uncached prompts + swap/model-unload thrash on
+  macbookm1; suspect OpenWebUI task prompts. Release plan: `docs/ops/release-plan-first-use.md` (Gate 1 closed; Gate 0
+  waiting on merge-target decision; reboot drill + oMLX memory policy need operator).
+
+## Earlier (done)
 
 Nothing in flight; all queue items terminal (stale pending row `qitem-20261007104613-3a8ea104` closed 2026-10-08). packet-23 (`BRIDGE_EMPTY_RETRIES`, default 1, retry once on an empty 200 stream) verified 2026-10-08:
 branch `packet-23-empty-retry` (`9a7bb9a`, off `376af5e`), 447 tests pass, 71 fail on old app code,
