@@ -67,9 +67,12 @@ time out (~6 min) and do not reach the operator reliably; keep briefs free of
 
 ## Next three actions
 
-1. Find out why 2 of 40 Part C
-   keyword steps fell back.
-2. Docs reconciliation (review/PRD describe the repo bridge, not production); Plane: update
-   GRAG-41/GRAG-11 with the seed result (needs the Plane tools).
-3. Operator items: probe set of 30-50 questions (GRAG-15/16), oMLX memory policy (GRAG-42),
-   (test containers already removed).
+1. Keyword fallbacks explained (Thinkpad agent, 2026-10-08, report `docs/ops/runs/stage0-keyword-fallback-reasons.md`):
+   Part C 2/40 (c07 P1, c08 P1) were rewrite-OFF context-less follow-ups, 3 attempts in ~2.7 s, so validation
+   rejection (not timeout, not http error; exact enum lost with the removed containers). c22 0/40, prod 0/4 (log
+   window short after redeploy). Not a bridge bug; packet-21 removes that input class. No action. Small gap:
+   persist `keyword_failure_reasons` in the measurement driver's capture.
+2. Docs reconciliation (review/PRD describe the repo bridge, not production); Plane: update GRAG-41/GRAG-11 with the
+   seed result and packet-23 deploy (needs the Plane tools).
+3. Operator items: probe set of 30-50 questions (GRAG-15/16), oMLX memory policy (GRAG-42). Local docs commits on
+   `packet-22-ll-seed` are unpushed.
