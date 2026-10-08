@@ -56,6 +56,7 @@ class SettingsBackupMixin(unittest.TestCase):
                 "bridge_rewrite_enabled",
                 "bridge_rewrite_turns",
                 "bridge_rewrite_retries",
+                "bridge_empty_retries",
             )
         }
         # Existing bridge tests predate the keyword-supply step; pin it off so
@@ -770,6 +771,107 @@ class TestStandaloneRewriteBridge(SettingsBackupMixin):
         r = _run_async(rewrite_query("what is the vx planning process",
                                      [{"role": "user", "content": "what is the vx planning process"}]))
         self.assertEqual(r.source, "skipped_no_history")
+
+class TestEmptyAnswerRetry(SettingsBackupMixin):
+    """oMLX early stop: HTTP 200 with zero answer words gets one retry."""
+
+    EMPTY = _stream_body([{"response": ""}])
+    ANSWER = _stream_body([{"response": "The vx planning process runs weekly."}])
+    CANNED = _stream_body(
+        [{"response": "Sorry, I'm not able to provide an answer to that question.[no-context]"}])
+
+    def _payload(self):
+        return {"model": "lightrag:latest",
+                "messages": [{"role": "user", "content": "what is the vx planning process"}]}
+
+    def _run(self, responses, *, empty_retries=1, kw=None):
+        import app.api as api
+
+        self.settings.bridge_empty_retries = empty_retries
+        self.settings.bridge_keyword_supply = kw is not None
+        self.settings.bridge_rewrite_enabled = False
+        proxy = AsyncMock(side_effect=responses)
+        captured: list[dict] = []
+        with patch.object(api, "client") as client, \
+             patch.object(api, "extract_keywords", AsyncMock(return_value=kw)), \
+             patch.object(api, "emit_bridge_log") as emit:
+            client.proxy = proxy
+            emit.side_effect = lambda fields, **kwarg: captured.append(kwarg)
+            answer = _run_async(api.answer_ollama_bridge_direct(self._payload()))
+        return answer, proxy, captured[-1]
+
+    def test_empty_then_answer_retries_once_with_identical_payload(self):
+        answer, proxy, line = self._run([_Resp(self.EMPTY), _Resp(self.ANSWER)])
+        self.assertIn("vx planning process runs weekly", answer)
+        self.assertEqual(proxy.await_count, 2)
+        first = proxy.call_args_list[0].kwargs
+        second = proxy.call_args_list[1].kwargs
+        self.assertEqual(first, second)  # same body, same headers, same path
+        self.assertEqual(line["empty_retries_used"], 1)
+
+    def test_still_empty_after_retry_keeps_todays_result(self):
+        answer, proxy, line = self._run([_Resp(self.EMPTY), _Resp(self.EMPTY)])
+        self.assertEqual(answer, "")
+        self.assertEqual(proxy.await_count, 2)
+        self.assertEqual(line["empty_retries_used"], 1)
+
+    def test_still_empty_with_keyword_fallback_keeps_honest_message(self):
+        from app.keywords import KeywordResult
+        from app.api import KEYWORD_HONEST_FAILURE_MESSAGE
+        kw = KeywordResult(["vx planning"], ["vx"], "fallback", 1, ["no_json_found"])
+        answer, proxy, line = self._run([_Resp(self.EMPTY), _Resp(self.EMPTY)], kw=kw)
+        self.assertEqual(answer, KEYWORD_HONEST_FAILURE_MESSAGE)
+        self.assertEqual(proxy.await_count, 2)
+        self.assertTrue(line["honest_failure"])
+        self.assertEqual(line["empty_retries_used"], 1)
+
+    def test_retries_zero_makes_one_call(self):
+        answer, proxy, line = self._run([_Resp(self.EMPTY)], empty_retries=0)
+        self.assertEqual(answer, "")
+        self.assertEqual(proxy.await_count, 1)
+        self.assertEqual(line["empty_retries_used"], 0)
+
+    def test_non_empty_first_answer_is_not_retried(self):
+        answer, proxy, line = self._run([_Resp(self.ANSWER)])
+        self.assertIn("vx planning process runs weekly", answer)
+        self.assertEqual(proxy.await_count, 1)
+        self.assertEqual(line["empty_retries_used"], 0)
+
+    def test_exception_is_not_retried(self):
+        answer, proxy, line = self._run([RuntimeError("proxy boom")])
+        self.assertEqual(answer, "")
+        self.assertEqual(proxy.await_count, 1)
+        self.assertEqual(type(line.get("exception")).__name__, "RuntimeError")
+        self.assertEqual(line["empty_retries_used"], 0)
+
+    def test_canned_answer_is_not_retried(self):
+        answer, proxy, line = self._run([_Resp(self.CANNED)])
+        self.assertEqual(proxy.await_count, 1)
+        self.assertTrue(line["canned_failure"])
+        self.assertEqual(line["empty_retries_used"], 0)
+
+    def test_retry_that_raises_keeps_last_empty_response(self):
+        answer, proxy, line = self._run([_Resp(self.EMPTY), RuntimeError("boom")])
+        self.assertEqual(answer, "")
+        self.assertEqual(proxy.await_count, 2)
+        self.assertEqual(line["empty_retries_used"], 1)
+        self.assertNotIn("exception", line)
+
+    def test_two_retries_when_configured(self):
+        answer, proxy, line = self._run(
+            [_Resp(self.EMPTY), _Resp(self.EMPTY), _Resp(self.ANSWER)], empty_retries=2)
+        self.assertIn("vx planning process runs weekly", answer)
+        self.assertEqual(proxy.await_count, 3)
+        self.assertEqual(line["empty_retries_used"], 2)
+
+    def test_log_field_is_an_int_and_carries_no_text(self):
+        _, _, line = self._run([_Resp(self.EMPTY), _Resp(self.ANSWER)])
+        self.assertIsInstance(line["empty_retries_used"], int)
+        self.assertNotIsInstance(line["empty_retries_used"], bool)
+        dumped = json.dumps(line)
+        for text in ("vx planning", "weekly", "Sorry, I'm not able"):
+            self.assertNotIn(text, dumped)
+
 
 if __name__ == "__main__":
     unittest.main()
