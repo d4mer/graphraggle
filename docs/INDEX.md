@@ -29,11 +29,17 @@ Use this file as the main navigation page for the GraphRAG documentation set.
 
 ## Validated Facts
 
-1. LightRAG image tag: `ghcr.io/hkuds/lightrag:v1.4.15`
-2. Embedding model: `mxbai-embed-large-v1`
-3. Reranker model: `jina-reranker-v3-mlx`
-4. LLM host: `192.168.1.190:1234/v1`
-5. Embedding/rerank host: `192.168.1.180:1234`
-6. Text files should ingest through LightRAG `POST /documents/text`
-7. Uploads should remain in `uploads/`
-8. Ignore `source_docs/__enqueued__`
+Verified on the production Thinkpad (`~/rag-project`) on 2026-10-09; details in
+`05-known-good-config.md`.
+
+1. Runtime: **Docker** (`docker compose`) — not podman
+2. LightRAG image tag: `ghcr.io/hkuds/lightrag:v1.5.7` (the repo `compose.yml` still pins `v1.4.15`)
+3. Embedding model: `mxbai-embed-large-v1` (dimension 1024)
+4. Reranker model: `jina-reranker-v3-mlx`
+5. LLM, embeddings and reranker host: `192.168.1.190:1234` — one oMLX server for all three
+6. Host ports: gateway `8020`, Open WebUI `3010`, LightRAG `9621`
+7. Gateway health: `GET http://localhost:8020/health` — never use LightRAG `pipeline_status`, it hangs
+8. `rag-ingest-worker` runs an old pre-packet-18 image; the worker dedupe hardening (`2f74255`) is in the repo but not deployed
+9. Text files should ingest through LightRAG `POST /documents/text`
+10. Uploads should remain in `uploads/`
+11. Ignore `source_docs/__enqueued__`

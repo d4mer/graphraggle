@@ -3,7 +3,7 @@
 ## Open The UI
 
 ```bash
-open http://localhost:3000
+open http://localhost:3010
 ```
 
 ## First-Time Configuration
@@ -15,7 +15,7 @@ Use Open WebUI against the local stack through the gateway's Ollama-compatible r
 Open:
 
 ```bash
-open http://localhost:3000
+open http://localhost:3010
 ```
 
 If prompted, create the initial local admin account.
@@ -59,8 +59,8 @@ Expected model behavior:
 Run these checks:
 
 ```bash
-curl -i http://localhost:8000/api/version
-curl -i http://localhost:8000/api/tags
+curl -i http://localhost:8020/api/version
+curl -i http://localhost:8020/api/tags
 ```
 
 If those fail, Open WebUI will not have a working backend model connection.
@@ -137,9 +137,9 @@ The stack exposes three distinct UI/API surfaces. Use each for its intended purp
 
 | Surface | URL | Purpose |
 |---------|-----|---------|
-| Gateway API | `http://localhost:8000` (or `macmini.local:8000`) | Uploads, ingest status, query tests, document generation — the operational control plane |
-| Open WebUI | `http://localhost:3000` | Conversational research, threaded exploration, iterative follow-up questions |
-| LightRAG Web UI | `http://localhost:9622` | Admin and debugging — inspect ingestion state, track status, internal health |
+| Gateway API | `http://localhost:8020` | Uploads, ingest status, query tests, document generation — the operational control plane |
+| Open WebUI | `http://localhost:3010` | Conversational research, threaded exploration, iterative follow-up questions |
+| LightRAG Web UI | `http://localhost:9621` | Admin and debugging — inspect ingestion state, track status, internal health |
 
 Rules:
 
@@ -190,15 +190,15 @@ Transcript prompt pattern:
 Commands:
 
 ```bash
-curl -i http://localhost:8000/ingest/status \
+curl -i http://localhost:8020/ingest/status \
   -H "Authorization: Bearer $RAG_API_KEY"
 
-curl -i -X POST http://localhost:8000/query \
+curl -i -X POST http://localhost:8020/query \
   -H "Authorization: Bearer $RAG_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"query":"What does the document say?","mode":"mix"}'
 
-curl -i http://localhost:8000/api/tags
+curl -i http://localhost:8020/api/tags
 ```
 
 ## Daily Use Checklist
@@ -206,14 +206,14 @@ curl -i http://localhost:8000/api/tags
 Before using Open WebUI each day:
 
 1. start the stack
-2. verify `http://localhost:8000/health`
-3. verify `http://localhost:8000/api/version`
+2. verify `http://localhost:8020/health`
+3. verify `http://localhost:8020/api/version`
 4. confirm target docs are `ingested`
-5. then open `http://localhost:3000`
+5. then open `http://localhost:3010`
 
 ## Known-Good Configuration For This Stack
 
-1. Open WebUI URL: `http://localhost:3000`
-2. Gateway API URL: `http://localhost:8000`
+1. Open WebUI URL: `http://localhost:3010`
+2. Gateway API URL: `http://localhost:8020`
 3. Ollama-compatible backend URL for Open WebUI: `http://gateway-api:8000`
 4. Do not use direct LightRAG or raw oMLX URLs in Open WebUI for this workflow
