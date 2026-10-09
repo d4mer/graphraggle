@@ -27,17 +27,26 @@ models); latency is not a concern; thinking is controlled per request only.
   `python-multipart` installed in `.venv` (it was missing; installed 2026-10-07).
 - Live services are not running on sigma; only offline unit tests.
 
-## In flight (updated 2026-10-08 evening)
+## In flight (updated 2026-10-09)
 
-- `qitem-20261008193140-7f2bdffa` packet-24 (cap OpenWebUI task prompts, `BRIDGE_TASK_MAX_CHARS` default 24000, log
-  `prompt_chars`/`forwarded_chars`) with dev-worker on branch `packet-24-task-prompt-cap` (off packet-23). OPERATOR
-  AUTHORISED DEPLOY once I verify (suite, diff, tests fail on old code). Deploy via ops-hermes with rollback tag
-  `pre-packet-24`, acceptance, then report.
-- ops-hermes (Thinkpad, `rig send --host thinkpad ops-hermes@thinkpad-ops`): Part A quality run (draw 2/3), then Part B
-  backup/restore drill, Part C cleanup (`docs/briefs/gate2-gate3-ops.md`); addenda: oMLX tps study (ssh macbookm1 read-only
-  approved) and task_prompt correlation. Finding so far: slow decode = 45k-80k uncached prompts + swap/model-unload thrash on
-  macbookm1; suspect OpenWebUI task prompts. Release plan: `docs/ops/release-plan-first-use.md` (Gate 1 closed; Gate 0
-  waiting on merge-target decision; reboot drill + oMLX memory policy need operator).
+GOAL NOW: release to prod ASAP (plan `docs/ops/release-plan-first-use.md`). Production = Thinkpad, already running the RC:
+gateway `local/rag-gateway:p24` (4629dcab0bea, commit c89b293 on branch `packet-24-task-prompt-cap`, rollback tag `pre-packet-24`=68c1631d7dd3).
+- `qitem-20261009210610-00299873` (dev-worker): docs-only reconciliation, branch `release-rc1-docs` off packet-24
+  (brief `docs/briefs/release-rc1-docs.md`). When it hands back: verify diff is docs/ only, suite 467 passed, no secrets, then
+  fast-forward `origin/master` (currently 2f74255) to it, tag `rc-1`, push.
+- OPERATOR DECISION 2026-10-09: update the production ingest worker AFTER rc-1 (prod `rag-ingest-worker` runs old image d9d9ce2307a2,
+  pre-packet-18; repo has dedupe fix 2f74255). Do via ops-hermes with a rollback tag, acceptance on a test file, report.
+- Done/closed: Gate 1 (probe set, 36 q, ~/rag-project/probe on Thinkpad), Gate 2 run (rc1-quality-report: cross-doc 0.56, unanswerable 0.67,
+  0 empty/5xx, p50 178 s), Gate 3 backup/restore drill PASS, reboot drill PASS (stack back in ~1 min; sigma lost ssh to Thinkpad ~70 min, unexplained).
+- Still open (operator): oMLX memory policy (GRAG-42; embeddings+rerank+LLM all on 192.168.1.190), go/no-go (Gate 4).
+- Findings: bridge answers ~32.5k prompt tokens, ~58 tps decode, ttft ~46 s; the 5-6 tps in oMLX is non-streaming helper calls (prefill included in
+  tps) plus contention; 45-80k prompts are another client (max_tokens=32000). Prod has MULTI_QUERY_ENABLED=true. Persistent query log is
+  not set (QUERY_LOG_PATH unset) - operator declined changing it for now.
+- ops-hermes (Thinkpad): approvals for `rig send` to me block unseen; tell it to write result FILES and read them via
+  `ssh 100.64.0.6`. After a reboot its seat is a bare shell: `ssh 100.64.0.6 'rig launch 01M4DDRGCNP2SFY3FB9TYP5KGG ops.hermes'`
+  then in its tmux pane `cd ~/rag-project && hermes chat -c`. Its `rig send` envelope garbage goes into a shell if the agent is not running.
+- Shared-checkout hazard: the worker and I share this cwd; use `git worktree add` for any commit on a branch other than the checked-out one.
+- A production API key appeared in a diff I printed (prod compose.yml has it in clear); never copied into repo; rotation advisable.
 
 ## Earlier (done)
 
