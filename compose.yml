@@ -1,9 +1,22 @@
 services:
   lightrag-server:
-    image: ghcr.io/hkuds/lightrag:v1.4.15
+    image: ghcr.io/hkuds/lightrag:v1.5.7
     container_name: lightrag-server
     env_file:
       - .env
+    environment:
+      # INPUT_DIR MUST equal the --input-dir CLI argument below. LightRAG v1.5.7
+      # writes uploads to the --input-dir argument but its parser looks for the
+      # file via the INPUT_DIR env var (image default /app/data/inputs). When the
+      # two differ every upload fails with "Parse worker failed (native): legacy
+      # source file not found". LightRAG also needs an input dir of its OWN: the
+      # ingest worker scans ./source_docs, and uploading a file whose basename is
+      # already in the input dir returns HTTP 409 "Input directory already
+      # contains a file with the same canonical basename".
+      # The host dir ./lightrag_inputs must exist and be world-writable (777)
+      # before first start; recreating it while the container runs leaves a stale
+      # bind mount, so restart lightrag-server after removing/recreating it.
+      INPUT_DIR: /data/lightrag_inputs
     command:
       - --host
       - 0.0.0.0
@@ -12,13 +25,14 @@ services:
       - --working-dir
       - /data/lightrag_store
       - --input-dir
-      - /data/source_docs
+      - /data/lightrag_inputs
     volumes:
       - ./lightrag_store:/data/lightrag_store
+      - ./lightrag_inputs:/data/lightrag_inputs
       - ./source_docs:/data/source_docs
       - ./logs:/data/logs
     ports:
-      - "9622:9621"
+      - "9621:9621"
     restart: unless-stopped
 
   gateway-api:
@@ -36,7 +50,7 @@ services:
         - ./logs:/app/logs
         - ./state:/app/state
       ports:
-        - "8000:8000"
+        - "8020:8000"
       depends_on:
         - lightrag-server
       restart: unless-stopped
@@ -61,14 +75,23 @@ services:
       restart: unless-stopped
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:0.11.4
     container_name: open-webui
     environment:
       WEBUI_AUTH: "False"
       ENABLE_OLLAMA_API: "True"
       OLLAMA_BASE_URLS: '["http://gateway-api:8000"]'
+      # HyperQwen / external OpenAI-compatible endpoints (non-secret values).
+      OPENAI_API_BASE_URLS: 'http://192.168.1.195:1234/v1;http://192.168.1.195:18020/v1'
+      # SECRET: the key value never goes in the repo. Set OPENWEBUI_OPENAI_API_KEYS
+      # in the host .env file (same place as the other secrets); the empty default
+      # keeps `docker compose up` working until it is set.
+      OPENAI_API_KEYS: "${OPENWEBUI_OPENAI_API_KEYS:-}"
+      OPENCLAW_BRIDGE_STATE_DIR: '/app/backend/data/openclaw-bridge'
+    extra_hosts:
+      - host.docker.internal:host-gateway
     ports:
-      - "3000:8080"
+      - "3010:8080"
     depends_on:
       - gateway-api
     volumes:

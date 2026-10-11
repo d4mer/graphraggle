@@ -13,6 +13,7 @@ __pycache__/
 
 # Local stack runtime artifacts should stay outside this repo.
 lightrag_store/
+lightrag_inputs/
 source_docs/
 uploads/
 logs/

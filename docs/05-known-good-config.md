@@ -21,7 +21,7 @@ Runtime is **Docker** (`docker compose`) — **not podman**. **(changed 2026-10-
 | Container | Image | Note |
 |---|---|---|
 | `rag-gateway-api` | `local/rag-gateway:p24` (image `4629dcab0bea`) | built from commit `c89b293` |
-| `lightrag-server` | `ghcr.io/hkuds/lightrag:v1.5.7` | **(changed 2026-10-09)** — the repo's `compose.yml` still pins `v1.4.15`; production does not run that tag |
+| `lightrag-server` | `ghcr.io/hkuds/lightrag:v1.5.7` | **(changed 2026-10-09)** — the repo `compose.yml` was reconciled to this tag on **2026-10-11** (packet-26) |
 | `open-webui` | `ghcr.io/open-webui/open-webui:0.11.4` | pinned tag, not `main` |
 | `rag-chromadb` | `chromadb/chroma:latest` | |
 | `rag-ingest-worker` | image `d9d9ce2307a2` | **an old build from before packet-18.** The worker dedupe hardening (`2f74255`) is in the repo but is **not yet deployed** to this container |
@@ -29,7 +29,7 @@ Runtime is **Docker** (`docker compose`) — **not podman**. **(changed 2026-10-
 Host ports (production):
 
 1. LightRAG — `9621:9621` on the host **(changed 2026-10-09)**; the repo
-   `compose.yml` maps `9622`, production maps `9621`
+   `compose.yml` now maps `9621` too **(reconciled 2026-10-11**, it used to map `9622`**)
 2. Gateway — host `8020` → container `8000` **(changed 2026-10-09)**
 3. Open WebUI — host `3010` → container `8080` **(changed 2026-10-09)**
 
@@ -80,8 +80,71 @@ RERANK_TIMEOUT=240
 image: ghcr.io/hkuds/lightrag:v1.5.7   # production, changed 2026-10-09
 ```
 
-The repo's `compose.yml` still says `v1.4.15`. That file was deliberately not
-touched by the rc1 docs pass; reconcile it in a separate code packet.
+The repo `compose.yml` now pins the same tag **(reconciled 2026-10-11**, packet-26**)**.
+
+## LightRAG Input Directory — the 409 / "legacy source file not found" cause (2026-10-11)
+
+LightRAG v1.5.7 uses **two different settings for one directory**, and they must be
+equal:
+
+1. the **`--input-dir` CLI argument** — where `/documents/upload` **writes** the file
+2. the **`INPUT_DIR` environment variable** — where the **parser looks the file up**
+   (image default: `/app/data/inputs`)
+
+When they differ, every uploaded binary fails in the parser with:
+
+```
+Parse worker failed (native): legacy source file not found
+```
+
+The input dir must also be **separate from the folder the ingest worker scans**
+(`source_docs/`). If it is the same folder, `/documents/upload` refuses the file with:
+
+```
+HTTP 409 — Input directory already contains a file with the same canonical basename
+```
+
+Production therefore runs LightRAG with its **own** input dir, and the repo
+`compose.yml` now matches:
+
+```yaml
+environment:
+  INPUT_DIR: /data/lightrag_inputs     # MUST equal --input-dir below
+command:
+  - --input-dir
+  - /data/lightrag_inputs
+volumes:
+  - ./lightrag_inputs:/data/lightrag_inputs
+  - ./source_docs:/data/source_docs    # still mounted for the worker's dedupe/state view
+```
+
+Operator facts about `lightrag_inputs/`:
+
+1. The host directory **must exist before the first start** and be **world-writable
+   (`777`)** — LightRAG runs as a non-root user inside the container and uploads fail
+   with a permission error otherwise:
+   `mkdir -p ~/rag-project/lightrag_inputs && chmod 777 ~/rag-project/lightrag_inputs`
+2. It is a runtime directory and is **gitignored** (`lightrag_inputs/`), like
+   `source_docs/`.
+3. **Removing and recreating the host directory leaves the bind mount stale** — the
+   running container keeps pointing at the deleted inode. Restart `lightrag-server`
+   after doing that.
+4. Canary `.docx` and `.pdf` both ingest after this change (verified on production
+   2026-10-11).
+
+## Open WebUI — HyperQwen connection (non-secret values in `compose.yml`)
+
+`compose.yml` carries `OPENAI_API_BASE_URLS`, `OPENCLAW_BRIDGE_STATE_DIR` and
+`extra_hosts: host.docker.internal:host-gateway` for the HyperQwen endpoints. The key
+itself is **never** in the repo:
+
+```yaml
+OPENAI_API_KEYS: "${OPENWEBUI_OPENAI_API_KEYS:-}"
+```
+
+Set **`OPENWEBUI_OPENAI_API_KEYS`** in the host `.env` file (the same file as every
+other secret). There is no `.env.example` in this repo, so the variable is documented
+here and in the change log only.
 
 ## Production `.env` Settings (non-secret, verified 2026-10-09)
 
