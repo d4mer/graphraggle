@@ -1,7 +1,6 @@
 # Packet 25 — submit source_docs files via LightRAG scan (fix v1.5.7 upload 409)
 
-Branch: `packet-25-scan-submit` (already created from origin/master in the lead's worktree; create your own:
-`git worktree add ../graphraggle-p25 -b packet-25-scan-submit origin/master` if that branch is not checked out for you, or check it out in a worktree. Do NOT switch the shared checkout).
+Branch: work in your own worktree, branched from this brief's branch: `git fetch origin && git worktree add ../graphraggle-p25 -b packet-25-impl origin/packet-25-scan-submit`. Push `packet-25-impl` when done. Do NOT switch the shared checkout.
 Tests: `RAG_API_KEY=test LIGHTRAG_INTERNAL_API_KEY=test LIGHTRAG_BASE_URL=http://localhost:9621 SOURCE_DOCS_DIR=/tmp/src UPLOADS_DIR=/tmp/up STATE_DB_PATH=/tmp/state.db .venv/bin/python -m pytest tests/ -q` (467 pass today). No live services on this box: everything is tested with mocked `client`.
 
 ## Problem (proven on prod, 2026-10-11)
