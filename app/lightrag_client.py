@@ -30,6 +30,22 @@ class LightRAGClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def post_scan(self) -> dict:
+        """``POST /documents/scan`` with no body (LightRAG v1.5.7).
+
+        Triggers LightRAG's own scan of its ``--input-dir``. The call is global:
+        it covers every file in that directory and returns ONE
+        ``{status, message, track_id}`` for the whole scan. When the pipeline is
+        busy it answers ``status="scanning_skipped_pipeline_busy"`` with no
+        ``track_id`` and starts nothing. A scan also performs LightRAG's
+        "exclusive FAILED reset", pulling previously failed documents back in;
+        that is expected and acceptable here.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(f"{self.base_url}/documents/scan", headers=self.headers)
+            resp.raise_for_status()
+            return resp.json()
+
     async def proxy(self, method: str, path: str, body: bytes | None = None, content_type: str | None = None):
         headers = dict(self.headers)
         if content_type:

@@ -48,6 +48,9 @@ NON_RETRYABLE_FAILURE_CODES = {
     "track_status_failed",
 }
 TRANSIENT_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+# LightRAG /documents/scan answers this when the pipeline is busy and starts
+# nothing. Transient: the rows stay retryable and are retried next cycle.
+SCAN_SKIP_STATUSES = {"scanning_skipped_pipeline_busy"}
 TRANSIENT_EXCEPTION_NAMES = {
     "ConnectError",
     "ConnectTimeout",
@@ -281,6 +284,178 @@ def is_retryable_failure(doc: dict[str, Any]) -> bool:
     return bool(error_code) and error_code not in NON_RETRYABLE_FAILURE_CODES
 
 
+# ── packet-25: submit source_docs files through LightRAG's input-dir scan ───
+
+def uses_scan_submit(path: Path) -> bool:
+    """True when this file must be submitted by LightRAG's input-dir scan.
+
+    LightRAG v1.5.7 refuses ``POST /documents/upload`` with HTTP 409 for any file
+    whose canonical basename already exists in its ``--input-dir``. Production
+    starts that container with ``--input-dir`` pointed at the same folder the
+    worker scans (``SOURCE_DOCS_DIR``), so every non-text file there 409s. Those
+    files are picked up natively by ``POST /documents/scan`` instead. Files under
+    ``UPLOADS_DIR`` are not in the input dir and keep using ``/documents/upload``;
+    text extensions keep using ``/documents/text``.
+    """
+    if not settings.worker_scan_submit_enabled:
+        return False
+    if path.suffix.lower() in TEXT_EXTENSIONS:
+        return False
+    root = Path(settings.source_docs_dir)
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
+def scan_entry_for_path(docs: list[dict[str, Any]], path: str) -> dict[str, Any] | None:
+    """Match a scan track's ``documents[]`` entry to this row by basename.
+
+    A scan track is shared: ``track_status`` returns every file the scan picked
+    up, each keyed by LightRAG's own ``file_path``. The row and its entry share a
+    basename, so compare ``Path(file_path).name`` exactly first, then a
+    whitespace/case-normalised pass in case LightRAG normalises the name.
+    """
+    wanted = Path(path).name
+    for entry in docs:
+        if Path(str(entry.get("file_path", ""))).name == wanted:
+            return entry
+    wanted_norm = " ".join(wanted.lower().split())
+    for entry in docs:
+        name = " ".join(Path(str(entry.get("file_path", ""))).name.lower().split())
+        if name and name == wanted_norm:
+            return entry
+    return None
+
+
+def is_scan_track(warnings_json: Any) -> bool:
+    """True when this row's track_id came from a shared input-dir scan."""
+    if not warnings_json:
+        return False
+    try:
+        meta = json.loads(warnings_json) if isinstance(warnings_json, str) else warnings_json
+    except (TypeError, ValueError):
+        return False
+    worker_block = meta.get("worker") if isinstance(meta, dict) else None
+    return isinstance(worker_block, dict) and worker_block.get("track_source") == "scan"
+
+
+async def _mark_scan_deferred(row: dict[str, Any], *, reason: str, detail: str | None) -> None:
+    """Leave a scan-submitted row retryable when the scan did not start.
+
+    ``scanning_skipped_pipeline_busy``, a missing ``track_id`` and HTTP
+    429/409/503 are all transient here: the row stays ``accepted`` with a
+    retryable marker, never ``failed``, so the next scan cycle submits it again.
+    """
+    await update_document_state(
+        row["path"],
+        sha256=row["digest"],
+        status="accepted",
+        error_stage="submit",
+        error_code="scan_deferred",
+        error_message="LightRAG input-dir scan did not start; worker will retry next scan cycle",
+        error_detail=detail,
+        last_error=reason,
+        track_id=None,
+        query_ready=False,
+        ingested_at=None,
+        byte_size=row["byte_size"],
+        warnings_json=merge_warning_metadata(
+            row.get("warnings_json"),
+            duplicate_of=None,
+            worker_updates=cleared_reindex_updates({
+                "dedupe_action": None,
+                "failure_class": "transient",
+                "retryable": True,
+                "retry_reason": row.get("retry_reason"),
+                "submission_blocked": "scan_not_started",
+                "scan_defer_reason": reason,
+                "track_source": None,
+            }),
+        ),
+    )
+
+
+async def _mark_scan_submitted(row: dict[str, Any], track_id: str) -> None:
+    """Record the shared scan ``track_id`` on one row, mirroring the upload path.
+
+    ``track_source: "scan"`` is what makes ``poll_track`` read this file's status
+    out of the shared track instead of the whole track's statuses.
+    """
+    await update_document_state(
+        row["path"],
+        sha256=row["digest"],
+        status="submitted",
+        track_id=track_id,
+        last_error=None,
+        validation_state=row["validation_state"],
+        error_stage=row["error_stage"],
+        error_code=row["error_code"],
+        error_message=row["error_message"],
+        error_detail=None,
+        query_ready=False,
+        content_hash=row["digest"],
+        detected_encoding=row.get("detected_encoding"),
+        byte_size=row["byte_size"],
+        ingested_at=None,
+        warnings_json=merge_warning_metadata(
+            row.get("warnings_json"),
+            duplicate_of=None,
+            worker_updates=cleared_reindex_updates({
+                "dedupe_action": None,
+                "duplicate_match_count": None,
+                "duplicate_match_paths": None,
+                "duplicate_status": None,
+                "last_submitted_track_id": track_id,
+                "last_polled_track_id": track_id,
+                "retry_reason": row.get("retry_reason"),
+                "submission_blocked": None,
+                "stale_track_id": None,
+                "stale_track_marker": None,
+                "stale_track_reason": None,
+                "track_id_policy": None,
+                "track_poll_payload": None,
+                "scan_defer_reason": None,
+                "track_source": "scan",
+            }),
+        ),
+    )
+    await update_document_state(row["path"], retry_count=0)
+
+
+async def flush_scan_submission(pending: list[dict[str, Any]]) -> None:
+    """Trigger ONE LightRAG input-dir scan for every file deferred this cycle.
+
+    The scan takes no per-file body and is global, so N files cost one call and
+    one shared ``track_id``. Every failure mode is transient: a skipped/busy
+    answer, a missing ``track_id``, or an HTTP error (429/409/503 included) leaves
+    the rows retryable instead of writing a failure row.
+    """
+    if not pending:
+        return
+    try:
+        resp = await client.post_scan()
+    except Exception as exc:
+        warn(
+            f"LightRAG scan trigger failed for {len(pending)} file(s): "
+            f"{type(exc).__name__}: {exc}; rows stay retryable"
+        )
+        for row in pending:
+            await _mark_scan_deferred(row, reason=f"scan_trigger_{type(exc).__name__}", detail=str(exc))
+        return
+    status = str(resp.get("status") or "")
+    track_id = resp.get("track_id") or None
+    if not track_id or status in SCAN_SKIP_STATUSES:
+        reason = status or "scan_missing_track_id"
+        warn(f"LightRAG scan not started for {len(pending)} file(s): {reason}; rows stay retryable")
+        for row in pending:
+            await _mark_scan_deferred(row, reason=reason, detail=json.dumps(resp, sort_keys=True))
+        return
+    warn(f"LightRAG input-dir scan triggered for {len(pending)} file(s); track_id={track_id}")
+    for row in pending:
+        await _mark_scan_submitted(row, track_id)
+
+
 async def mark_duplicate_candidate(path: Path, digest: str, duplicate_of: dict[str, Any], existing: dict[str, Any] | None) -> None:
     warnings_json = merge_warning_metadata(
         existing.get("warnings_json") if existing else None,
@@ -323,7 +498,14 @@ async def mark_duplicate_candidate(path: Path, digest: str, duplicate_of: dict[s
     warn(f"Skipping duplicate content for {path}: {duplicate_of.get('path')}")
 
 
-async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason: str | None = None) -> None:
+async def submit_file(
+    path: Path,
+    source_type: str,
+    digest: str,
+    *,
+    retry_reason: str | None = None,
+    scan_pending: list[dict[str, Any]] | None = None,
+) -> None:
     existing = await get_document_by_path(str(path))
     company = existing.get("company") if existing else None
     original_filename = existing.get("original_filename") if existing else None
@@ -468,6 +650,11 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
                     "file_source": str(path),
                 },
             )
+        elif uses_scan_submit(path):
+            # packet-25: the file already lives in LightRAG's input dir, so it is
+            # picked up by this cycle's single scan instead of uploaded (v1.5.7
+            # /documents/upload 409s on a basename already in the input dir).
+            resp = None
         else:
             resp = await client.post_file("/documents/upload", str(path))
     except Exception as exc:
@@ -506,6 +693,28 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
                 }),
             ),
         )
+        return
+
+    if uses_scan_submit(path):
+        row = {
+            "path": str(path),
+            "source_type": source_type,
+            "digest": digest,
+            "validation_state": verdict.verdict if verdict.verdict in ("accept", "warn") else "accept",
+            "error_stage": "validation" if verdict.verdict == "warn" else None,
+            "error_code": verdict.meta.get("error_code") if verdict.verdict == "warn" else None,
+            "error_message": verdict.meta.get("error_message") if verdict.verdict == "warn" else None,
+            "detected_encoding": detected_encoding,
+            "byte_size": byte_size,
+            "warnings_json": warnings_json,
+            "retry_reason": retry_reason,
+        }
+        if scan_pending is None:
+            # Called outside a scan cycle (no collector): flush immediately so the
+            # row is never left without a submission decision.
+            await flush_scan_submission([row])
+        else:
+            scan_pending.append(row)
         return
 
     track_id = resp.get("track_id") or None
@@ -613,6 +822,42 @@ async def poll_track(doc: dict[str, Any]) -> None:
                 ),
             )
             return
+        if is_scan_track(doc.get("warnings_json")):
+            # A scan track is shared by every file the scan picked up, so this
+            # row's outcome is read from ITS entry only. An entry that has not
+            # appeared yet keeps the row processing: an absent file must never
+            # mark a shared track stale for the other rows. No new timeout is
+            # invented here — the existing stale policy above (empty documents,
+            # HTTP 404) still decides when a track is genuinely gone.
+            entry = scan_entry_for_path(docs, doc["path"])
+            if entry is None:
+                await update_document_state(
+                    doc["path"],
+                    status="processing",
+                    last_error=None,
+                    error_stage=None,
+                    error_code=None,
+                    error_message=None,
+                    error_detail=None,
+                    query_ready=False,
+                    warnings_json=merge_warning_metadata(
+                        doc.get("warnings_json"),
+                        worker_updates={
+                            "last_polled_track_id": doc.get("track_id"),
+                            "last_track_status": "no_entry_for_basename",
+                            "failure_class": None,
+                            "retryable": None,
+                            "stale_track_id": None,
+                            "stale_track_marker": None,
+                            "stale_track_reason": None,
+                            "track_id_policy": None,
+                            "track_poll_payload": json.dumps({"documents_count": len(docs)}, sort_keys=True),
+                        },
+                    ),
+                )
+                return
+            statuses = {str(entry.get("status", "")).upper()} if entry.get("status") else set()
+
         if not statuses:
             await update_document_state(
                 doc["path"],
@@ -775,7 +1020,13 @@ async def poll_track(doc: dict[str, Any]) -> None:
             )
 
 
-async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
+async def handle_candidate(
+    path: Path,
+    source_type: str,
+    root: Path,
+    *,
+    scan_pending: list[dict[str, Any]] | None = None,
+) -> None:
     if should_skip_path(path, root, source_type):
         return
 
@@ -969,10 +1220,13 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
             worker_updates=cleared_reindex_updates(),
         ),
     )
-    await submit_file(path, source_type, digest, retry_reason=retry_reason)
+    await submit_file(path, source_type, digest, retry_reason=retry_reason, scan_pending=scan_pending)
 
 
 async def scan_once() -> None:
+    # Files that must go through LightRAG's input-dir scan are collected during
+    # the cycle and submitted by ONE /documents/scan call at the end of it.
+    scan_pending: list[dict[str, Any]] = []
     for base, source_type in ((Path(settings.source_docs_dir), "filesystem"), (Path(settings.uploads_dir), "upload")):
         if not base.exists():
             continue
@@ -1002,7 +1256,7 @@ async def scan_once() -> None:
                 )
                 continue
             try:
-                await handle_candidate(path, source_type, base)
+                await handle_candidate(path, source_type, base, scan_pending=scan_pending)
             except Exception as exc:
                 existing = await get_document_by_path(str(path))
                 if existing:
@@ -1051,6 +1305,9 @@ async def scan_once() -> None:
                             },
                         ),
                     )
+
+
+    await flush_scan_submission(scan_pending)
 
 
 async def main() -> None:

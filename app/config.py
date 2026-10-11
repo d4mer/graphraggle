@@ -19,6 +19,12 @@ class Settings(BaseSettings):
 
     ingest_scan_interval_seconds: int = Field(default=30, alias="INGEST_SCAN_INTERVAL_SECONDS")
     ingest_max_retries: int = Field(default=3, alias="INGEST_MAX_RETRIES")
+    # packet-25: LightRAG v1.5.7 /documents/upload answers HTTP 409 for any file
+    # whose canonical basename already exists in its --input-dir, which is every
+    # file under SOURCE_DOCS_DIR. Those files are submitted by triggering
+    # LightRAG's own input-dir scan (POST /documents/scan) instead of uploading.
+    # Set false to fall back to the old upload path.
+    worker_scan_submit_enabled: bool = Field(default=True, alias="WORKER_SCAN_SUBMIT_ENABLED")
     request_timeout_seconds: int = Field(default=300, alias="REQUEST_TIMEOUT_SECONDS")
 
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
