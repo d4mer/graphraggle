@@ -1,39 +1,50 @@
 # Handoff — lead
 
-Last updated: 2026-10-07 (rig bootstrap, no work done yet)
+Last updated: 2026-10-11 (after rc-1 worker update, LightRAG input-dir fix, packet-26)
 
 ## Goal
+Get GraphRAG released to production for first use (plan: docs/ops/release-plan-first-use.md). Operator: "get back to dev and release to prod asap".
+Keep `master` on GitHub green. I do not write code; dev-worker@graphraggle does (queue). Ops on the Thinkpad (prod) go through
+`rig send --host thinkpad ops-hermes@thinkpad-ops "..."` (files-only reports, never rig send back; Hermes approval dialogs are invisible to
+the operator — if the pane shows a Dangerous Command dialog for a brief-approved command, select "Allow once" via
+`ssh 100.64.0.6 'tmux send-keys -t "ops-hermes@thinkpad-ops" Enter'`).
 
-Take the GraphRAG implementation repo forward end to end, using the worker seat
-for implementation and testing. Keep `master` on GitHub green at all times.
-
-## Current state
-
-- Fresh clone on sigma at `~/work/graphraggle`, branch `master`, HEAD `05ff985`.
-- `.venv/` created with fastapi, pydantic, pydantic-settings, httpx, aiosqlite,
-  aiofiles, pytest. Full suite passes: **273 passed in ~0.3s**.
-- No work items started yet. No commits made yet.
+## Where things stand
+- master = fca1b3f (pushed). Tag rc-1 = e436e98. Working branch earlier was packet-22-ll-seed (18 commits ahead of master, unmerged:
+  BRIDGE_REWRITE_SEED_LL work + prompt-size investigation); packet-24 (task prompt cap, default OFF) is in master and deployed.
+- Prod (Thinkpad ~/rag-project, Docker, ssh 100.64.0.6): gateway p24 image 4629dcab0bea; ingest-worker updated to the SAME image on 2026-10-10
+  (backup backups/pre-worker-update-20261010-075725Z; rollback override compose.rollback-worker.yml, image local/rag-gateway:pre-packet-18, unapplied).
+- LightRAG v1.5.7 input-dir fix applied 2026-10-11: compose has `--input-dir /data/lightrag_inputs` + volume + `environment: INPUT_DIR: /data/lightrag_inputs`.
+  Root cause: upload writes to the CLI arg, parser reads INPUT_DIR env; plus the old input dir overlapped the worker's scan folder (409s).
+  Canary .docx and .pdf both ingested and were cleaned up. Backups: backups/compose.yml.pre-inputdir*-2026101*.
+  Hazard: recreating the host dir lightrag_inputs leaves a stale bind mount -> restart lightrag-server (I did one restart after Hermes rmdir'd it).
+- Repo compose.yml reconciled to prod (packet-26, guard tests, 479 tests pass). DO NOT copy repo compose over prod: prod holds the real OpenWebUI key
+  (repo uses ${OPENWEBUI_OPENAI_API_KEYS:-}).
+- Packet-25 (scan-based submit) built and REJECTED: LightRAG /documents/scan archives processed files and may re-ingest abs-path text docs. Branch packet-25-impl kept unmerged.
+- Flags in force: BRIDGE_TASK_MAX_CHARS=0, BRIDGE_REWRITE_SEED_LL off, MULTI_QUERY on, GRAPH_EXPANSION off, RERANK on, MAX_ASYNC=1.
 
 ## In flight
+Nothing queued. No open worker or Hermes jobs.
 
-None. qitem-20261007103353-e2fafb7b (worker dedupe hardening) closed done and pushed 2026-10-07; suite 287 passed.
+## Decisions pending (operator)
+1. Retry the failed document rows in the state DB (4 old `accepted`->failed from the worker update, plus older ones; LightRAG-side failed entries
+   must be cleared first). Terminal failures are not auto-retried. Separate small job.
+2. Gate 4 go/no-go. Evidence: Gate 2 quality baseline (cross-doc 0.56; unanswerable hallucination p35 0/3), latency median ~178 s,
+   reboot drill + backup/restore drill done, Office/PDF ingest now works.
+3. Rotate the prod OpenWebUI API key (OPENAI_API_KEYS) — it was printed in a diff once (never committed).
+4. oMLX memory policy (embeddings+rerank+LLM on one box, swap ~89%); GRAG-42.
+5. A real-document check: drop one real .docx into source_docs and confirm it shows in the LightRAG web UI under the current date.
+6. Unexplained: sigma->Thinkpad VPN gap (~70 min after the reboot drill); latency gap 178 s vs ~80-90 s estimate (no persistent query log, operator declined QUERY_LOG_PATH).
+7. Plane updates (GRAG-41/11/15/16/42) need Plane tools.
 
-## Decisions and constraints
-
-- Lead delegates all code changes to `dev-worker@graphraggle`; lead verifies and
-  pushes.
-- Test command is `.venv/bin/python -m pytest tests/ -q`. Tests are offline and
-  fast; there is no reason to skip them.
-- `TODO.md` near-term list is the default backlog: worker dedupe hardening,
-  SQLite status transitions / stale `track_id`, upload vs source-doc ingestion
-  semantics, end-to-end ingestion path validation (PDF/DOCX/PPTX/XLSX),
-  generate-document prompt templates.
-- Live services (LightRAG, Open WebUI) are NOT running on sigma. Only the
-  offline test suite is available here. Do not brief the worker on anything that
-  needs live services.
+## Constraints and hazards
+- Shared checkout (/home/maverick/work/graphraggle) is on release-rc1-docs with the worker's uncommitted agents/worker/startup/context.md; use `git worktree`
+  (lead worktree: ../graphraggle-lead-wt) for any commit.
+- Test command: RAG_API_KEY=test LIGHTRAG_INTERNAL_API_KEY=test LIGHTRAG_BASE_URL=http://localhost:9621 SOURCE_DOCS_DIR=/tmp/src UPLOADS_DIR=/tmp/up STATE_DB_PATH=/tmp/state.db .venv/bin/python -m pytest tests/ -q
+- Hermes reports live on the Thinkpad (~/rag-project/docs/ops/runs/rc1-*.md); not committed by operator decision. Judge Hermes claims against its source evidence
+  (it misread an input dir once and reported a stale mount as fine).
 
 ## Next three actions
-
-1. Pick TODO.md near-term #2 (SQLite status transitions / stale `track_id` replacement); read app/state_store.py + worker stale-track paths, write a tight brief, create queue item.
-2. Verify worker result (diff + full suite; re-run new tests against old code to confirm they fail pre-fix).
-3. Commit and push to `origin master`.
+1. Ask the operator for the Gate 4 go/no-go and the decision on retrying the failed rows.
+2. If go: run the real-document check, then tag the release and update docs/08-change-log.md.
+3. Decide whether to merge packet-22-ll-seed (BRIDGE_REWRITE_SEED_LL) or leave it parked.
