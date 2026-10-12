@@ -55,6 +55,8 @@ class FakeOps(ol.Ops):
         self.commands: list[list[str]] = []
         self.env_snapshots: list[str] = []
         self.http_calls: list[tuple[str, str]] = []
+        self.headers_seen: list[tuple[str, dict]] = []
+        self.delete_status = 200
         self.worker_running = False
         self.fail_compose_calls: set[int] = set()
         self.raise_on_exec = False
@@ -97,7 +99,10 @@ class FakeOps(ol.Ops):
 
     def http_json(self, method, url, *, headers=None, payload=None, timeout=30.0):
         self.http_calls.append((method, url))
+        self.headers_seen.append((url, dict(headers or {})))
         self.clock += self.advance_per_call
+        if url.endswith("/documents") and method == "DELETE" and self.delete_status != 200:
+            return self.delete_status, {"error": "clear refused"}
         if url.endswith("/health"):
             return 200, {"status": "healthy"}
         if url.endswith("/v1/models"):
@@ -573,6 +578,83 @@ class TestCommandLine(_Case):
                 "--out", str(self.out),
             ])
         self.assertEqual(code, 3)
+
+
+# ── LightRAG API key is optional (packet-29) ───────────────────────────────
+
+class TestLightRagApiKey(_Case):
+    KEY = "lightrag-secret"
+
+    def _env_without_key(self) -> str:
+        return ENV_TEXT.replace(f"LIGHTRAG_API_KEY={self.KEY}\n", "")
+
+    def _set_env(self, text: str) -> None:
+        (self.root / ".env").write_text(text, encoding="utf-8")
+
+    def _reingest_config(self) -> dict:
+        return self.write_experiments({
+            "baseline_env": {},
+            "experiments": [{"name": "E1", "env": {}, "reingest": True}],
+        })
+
+    def _document_call_headers(self) -> list[tuple[str, dict]]:
+        return [(url, headers) for url, headers in self.ops.headers_seen if "/documents" in url]
+
+    def test_absent_key_sends_no_auth_header_and_reingest_succeeds(self):
+        self._set_env(self._env_without_key())
+        config = self._reingest_config()
+        self.assertEqual(self.make_loop(config).run(), 0)
+        state = self.state()
+        self.assertEqual(state["experiments"]["E1"]["status"], "done")
+        self.assertEqual(state["corpus_built_by"], "E1")
+        calls = self._document_call_headers()
+        self.assertTrue(any(url.endswith("/documents") for url, _ in calls))
+        self.assertTrue(any(url.endswith("/documents/text") for url, _ in calls))
+        self.assertTrue(any("/documents/track_status/" in url for url, _ in calls))
+        for url, headers in calls:
+            self.assertNotIn("X-API-Key", headers)
+
+    def test_empty_key_is_treated_as_absent(self):
+        self._set_env(ENV_TEXT.replace(f"LIGHTRAG_API_KEY={self.KEY}", "LIGHTRAG_API_KEY="))
+        config = self._reingest_config()
+        self.assertEqual(self.make_loop(config).run(), 0)
+        self.assertEqual(self.state()["experiments"]["E1"]["status"], "done")
+        for _url, headers in self._document_call_headers():
+            self.assertNotIn("X-API-Key", headers)
+
+    def test_present_key_sends_the_header_on_every_call(self):
+        config = self._reingest_config()
+        self.assertEqual(self.make_loop(config).run(), 0)
+        calls = self._document_call_headers()
+        self.assertTrue(calls)
+        for _url, headers in calls:
+            self.assertEqual(headers.get("X-API-Key"), self.KEY)
+
+    def test_key_status_is_logged_once_per_run(self):
+        self._set_env(self._env_without_key())
+        config = self._reingest_config()
+        self.make_loop(config).run()
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("LightRAG API key: absent (open access)"), 1)
+        self.assertNotIn("LightRAG API key: present", log)
+
+    def test_present_key_logs_present_once_without_the_value(self):
+        config = self._reingest_config()
+        self.make_loop(config).run()
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("LightRAG API key: present"), 1)
+        self.assertNotIn(self.KEY, log)
+
+    def test_key_value_never_reaches_the_log_or_an_error_message(self):
+        config = self._reingest_config()
+        self.ops.delete_status = 500
+        self.make_loop(config).run()
+        state = self.state()
+        self.assertEqual(state["experiments"]["E1"]["status"], "error")
+        self.assertIn("DELETE /documents returned 500", state["experiments"]["E1"]["error"])
+        self.assertNotIn(self.KEY, state["experiments"]["E1"]["error"])
+        self.assertNotIn(self.KEY, (self.out / "loop.log").read_text(encoding="utf-8"))
+        self.assertNotIn(self.KEY, json.dumps(state))
 
 
 if __name__ == "__main__":

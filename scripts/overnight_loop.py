@@ -795,13 +795,21 @@ class Loop:
         self.log("worker is stopped; safe to clear LightRAG")
 
     def _api_key(self) -> str:
-        key = env_value(self.original_env_text, "LIGHTRAG_API_KEY")
-        if not key:
-            raise StepError("LIGHTRAG_API_KEY not found in .env; cannot call LightRAG")
-        return key
+        """LightRAG's API key, or "" when the stack runs open access.
+
+        Production runs LightRAG without LIGHTRAG_API_KEY (the /documents/*
+        routes are whitelisted), so an absent key is normal, not an error. The
+        value is never logged.
+        """
+        return env_value(self.original_env_text, "LIGHTRAG_API_KEY") or ""
+
+    def _lightrag_headers(self) -> dict[str, str]:
+        """Auth header for LightRAG calls: only when a key is configured."""
+        key = self._api_key()
+        return {"X-API-Key": key} if key else {}
 
     def _clear_lightrag(self) -> None:
-        headers = {"X-API-Key": self._api_key()}
+        headers = self._lightrag_headers()
         status, body = self.ops.http_json("DELETE", f"{LIGHTRAG_URL}/documents", headers=headers, timeout=120)
         if status >= 400:
             raise StepError(f"DELETE /documents returned {status}")
@@ -835,7 +843,7 @@ class Loop:
         status, body = self.ops.http_json(
             "POST",
             f"{LIGHTRAG_URL}/documents/text",
-            headers={"X-API-Key": self._api_key()},
+            headers=self._lightrag_headers(),
             payload={"text": text, "file_source": str(path)},
             timeout=120,
         )
@@ -848,7 +856,7 @@ class Loop:
         def processed() -> tuple[bool, Any]:
             code, payload = self.ops.http_json(
                 "GET", f"{LIGHTRAG_URL}/documents/track_status/{track_id}",
-                headers={"X-API-Key": self._api_key()}, timeout=30,
+                headers=self._lightrag_headers(), timeout=30,
             )
             if code != 200:
                 return False, payload
@@ -1122,6 +1130,10 @@ class Loop:
             self.log(f"backed up .env to {self.env_original_path} (chmod 600)")
         if self.dry_run:
             self.ops.write_text_atomic(self.env_path, self.original_env_text)
+        key = self._api_key()
+        self.log(
+            "LightRAG API key: present" if key else "LightRAG API key: absent (open access)"
+        )
 
     def _run_experiments(self) -> None:
         consecutive_errors = 0
