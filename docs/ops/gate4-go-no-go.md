@@ -60,5 +60,5 @@ Latency: median 178 s, p95 237 s per answer. Bridge decode runs about 58 tok/s; 
 Operator logs each bad answer (question, expected, got). Lead triages weekly into bug, tuning flag, or accepted limitation. First candidates to tackle from the
 log: refusal behaviour on unanswerable questions, cross-document retrieval, and the latency gap.
 
-## Decision requested
-Go / no-go for rc-1 first use as above.
+## Decision
+**GO**, given by the operator on 2026-10-12: proceed with first use of rc-1 (Gate 5 hypercare begins). Pre-use actions (key rotation, real-document check) remain open.

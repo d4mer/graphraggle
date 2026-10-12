@@ -28,7 +28,7 @@ Nothing queued. No open worker or Hermes jobs.
 
 ## Decisions pending (operator)
 1. RESOLVED 2026-10-12: failed rows triaged (Hermes rc1-failed-triage.md): 4 already searchable, 4 test artifacts (scenario06 placeholder, 2x v157-regression probes), 1 missing probe file, 2 canaries. Operator decision: retry nothing, delete nothing, leave all as is (incl. 5 failed LightRAG stub entries).
-2. Gate 4 go/no-go. Evidence: Gate 2 quality baseline (cross-doc 0.56; unanswerable hallucination p35 0/3), latency median ~178 s,
+2. DECIDED 2026-10-12: GO for first use (Gate 5 hypercare started). Next feature dev: pptx support (scope to be defined with operator). Evidence was: Gate 2 quality baseline (cross-doc 0.56; unanswerable hallucination p35 0/3), latency median ~178 s,
    reboot drill + backup/restore drill done, Office/PDF ingest now works.
 3. Rotate the prod OpenWebUI API key (OPENAI_API_KEYS) — it was printed in a diff once (never committed).
 4. oMLX memory policy (embeddings+rerank+LLM on one box, swap ~89%); GRAG-42.
@@ -44,6 +44,6 @@ Nothing queued. No open worker or Hermes jobs.
   (it misread an input dir once and reported a stale mount as fine).
 
 ## Next three actions
-1. Ask the operator for the Gate 4 go/no-go.
+1. Define pptx support scope with the operator, then brief the worker; hypercare: collect bad answers (question/expected/got), triage weekly.
 2. If go: run the real-document check, then tag the release and update docs/08-change-log.md.
 3. Decide whether to merge packet-22-ll-seed (BRIDGE_REWRITE_SEED_LL) or leave it parked.
