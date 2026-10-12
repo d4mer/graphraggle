@@ -1,0 +1,11 @@
+{
+  "baseline_env": {},
+  "experiments": [
+    {"name": "E0-baseline", "env": {}, "reingest": false, "probe_concurrency": 1},
+    {"name": "E1-async2", "env": {"MAX_ASYNC": "2", "LLM_MODEL_MAX_ASYNC": "2"}, "reingest": true, "probe_concurrency": 1},
+    {"name": "E2-nogleaning", "env": {"MAX_ASYNC": "2", "LLM_MODEL_MAX_ASYNC": "2", "MAX_GLEANING": "0"}, "reingest": true, "probe_concurrency": 1},
+    {"name": "E3-chunk600", "env": {"MAX_ASYNC": "2", "LLM_MODEL_MAX_ASYNC": "2", "CHUNK_SIZE": "600", "CHUNK_OVERLAP_SIZE": "100"}, "reingest": true, "probe_concurrency": 1},
+    {"name": "E4-chunk2000", "env": {"MAX_ASYNC": "2", "LLM_MODEL_MAX_ASYNC": "2", "CHUNK_SIZE": "2000", "CHUNK_OVERLAP_SIZE": "200"}, "reingest": true, "probe_concurrency": 1},
+    {"name": "E5-entitytypes", "env": {"MAX_ASYNC": "2", "LLM_MODEL_MAX_ASYNC": "2", "ENTITY_TYPES": "[\"Person\",\"Organization\",\"System\",\"Process\",\"Project\",\"Decision\",\"Risk\",\"Document\",\"Location\",\"Event\",\"Concept\"]"}, "reingest": true, "probe_concurrency": 1}
+  ]
+}
