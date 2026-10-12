@@ -119,11 +119,17 @@ class FakeOps(ol.Ops):
         if url.endswith("/documents") and method == "DELETE":
             return 200, {"status": "ok"}
         if url.endswith("/status_counts"):
-            return 200, {"counts": {"pending": 0, "processing": 0, "preprocessed": 0, "processed": 0, "failed": 0}}
+            return 200, {"status_counts": {
+                "pending": 0, "parsing": 0, "analyzing": 0, "processing": 0,
+                "preprocessed": 0, "processed": 0, "failed": 0, "all": 0,
+            }}
         if url.endswith("/documents/text"):
             return 200, {"track_id": "track-1"}
         if "/documents/track_status/" in url:
-            return 200, {"documents": [{"status": "processed"}]}
+            return 200, {"track_id": "track-1", "documents": [
+                {"id": "doc-1", "status": "processed", "file_path": "doc1.txt",
+                 "chunks_count": 1, "error_msg": None},
+            ], "total_count": 1, "status_summary": {"processed": 1}}
         if url.endswith("/api/chat"):
             question = payload["messages"][-1]["content"]
             if question in self.chat_fails:
@@ -676,19 +682,34 @@ class TestStaticIntegrity(unittest.TestCase):
     ALLOWED = {"__name__", "__file__", "__module__", "__doc__", "__builtins__"}
 
     def _module_level_names(self, tree: ast.Module) -> set[str]:
+        """Names bound at module level, including inside module-level if/try/for
+        blocks, but not names local to a function or class body."""
         names: set[str] = set()
-        for node in tree.body:
+
+        def collect(node: ast.AST) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+                return
+            if isinstance(node, ast.Lambda):
+                return
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for alias in node.names:
                     names.add(alias.asname or alias.name.split(".")[0])
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(node.name)
             elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
                     names.update(n.id for n in ast.walk(target) if isinstance(n, ast.Name))
             elif isinstance(node, ast.TypeAlias):
                 names.add(node.name.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                names.add(node.id)
+            for child in ast.iter_child_nodes(node):
+                collect(child)
+
+        for statement in tree.body:
+            collect(statement)
         return names
 
     def test_no_undefined_names(self):
@@ -1038,9 +1059,9 @@ class _E2EFixture:
         self.stub.routes = {
             ("GET", "/health"): (200, {"status": "healthy"}),
             ("DELETE", "/documents"): (200, {"status": "cleared"}),
-            ("GET", "/documents/status_counts"): (200, {"counts": {"processing": 0, "pending": 0, "processed": 0}}),
+            ("GET", "/documents/status_counts"): (200, REAL_STATUS_COUNTS_ZERO),
             ("POST", "/documents/text"): (200, {"track_id": "tr1"}),
-            ("GET", "/documents/track_status/tr1"): (200, {"documents": [{"status": "processed"}]}),
+            ("GET", "/documents/track_status/tr1"): (200, REAL_TRACK_PROCESSED),
             ("POST", "/api/chat"): (200, {"message": {"content": "stub answer from the stack"}}),
             ("GET", "/v1/models"): (200, {"data": [{"id": "qwen3.6-35b"}]}),
             ("POST", "/v1/chat/completions"): (
@@ -1484,6 +1505,180 @@ class TestRejudge(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             ol.main(["--root", str(self.root)])
         self.assertEqual(raised.exception.code, 2)
+
+
+# ── real LightRAG response shapes (packet-32) ────────────────────────────
+
+REAL_STATUS_COUNTS_ZERO = {"status_counts": {
+    "pending": 0, "parsing": 0, "analyzing": 0, "processing": 0,
+    "preprocessed": 0, "processed": 0, "failed": 0, "all": 0,
+}}
+REAL_STATUS_COUNTS_BUSY = {"status_counts": {
+    "pending": 0, "parsing": 0, "analyzing": 0, "processing": 0,
+    "preprocessed": 0, "processed": 3, "failed": 0, "all": 3,
+}}
+REAL_TRACK_PROCESSED = {
+    "track_id": "tr1",
+    "documents": [{"id": "doc-1", "status": "processed", "file_path": "/data/x.txt",
+                   "chunks_count": 2, "error_msg": None}],
+    "total_count": 1,
+    "status_summary": {"processed": 1},
+}
+
+
+class TestStatusCountsShape(unittest.TestCase):
+    """v1.5.7 nests the counters under status_counts; the invented flat shape made
+    the driver decide the store was never empty and time the clear out."""
+
+    def test_real_shape_with_everything_zero_is_zero(self):
+        self.assertTrue(ol.status_counts_are_zero(REAL_STATUS_COUNTS_ZERO))
+
+    def test_real_shape_with_documents_is_not_zero(self):
+        self.assertFalse(ol.status_counts_are_zero(REAL_STATUS_COUNTS_BUSY))
+
+    def test_all_counter_wins_over_the_other_fields(self):
+        self.assertTrue(ol.status_counts_are_zero({"status_counts": {"all": 0, "failed": 5}}))
+        self.assertFalse(ol.status_counts_are_zero({"status_counts": {"all": 2, "failed": 0}}))
+
+    def test_older_shapes_are_still_read(self):
+        self.assertTrue(ol.status_counts_are_zero({"counts": {"pending": 0, "processed": 0}}))
+        self.assertTrue(ol.status_counts_are_zero({"pending": 0, "processing": 0, "processed": 0}))
+
+    def test_no_numbers_at_all_is_not_zero(self):
+        for payload in ({}, {"status_counts": {}}, {"error": "nope"}, None, [], "counts"):
+            self.assertFalse(ol.status_counts_are_zero(payload), msg=str(payload))
+
+    def test_booleans_are_not_counters(self):
+        self.assertFalse(ol.status_counts_are_zero({"status_counts": {"ok": True, "ready": True}}))
+
+    def test_status_counts_of_prefers_the_nested_key(self):
+        self.assertEqual(
+            ol.status_counts_of({"status_counts": {"all": 1}, "counts": {"all": 9}}), {"all": 1}
+        )
+
+    def test_emit_ignores_a_dead_pipe(self):
+        def dead_pipe(line):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def dead_io(line):
+            raise OSError(5, "I/O error")
+
+        for print_fn in (dead_pipe, dead_io, None):
+            ol.emit(print_fn, "a line that must not raise")
+
+
+class TestClearAndTrackAgainstRealShapes(_E2EFixture, unittest.TestCase):
+    def test_nonzero_counts_keep_waiting_and_time_the_clear_out(self):
+        self.stub.routes[("GET", "/documents/status_counts")] = (200, REAL_STATUS_COUNTS_BUSY)
+        timeout_backup = ol.CLEAR_TIMEOUT
+        ol.CLEAR_TIMEOUT = 0.05
+        self.addCleanup(setattr, ol, "CLEAR_TIMEOUT", timeout_backup)
+
+        config = ol.load_experiments(self._config_path())
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+                       handle_signals=False, print_fn=lambda line: None)
+        self.assertEqual(loop.run(), 0)
+
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["experiments"]["E1-reingest"]["status"], "error")
+        self.assertIn("timeout waiting for status_counts to reach 0", state["experiments"]["E1-reingest"]["error"])
+        self.assertIsNone(state["corpus_built_by"])  # nothing was inserted on top of a busy store
+        # the clear itself was still issued, and the probe sets were never asked
+        self.assertTrue(self.stub.calls("DELETE", "/documents"))
+        self.assertEqual(len(self.stub.calls("POST", "/api/chat")), 5)  # E2-probes only
+
+    def test_empty_documents_list_is_not_yet_processed(self):
+        seen = {"calls": 0}
+
+        def route(_record):
+            seen["calls"] += 1
+            if seen["calls"] < 3:
+                return 200, {"track_id": "tr1", "documents": [], "total_count": 0, "status_summary": {}}
+            return 200, REAL_TRACK_PROCESSED
+
+        self.stub.routes[("GET", "/documents/track_status/tr1")] = route
+        config = ol.load_experiments(self._config_path())
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+                       handle_signals=False, print_fn=lambda line: None)
+        self.assertEqual(loop.run(), 0)
+
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["experiments"]["E1-reingest"]["status"], "done")
+        self.assertEqual(state["corpus_built_by"], "E1-reingest")
+        self.assertGreaterEqual(seen["calls"], 3)
+
+
+class TestRetryErrors(_Case):
+    """--retry-errors (with --resume) re-runs experiments that ended in error;
+    done experiments stay skipped."""
+
+    def _config(self):
+        return self.write_experiments({
+            "baseline_env": {},
+            "experiments": [
+                {"name": "E1-bad", "env": {"CHUNK_SIZE": "1000"}, "reingest": True},
+                {"name": "E2-good", "env": {"CHUNK_SIZE": "1200"}, "reingest": False},
+            ],
+        })
+
+    def test_failed_experiment_is_rerun_and_the_good_one_is_skipped(self):
+        config = self._config()
+        self.ops.delete_status = 500
+        self.make_loop(config).run()
+        state = self.state()
+        self.assertEqual(state["experiments"]["E1-bad"]["status"], "error")
+        self.assertEqual(state["experiments"]["E2-good"]["status"], "done")
+
+        self.make_loop(config, resume=True).run()
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("E1-bad: already error in state.json; skipping (--resume)", log)
+
+        self.ops.delete_status = 200
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                       resume=True, retry_errors=True, handle_signals=False, print_fn=lambda line: None)
+        loop.run()
+
+        state = self.state()
+        self.assertEqual(state["experiments"]["E1-bad"]["status"], "done")
+        self.assertEqual(state["experiments"]["E2-good"]["status"], "done")
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("E1-bad: previous status was error; running it again (--retry-errors)", log)
+        self.assertIn("E2-good: already done in state.json; skipping (--resume)", log)
+
+    def test_without_the_flag_an_error_stays_skipped(self):
+        config = self._config()
+        self.ops.delete_status = 500
+        self.make_loop(config).run()
+        clears_before = len(self.ops.http_calls)
+        self.make_loop(config, resume=True).run()
+        self.assertEqual(len([call for call in self.ops.http_calls[clears_before:] if call[0] == "DELETE"]), 0)
+
+
+class TestBrokenPipeFinalise(_E2EFixture, unittest.TestCase):
+    """Ctrl-C in a `| tee` pipeline kills tee; the next stdout write raises
+    BrokenPipeError. That must never abort finalise."""
+
+    def test_finalise_still_restores_env_and_recreates_the_container(self):
+        def dead_pipe(line):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        config = ol.load_experiments(self._config_path())
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+                       handle_signals=False, print_fn=dead_pipe)
+        self.assertEqual(loop.run(), 0)
+
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        ups = [line for line in calls if line.startswith("compose -f") and "up -d --no-deps lightrag-server" in line]
+        self.assertEqual(len(ups), 3)  # E1, E2 and the finalise recreate
+        self.assertTrue(any(line == "ps --format {{.Names}}" for line in calls))
+
+        # the file log is unaffected: losing stdout must not lose the record
+        lines = (self.out / "loop.log").read_text(encoding="utf-8").splitlines()
+        self.assertGreater(len(lines), 10)
+        self.assertIn("env restored", "\n".join(lines))
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "complete")
 
 
 if __name__ == "__main__":

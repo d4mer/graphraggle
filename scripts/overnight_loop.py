@@ -10,7 +10,7 @@ production config back at the end.
 Usage:
     python3 scripts/overnight_loop.py --root ~/rag-project \
         --experiments experiments.json --out ~/rag-project/probe/loop \
-        --max-hours 11 [--dry-run] [--resume]
+        --max-hours 11 [--dry-run] [--resume] [--retry-errors]
 
     python3 scripts/overnight_loop.py --root ~/rag-project \
         --rejudge ~/rag-project/probe/loop
@@ -20,6 +20,13 @@ Usage:
 directories' verdicts and summaries, and writes <out>/results-rejudged.md. It
 never touches .env, docker, LightRAG, the gateway, sigma, results.md or
 state.json.
+
+Stopping a run: use ``kill -TERM <pid>``, NOT Ctrl-C, when the process is piped
+(e.g. ``... | tee loop.log``). Ctrl-C reaches tee too, the pipe dies, and any
+later stdout write raises BrokenPipeError - the driver swallows that so finalise
+still restores .env and recreates lightrag-server, but a clean SIGTERM is the
+intended way to stop. --retry-errors (with --resume) re-runs experiments whose
+recorded status is "error"; "done" experiments stay skipped.
 
 Outputs, all under --out:
     state.json     resumable run state, written atomically after every step
@@ -580,6 +587,57 @@ def results_row(
     )
 
 
+def status_counts_of(payload: Any) -> dict[str, Any]:
+    """The counts mapping inside a /documents/status_counts response.
+
+    LightRAG v1.5.7 nests it: {"status_counts": {"pending": 0, "parsing": 0,
+    "analyzing": 0, "processing": 0, "preprocessed": 0, "processed": 0,
+    "failed": 0, "all": 0}}. Older/alternate shapes put it under "counts" or at
+    the top level, so both are still read.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("status_counts", "counts"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return payload
+
+
+def status_counts_are_zero(payload: Any) -> bool:
+    """True when the store reports nothing left pending or processing.
+
+    The "all" counter wins when present. Otherwise every numeric value must be 0.
+    A response with no numbers at all is NOT zero - treating a malformed or error
+    payload as "empty store" would let a reingest start on top of documents that
+    are still there.
+    """
+    counts = status_counts_of(payload)
+    total = counts.get("all")
+    if isinstance(total, (int, float)) and not isinstance(total, bool):
+        return total == 0
+    numeric = [
+        value for value in counts.values()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    return bool(numeric) and all(value == 0 for value in numeric)
+
+
+def emit(print_fn: Callable[[str], None] | None, line: str) -> None:
+    """Print if there is a stdout to print to.
+
+    A piped run (``| tee``) dies on Ctrl-C by killing tee, after which every
+    stdout write raises BrokenPipeError. That must never abort finalise, which is
+    what puts production back the way it was.
+    """
+    if print_fn is None:
+        return
+    try:
+        print_fn(line)
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def meets_success(heldout: dict[str, Any]) -> bool:
     """SUCCESS: heldout correct% >= 90 AND hallucination% < 5 AND refusal >= 80."""
     refusal = heldout.get("refusal_accuracy_pct")
@@ -705,11 +763,16 @@ class DryRunOps(Ops):
         if url.endswith("/health"):
             return 200, {"status": "healthy"}
         if url.endswith("/status_counts"):
-            return 200, {"processing": 0, "pending": 0, "failed": 0, "preprocessed": 0, "processed": 0}
+            return 200, {"status_counts": {
+                "pending": 0, "parsing": 0, "analyzing": 0, "processing": 0,
+                "preprocessed": 0, "processed": 0, "failed": 0, "all": 0,
+            }}
         if "/documents/text" in url:
             return 200, {"track_id": "dryrun-track"}
         if "/documents/track_status/" in url:
-            return 200, {"documents": [{"status": "processed"}]}
+            return 200, {"track_id": "dryrun-track", "documents": [
+                {"id": "doc-1", "status": "processed", "file_path": "dryrun.txt", "chunks_count": 1},
+            ], "total_count": 1, "status_summary": {"processed": 1}}
         if url.endswith("/v1/models"):
             return 200, {"data": [{"id": JUDGE_MODEL}]}
         if url.endswith("/api/chat"):
@@ -740,6 +803,7 @@ class Loop:
         max_hours: float = 11.0,
         dry_run: bool = False,
         resume: bool = False,
+        retry_errors: bool = False,
         handle_signals: bool = True,
         print_fn: Callable[[str], None] | None = None,
     ) -> None:
@@ -750,6 +814,7 @@ class Loop:
         self.max_hours = float(max_hours)
         self.dry_run = dry_run
         self.resume = resume
+        self.retry_errors = retry_errors
         self.handle_signals = handle_signals
         self.print_fn = print_fn or (lambda line: print(line, flush=True))
 
@@ -778,8 +843,14 @@ class Loop:
     def log(self, message: str) -> None:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         line = f"{stamp} {message}"
-        self.ops.append_text(self.log_path, line + "\n")
-        self.print_fn(line)
+        try:
+            self.ops.append_text(self.log_path, line + "\n")
+        except OSError as exc:  # losing the log must not stop the run
+            try:
+                print(f"could not append to {self.log_path}: {exc}", flush=True)
+            except (BrokenPipeError, OSError):
+                pass
+        emit(self.print_fn, line)
 
     def heartbeat(self) -> None:
         self.ops.write_text_atomic(self.heartbeat_path, time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
@@ -1005,9 +1076,7 @@ class Loop:
             code, payload = self.ops.http_json("GET", f"{LIGHTRAG_URL}/documents/status_counts", headers=headers, timeout=30)
             if code != 200:
                 return False, payload
-            counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else payload
-            numeric = [value for value in counts.values() if isinstance(value, (int, float))]
-            return bool(numeric) and all(value == 0 for value in numeric), payload
+            return status_counts_are_zero(payload), payload
 
         self._wait_until(counts_zero, timeout=CLEAR_TIMEOUT, interval=15, what="status_counts to reach 0")
         self.log("LightRAG is empty")
@@ -1293,9 +1362,12 @@ class Loop:
         for experiment in self.config["experiments"]:
             name = experiment["name"]
             record = self.state["experiments"].get(name)
-            if self.resume and record and record.get("status") in ("done", "error"):
+            skipped_statuses = ("done",) if self.retry_errors else ("done", "error")
+            if self.resume and record and record.get("status") in skipped_statuses:
                 self.log(f"{name}: already {record['status']} in state.json; skipping (--resume)")
                 continue
+            if self.resume and self.retry_errors and record and record.get("status") == "error":
+                self.log(f"{name}: previous status was error; running it again (--retry-errors)")
             if self.ops.now() > self.deadline:
                 self.state["stop_reason"] = "time_budget"
                 self.log(f"max-hours {self.max_hours} reached; not starting {name}")
@@ -1416,7 +1488,7 @@ class Loop:
         else:
             lines.append("- no experiment produced a score; nothing to recommend")
         self.ops.append_text(self.results_path, "\n".join(lines) + "\n")
-        self.print_fn("\n".join(lines))
+        emit(self.print_fn, "\n".join(lines))
 
 
 # ── offline re-judge mode ────────────────────────────────────────────
@@ -1586,17 +1658,16 @@ def rejudge(out_dir: Path, root: Path, *, ops: Ops | None = None, print_fn: Call
 
     dev_map, heldout_map = load_probe_maps(root, ops)
     if not dev_map or not heldout_map:
-        print_fn(
-            f"refusing to re-judge: need both {DEV_PROBE_FILE} and {HELDOUT_PROBE_FILE} "
-            f"with ids under {root}"
-        )
+        emit(print_fn,
+             f"refusing to re-judge: need both {DEV_PROBE_FILE} and {HELDOUT_PROBE_FILE} "
+             f"with ids under {root}")
         return 3
 
     directories = sorted(
         path for path in out_dir.iterdir() if path.is_dir() and (path / "answers.jsonl").exists()
     ) if out_dir.exists() else []
     if not directories:
-        print_fn(f"nothing to do: no <name>/answers.jsonl under {out_dir}")
+        emit(print_fn, f"nothing to do: no <name>/answers.jsonl under {out_dir}")
         return 0
 
     rows: list[str] = []
@@ -1612,11 +1683,10 @@ def rejudge(out_dir: Path, root: Path, *, ops: Ops | None = None, print_fn: Call
             )
         )
         # counts only: never questions, answers or judge reasons
-        print_fn(
-            f"{name}: judged {counts['judged']} kept {counts['kept']} "
-            f"no_answer {counts['no_answer']} errors {counts['errors']} "
-            f"unmatched {counts['unmatched']} skipped_lines {counts['skipped_lines']}"
-        )
+        emit(print_fn,
+             f"{name}: judged {counts['judged']} kept {counts['kept']} "
+             f"no_answer {counts['no_answer']} errors {counts['errors']} "
+             f"unmatched {counts['unmatched']} skipped_lines {counts['skipped_lines']}")
         if counts["unmatched"]:
             notes.append(
                 f"- {name}: {counts['unmatched']} answer(s) had no matching probe id, "
@@ -1632,7 +1702,7 @@ def rejudge(out_dir: Path, root: Path, *, ops: Ops | None = None, print_fn: Call
     if notes:
         table += "\nNotes\n\n" + "\n".join(notes) + "\n"
     ops.write_text_atomic(out_dir / "results-rejudged.md", table)
-    print_fn(f"wrote {out_dir / 'results-rejudged.md'} ({len(rows)} experiment(s))")
+    emit(print_fn, f"wrote {out_dir / 'results-rejudged.md'} ({len(rows)} experiment(s))")
     return 0
 
 
@@ -1656,6 +1726,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-hours", type=float, default=11.0, help="stop starting experiments after this many hours")
     parser.add_argument("--dry-run", action="store_true", help="run the plan against a fake Ops; touches nothing real")
     parser.add_argument("--resume", action="store_true", help="skip experiments already done/error in state.json")
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="with --resume: run experiments whose recorded status is \"error\" again from step 1 "
+             "(\"done\" experiments stay skipped)",
+    )
     parser.add_argument(
         "--rejudge",
         metavar="OUT_DIR",
@@ -1685,6 +1761,7 @@ def main(argv: list[str] | None = None) -> int:
         max_hours=arguments.max_hours,
         dry_run=arguments.dry_run,
         resume=arguments.resume,
+        retry_errors=arguments.retry_errors,
     )
     for line in build_plan_lines(config):
         loop.log(line)
@@ -1694,4 +1771,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    # A closed downstream pipe (| head, a killed tee) otherwise makes CPython exit
+    # 120 while flushing stdout at shutdown, which looks like a failed run.
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+    sys.exit(exit_code)
