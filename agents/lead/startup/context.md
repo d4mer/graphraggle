@@ -1,6 +1,6 @@
 # Handoff — lead
 
-Last updated: 2026-10-11 (after rc-1 worker update, LightRAG input-dir fix, packet-26)
+Last updated: 2026-10-12 (after rc-1 worker update, LightRAG input-dir fix, packet-26)
 
 ## Goal
 Get GraphRAG released to production for first use (plan: docs/ops/release-plan-first-use.md). Operator: "get back to dev and release to prod asap".
@@ -27,8 +27,7 @@ the operator — if the pane shows a Dangerous Command dialog for a brief-approv
 Nothing queued. No open worker or Hermes jobs.
 
 ## Decisions pending (operator)
-1. Retry the failed document rows in the state DB (4 old `accepted`->failed from the worker update, plus older ones; LightRAG-side failed entries
-   must be cleared first). Terminal failures are not auto-retried. Separate small job.
+1. RESOLVED 2026-10-12: failed rows triaged (Hermes rc1-failed-triage.md): 4 already searchable, 4 test artifacts (scenario06 placeholder, 2x v157-regression probes), 1 missing probe file, 2 canaries. Operator decision: retry nothing, delete nothing, leave all as is (incl. 5 failed LightRAG stub entries).
 2. Gate 4 go/no-go. Evidence: Gate 2 quality baseline (cross-doc 0.56; unanswerable hallucination p35 0/3), latency median ~178 s,
    reboot drill + backup/restore drill done, Office/PDF ingest now works.
 3. Rotate the prod OpenWebUI API key (OPENAI_API_KEYS) — it was printed in a diff once (never committed).
@@ -45,6 +44,6 @@ Nothing queued. No open worker or Hermes jobs.
   (it misread an input dir once and reported a stale mount as fine).
 
 ## Next three actions
-1. Ask the operator for the Gate 4 go/no-go and the decision on retrying the failed rows.
+1. Ask the operator for the Gate 4 go/no-go.
 2. If go: run the real-document check, then tag the release and update docs/08-change-log.md.
 3. Decide whether to merge packet-22-ll-seed (BRIDGE_REWRITE_SEED_LL) or leave it parked.
