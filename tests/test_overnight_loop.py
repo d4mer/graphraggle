@@ -760,10 +760,13 @@ class _StubHandler(BaseHTTPRequestHandler):
             "body": raw,
         }
         stub.records.append(record)
-        status, payload = stub.routes.get((method, self.path)) or stub.routes.get((method, "*")) or (
-            404,
-            {"error": f"no stub route for {method} {self.path}"},
-        )
+        route = stub.routes.get((method, self.path)) or stub.routes.get((method, "*"))
+        if route is None:
+            status, payload = 404, {"error": f"no stub route for {method} {self.path}"}
+        elif callable(route):
+            status, payload = route(record)
+        else:
+            status, payload = route
         if isinstance(payload, _RawBody):
             body = payload.text.encode("utf-8")
             content_type = "text/plain"
@@ -983,10 +986,9 @@ class _FastOps(ol.Ops):
         time.sleep(0)
 
 
-class TestEndToEndRealOps(unittest.TestCase):
-    """No fake Ops here: real subprocess calls to a fake docker on PATH, real
-    HTTP to a stub server, real files. The fake docker prints the current .env,
-    so container-env verification is exercised for real too."""
+class _E2EFixture:
+    """Fixture: real Ops, fake docker on PATH, stub services. Mixed into the
+    end-to-end test classes; it defines no tests itself."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1081,6 +1083,13 @@ class TestEndToEndRealOps(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+class TestEndToEndRealOps(_E2EFixture, unittest.TestCase):
+    """Real subprocess calls to a fake docker on PATH, real HTTP to the stub
+    server, real files: the whole driver end to end, no fake Ops anywhere.
+
+    The fake docker prints the current .env, so container-env verification is
+    exercised for real too."""
 
     def test_full_run_with_real_ops(self):
         config = ol.load_experiments(self._config_path())
@@ -1180,6 +1189,301 @@ class TestEndToEndRealOps(unittest.TestCase):
         self.assertIn("E1-reingest: already done in state.json; skipping (--resume)", log)
         self.assertIn("E2-probes: already done in state.json; skipping (--resume)", log)
         self.assertLess(len(self.docker_log.read_text(encoding="utf-8").splitlines()), docker_calls_before + 3)
+
+
+# ── judge token budget for a reasoning model (packet-31) ────────────────
+
+class TestJudgeTokenBudget(unittest.TestCase):
+    """qwen3.6-35b answers with message.reasoning_content plus message.content;
+    a 400-token budget bought only thinking, content came back empty, and every
+    verdict was judge_error. Real Ops over the stub judge endpoint."""
+
+    def setUp(self):
+        self.stub = _StubServer()
+        self.stub.start()
+        self.addCleanup(self.stub.stop)
+        self.url_backup = ol.JUDGE_URL
+        ol.JUDGE_URL = f"{self.stub.base}/v1/chat/completions"
+        self.addCleanup(setattr, ol, "JUDGE_URL", self.url_backup)
+        self.ops = ol.Ops()
+        self.item = {
+            "id": "d1", "question": "Who is in Paris?", "expected_answer": "Marie",
+            "evidence": "Marie is in Paris", "type": "single-fact",
+        }
+
+    def reply(self, content, reasoning="", finish="stop"):
+        return {"choices": [{"message": {"content": content, "reasoning_content": reasoning},
+                             "finish_reason": finish}]}
+
+    def test_budget_and_timeout_constants_are_large_enough(self):
+        self.assertGreaterEqual(ol.JUDGE_MAX_TOKENS, 1000)
+        self.assertEqual(ol.JUDGE_TIMEOUT, 300)
+
+    def test_larger_budget_makes_the_old_empty_content_case_work(self):
+        def route(record):
+            sent = json.loads(record["body"])
+            if sent["max_tokens"] < 1000:
+                return 200, self.reply("", reasoning="thinking hard", finish="length")
+            return 200, self.reply('{"verdict": "correct", "reason": "matches the evidence"}')
+
+        self.stub.routes[("POST", "/v1/chat/completions")] = route
+        verdict = ol.judge_answer(self.ops, self.item, "Marie is in Paris.", "key")
+        self.assertEqual(verdict["verdict"], "correct")
+        sent = json.loads(self.stub.calls("POST", "/v1/chat/completions")[-1]["body"])
+        self.assertEqual(sent["max_tokens"], ol.JUDGE_MAX_TOKENS)
+        self.assertGreaterEqual(sent["max_tokens"], 1000)
+
+    def test_verdict_is_taken_from_the_last_object_in_reasoning_content(self):
+        reasoning = (
+            'Start with {"verdict": "wrong", "reason": "stale"} then reconsider; '
+            'on balance {"verdict": "partial", "reason": "missing the date"}'
+        )
+        self.stub.routes[("POST", "/v1/chat/completions")] = (200, self.reply("", reasoning=reasoning))
+        verdict = ol.judge_answer(self.ops, self.item, "Marie.", "key")
+        self.assertEqual(verdict["verdict"], "partial")
+        self.assertEqual(verdict["reason"], "missing the date")
+
+    def test_truncated_reply_raises_judge_truncated(self):
+        self.stub.routes[("POST", "/v1/chat/completions")] = (
+            200, self.reply("", reasoning="a very long chain of thought", finish="length")
+        )
+        with self.assertRaises(ol.JudgeTruncated):
+            ol.judge_answer(self.ops, self.item, "Marie.", "key")
+
+    def test_reply_with_no_verdict_anywhere_stays_unparsable(self):
+        self.stub.routes[("POST", "/v1/chat/completions")] = (
+            200, self.reply("", reasoning="prose with no json at all")
+        )
+        with self.assertRaises(RuntimeError):
+            ol.judge_answer(self.ops, self.item, "Marie.", "key")
+
+
+class TestJudgeTruncationEndToEnd(_E2EFixture, unittest.TestCase):
+    """Truncation must be reported once per experiment, not once per question, and
+    must not be retried (each call is worth 300 s)."""
+
+    def setUp(self):
+        super().setUp()
+        self.stub.routes[("POST", "/v1/chat/completions")] = (
+            200,
+            {"choices": [{"message": {"content": "", "reasoning_content": "thinking " * 300},
+                          "finish_reason": "length"}]},
+        )
+
+    def test_truncation_logged_once_per_experiment_and_scored_judge_error(self):
+        config = ol.load_experiments(self._config_path())
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+                       handle_signals=False, print_fn=lambda line: None)
+        self.assertEqual(loop.run(), 0)
+
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("judge truncated (raise JUDGE_MAX_TOKENS)"), 2)
+
+        # 5 questions x 2 experiments, one call each: no retry on truncation
+        self.assertEqual(len(self.stub.calls("POST", "/v1/chat/completions")), 10)
+
+        for name in ("E1-reingest", "E2-probes"):
+            verdicts = [
+                json.loads(line)["verdict"]
+                for line in (self.out / name / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(verdicts, [ol.JUDGE_ERROR] * 5)
+            summary = json.loads((self.out / name / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["dev"]["judge_errors"], 3)
+            self.assertEqual(summary["heldout"]["judge_errors"], 2)
+            self.assertEqual(summary["dev"]["correct_pct"], 0.0)
+            self.assertEqual(summary["heldout"]["refusal_accuracy_pct"], None)
+
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
+
+
+# ── offline --rejudge mode (packet-31) ───────────────────────────────
+
+class TestRejudge(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.root = base / "rag"
+        self.out = self.root / "probe" / "loop"
+        (self.root / "probe").mkdir(parents=True)
+        self.out.mkdir(parents=True)
+
+        dev = [
+            {"id": "dev1", "question": "Question one?", "expected_answer": "Alpha", "evidence": "evidence alpha", "type": "single-fact"},
+            {"id": "dev2", "question": "Question two?", "expected_answer": "Beta", "evidence": "evidence beta", "type": "multi-fact"},
+            {"id": "dev3", "question": "Question three?", "expected_answer": "Gamma", "evidence": "evidence gamma", "type": "single-fact"},
+        ]
+        heldout = [
+            {"id": "held1", "question": "Question four?", "expected_answer": "Delta", "evidence": "evidence delta", "type": "single-fact"},
+            {"id": "held2", "question": "Question five?", "expected_answer": "not in the documents", "evidence": "", "type": "unanswerable"},
+        ]
+        (self.root / "probe" / "solvay-dev-v1.jsonl").write_text(_jsonl(dev), encoding="utf-8")
+        (self.root / "probe" / "solvay-heldout-v1.jsonl").write_text(_jsonl(heldout), encoding="utf-8")
+
+        # files that --rejudge must never touch
+        (self.root / ".env").write_text("MAX_ASYNC=1\nLIGHTRAG_API_KEY=secret-do-not-log\n", encoding="utf-8")
+        (self.out / "results.md").write_text("SENTINEL results table\n", encoding="utf-8")
+        (self.out / "state.json").write_text('{"status": "running"}\n', encoding="utf-8")
+        self.untouched = {
+            path: path.read_bytes()
+            for path in (self.root / ".env", self.out / "results.md", self.out / "state.json")
+        }
+
+        e1 = self.out / "E1"
+        e2 = self.out / "E2"
+        e1.mkdir()
+        e2.mkdir()
+        (e1 / "answers.jsonl").write_text(
+            "".join([
+                json.dumps({"set": "dev", "id": "dev1", "type": "single-fact", "question": "Question one?",
+                            "answer": "saved answer one", "latency": 1.5, "error": None}) + "\n",
+                json.dumps({"set": "dev", "id": "dev2", "type": "multi-fact", "question": "Question two?",
+                            "answer": "saved answer two", "latency": 2.0, "error": None}) + "\n",
+                json.dumps({"set": "dev", "id": "dev3", "type": "single-fact", "question": "Question three?",
+                            "answer": "", "latency": 0.2, "error": "/api/chat returned HTTP 502"}) + "\n",
+                '{"set": "dev", "id": "dev4", "answer": "a line cut off mid-wri',  # half-written
+            ]),
+            encoding="utf-8",
+        )
+        (e1 / "verdicts.jsonl").write_text(
+            "".join([
+                json.dumps({"set": "dev", "id": "dev1", "type": "single-fact", "verdict": "judge_error"}) + "\n",
+                json.dumps({"set": "dev", "id": "dev2", "type": "multi-fact", "verdict": "correct"}) + "\n",
+            ]),
+            encoding="utf-8",
+        )
+        # no explicit "set" field: the id has to identify the set
+        (e2 / "answers.jsonl").write_text(
+            "".join([
+                json.dumps({"id": "held1", "answer": "saved answer four", "latency": 3.0, "error": None}) + "\n",
+                json.dumps({"id": "held2", "answer": "saved answer five", "latency": 4.0, "error": None}) + "\n",
+                json.dumps({"id": "zz9", "answer": "answer with no probe item", "latency": 5.0, "error": None}) + "\n",
+            ]),
+            encoding="utf-8",
+        )
+        (e1 / "summary.json").write_text(json.dumps({"reingest": True, "env": {"CHUNK_SIZE": "1200"}}), encoding="utf-8")
+
+        self.stub = _StubServer()
+        self.stub.routes[("POST", "/v1/chat/completions")] = (
+            200,
+            {"choices": [{"message": {"content": '{"verdict": "wrong", "reason": "invented detail"}'},
+                          "finish_reason": "stop"}]},
+        )
+        self.stub.start()
+        self.addCleanup(self.stub.stop)
+        self.url_backup = ol.JUDGE_URL
+        ol.JUDGE_URL = f"{self.stub.base}/v1/chat/completions"
+        self.addCleanup(setattr, ol, "JUDGE_URL", self.url_backup)
+        self.ops = ol.Ops()
+
+    def _read_verdicts(self, name):
+        text = (self.out / name / "verdicts.jsonl").read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines()]
+
+    def test_rejudge_scores_keeps_good_verdicts_and_survives_a_torn_line(self):
+        printed: list[str] = []
+        code = ol.rejudge(self.out, self.root, ops=self.ops, print_fn=printed.append)
+        self.assertEqual(code, 0)
+
+        e1 = self._read_verdicts("E1")
+        self.assertEqual([row["verdict"] for row in e1], ["wrong", "correct", ol.NO_ANSWER])
+        self.assertEqual([row["id"] for row in e1], ["dev1", "dev2", "dev3"])
+        e2 = self._read_verdicts("E2")
+        self.assertEqual([row["verdict"] for row in e2], ["wrong", "wrong", ol.JUDGE_ERROR])
+        # the unmatched id keeps an empty set label so the gap stays visible
+        self.assertEqual([row["set"] for row in e2], ["heldout", "heldout", ""])
+
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["dev"]["correct_pct"], 50.0)   # dev1 wrong, dev2 correct
+        self.assertEqual(summary["dev"]["judged"], 2)
+        self.assertEqual(summary["dev"]["no_answers"], 1)
+        self.assertEqual(summary["dev"]["judge_errors"], 0)
+        self.assertEqual(summary["reingest"], True)             # unrelated keys preserved
+        self.assertEqual(summary["env"], {"CHUNK_SIZE": "1200"})
+        summary2 = json.loads((self.out / "E2" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary2["heldout"]["n"], 2)          # the unmatched id is not scored
+        self.assertEqual(summary2["heldout"]["judge_errors"], 0)
+        self.assertEqual(summary2["unmatched"], 1)
+        self.assertEqual(summary2["rejudged_counts"]["judged"], 2)
+
+        # one judge call per re-graded answer: kept and no_answer cost nothing
+        self.assertEqual(len(self.stub.calls("POST", "/v1/chat/completions")), 3)
+        self.assertEqual({record["path"] for record in self.stub.records}, {"/v1/chat/completions"})
+
+        table = (self.out / "results-rejudged.md").read_text(encoding="utf-8")
+        self.assertIn(ol.RESULTS_TABLE_HEADER, table)
+        rows = [line for line in table.splitlines() if line.startswith("| E")]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("rejudged" in line for line in rows))
+        self.assertIn("1 answer(s) had no matching probe id", table)
+        self.assertIn("1 unparsable line(s) in answers.jsonl", table)
+
+        # counts only on stdout: no questions, answers or judge reasons
+        joined = "\n".join(printed)
+        for forbidden in ("Question one?", "saved answer", "invented detail", "secret-do-not-log"):
+            self.assertNotIn(forbidden, joined)
+        self.assertIn("judged 1 kept 1 no_answer 1 errors 0 unmatched 0 skipped_lines 1", joined)
+        self.assertIn("judged 2 kept 0 no_answer 0 errors 0 unmatched 1 skipped_lines 0", joined)
+
+        for path, before in self.untouched.items():
+            self.assertEqual(path.read_bytes(), before, f"{path.name} was modified")
+
+    def test_rejudge_is_idempotent_and_cheap_the_second_time(self):
+        self.assertEqual(ol.rejudge(self.out, self.root, ops=self.ops, print_fn=lambda line: None), 0)
+        calls_after_first = len(self.stub.records)
+        printed: list[str] = []
+        self.assertEqual(ol.rejudge(self.out, self.root, ops=self.ops, print_fn=printed.append), 0)
+        self.assertEqual(len(self.stub.records), calls_after_first, "re-judging made new judge calls")
+        joined = "\n".join(printed)
+        self.assertIn("judged 0 kept 2 no_answer 1", joined)  # E1: wrong + correct kept
+        self.assertIn("judged 0 kept 2 no_answer 0", joined)  # E2: both wrong kept
+        self.assertEqual([row["verdict"] for row in self._read_verdicts("E1")],
+                         ["wrong", "correct", ol.NO_ANSWER])
+
+    def test_rejudge_refuses_without_the_probe_files(self):
+        empty_root = Path(self.tmp.name) / "no-probes"
+        empty_root.mkdir()
+        printed: list[str] = []
+        self.assertEqual(ol.rejudge(self.out, empty_root, ops=self.ops, print_fn=printed.append), 3)
+        self.assertIn("refusing to re-judge", "\n".join(printed))
+        self.assertFalse((self.out / "results-rejudged.md").exists())
+
+    def test_rejudge_on_an_empty_out_dir_is_not_an_error(self):
+        empty_out = Path(self.tmp.name) / "empty-out"
+        empty_out.mkdir()
+        printed: list[str] = []
+        self.assertEqual(ol.rejudge(empty_out, self.root, ops=self.ops, print_fn=printed.append), 0)
+        self.assertIn("nothing to do", "\n".join(printed))
+
+    def test_unreachable_judge_is_recorded_as_error_and_never_crashes(self):
+        """The whole point of --rejudge is retrying saved judge_error rows, so a
+        dead judge must degrade to counts, not a traceback."""
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        ol.JUDGE_URL = f"http://127.0.0.1:{port}/v1/chat/completions"
+        printed: list[str] = []
+        self.assertEqual(ol.rejudge(self.out, self.root, ops=self.ops, print_fn=printed.append), 0)
+        self.assertEqual(
+            [row["verdict"] for row in self._read_verdicts("E1")],
+            [ol.JUDGE_ERROR, "correct", ol.NO_ANSWER],
+        )
+        self.assertIn("judged 0 kept 1 no_answer 1 errors 1 unmatched 0", "\n".join(printed))
+        self.assertTrue((self.out / "results-rejudged.md").exists())
+
+    def test_cli_wires_rejudge_without_experiments_or_out(self):
+        with redirect_stdout(io.StringIO()) as captured:
+            code = ol.main(["--root", str(self.root), "--rejudge", str(self.out)])
+        self.assertEqual(code, 0)
+        self.assertTrue((self.out / "results-rejudged.md").exists())
+        self.assertNotIn("Question one?", captured.getvalue())
+
+    def test_cli_still_demands_experiments_and_out_for_a_normal_run(self):
+        with self.assertRaises(SystemExit) as raised:
+            ol.main(["--root", str(self.root)])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

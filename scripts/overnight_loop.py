@@ -12,6 +12,15 @@ Usage:
         --experiments experiments.json --out ~/rag-project/probe/loop \
         --max-hours 11 [--dry-run] [--resume]
 
+    python3 scripts/overnight_loop.py --root ~/rag-project \
+        --rejudge ~/rag-project/probe/loop
+
+--rejudge is the offline mode: it re-grades answers already saved in
+<out>/<name>/answers.jsonl using nothing but the judge endpoint, rewrites those
+directories' verdicts and summaries, and writes <out>/results-rejudged.md. It
+never touches .env, docker, LightRAG, the gateway, sigma, results.md or
+state.json.
+
 Outputs, all under --out:
     state.json     resumable run state, written atomically after every step
     heartbeat      ISO timestamp, rewritten at least every 60 s while waiting
@@ -87,6 +96,11 @@ NEVER_CHANGE_SUFFIX = re.compile(r"(_API_KEY|_API_KEYS|_KEY|_SECRET|_PASSWORD)$"
 JUDGE_URL = "http://192.168.1.190:1234/v1/chat/completions"
 JUDGE_MODEL = "qwen3.6-35b"
 JUDGE_KEY_DEFAULT = "1234"
+# qwen3.6-35b on the Thinkpad is a reasoning model: it spends hundreds of tokens
+# on message.reasoning_content before answering, so a small budget returns an
+# empty message.content every time. 4000 leaves room for the verdict.
+JUDGE_MAX_TOKENS = 4000
+JUDGE_TIMEOUT = 300
 
 # Service liveness probe ("sigma" on the Thinkpad).
 SIGMA_URL = "http://192.168.1.195:1234/v1/models"
@@ -115,6 +129,11 @@ SUCCESS_REFUSAL_ACCURACY_PCT = 80.0
 
 VERDICT_VALUES = ("correct", "partial", "wrong", "hallucinated", "refused_ok", "refused_wrong")
 JUDGE_ERROR = "judge_error"
+# Verdicts that mean "this question produced no grade" and are kept out of every
+# percentage: judge_error (the judge failed) and no_answer (the stack never
+# answered, so there was nothing to grade).
+NO_ANSWER = "no_answer"
+EXCLUDED_VERDICTS = (JUDGE_ERROR, NO_ANSWER)
 
 JUDGE_PROMPT = """You are grading one answer from a document question-answering system.
 
@@ -322,11 +341,53 @@ def first_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def parse_verdict(text: str | None) -> dict[str, str] | None:
+def last_json_object(text: str) -> dict[str, Any] | None:
+    """Return the LAST balanced JSON object found anywhere in ``text``."""
+    found: dict[str, Any] | None = None
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start:index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict):
+                        found = parsed
+                    break
+        start = text.find("{", start + 1)
+    return found
+
+
+class JudgeTruncated(Exception):
+    """The judge ran out of tokens before it could answer."""
+
+
+def parse_verdict(text: str | None, *, prefer_last: bool = False) -> dict[str, str] | None:
     """Extract ``{"verdict": ..., "reason": ...}`` from a judge reply.
 
     Handles clean JSON, markdown-fenced JSON and prose wrapped around the
-    object. Returns None when nothing usable is present.
+    object. ``prefer_last`` takes the final object instead of the first, which is
+    what a reasoning model's chain of thought needs (the verdict comes last).
+    Returns None when nothing usable is present.
     """
     if not text:
         return None
@@ -334,13 +395,72 @@ def parse_verdict(text: str | None) -> dict[str, str] | None:
     fenced = _FENCE.search(candidate)
     if fenced:
         candidate = fenced.group(1).strip()
-    obj = first_json_object(candidate)
+    obj = last_json_object(candidate) if prefer_last else first_json_object(candidate)
     if obj is None:
         return None
     verdict = str(obj.get("verdict", "")).strip().lower()
     if verdict not in VERDICT_VALUES:
         return None
     return {"verdict": verdict, "reason": str(obj.get("reason", "")).strip()}
+
+
+def judge_prompt_for(item: dict[str, Any], answer: str) -> str:
+    return JUDGE_PROMPT.format(
+        question=item.get("question") or "",
+        expected_answer=item.get("expected_answer") or "",
+        evidence=item.get("evidence") or "",
+        answer=answer,
+    )
+
+
+def judge_reply(ops: Ops, prompt: str, judge_key: str) -> tuple[str, str, str]:
+    """One judge call. Returns (message.content, message.reasoning_content,
+    choices[0].finish_reason). Transport and HTTP problems raise."""
+    payload = {
+        "model": JUDGE_MODEL,
+        "temperature": 0,
+        "max_tokens": JUDGE_MAX_TOKENS,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    status, body = ops.http_json(
+        "POST", JUDGE_URL,
+        headers={"Authorization": f"Bearer {judge_key}"},
+        payload=payload,
+        timeout=JUDGE_TIMEOUT,
+    )
+    if status >= 400:
+        raise RuntimeError(f"judge returned HTTP {status}")
+    choices = body.get("choices") or [{}]
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+    return (
+        str(message.get("content") or ""),
+        str(message.get("reasoning_content") or ""),
+        str(choice.get("finish_reason") or ""),
+    )
+
+
+def judge_answer(ops: Ops, item: dict[str, Any], answer: str, judge_key: str) -> dict[str, str]:
+    """Grade one answer against the item's evidence.
+
+    The verdict normally sits in message.content. If it is missing and the call
+    was not cut short, look for the last JSON object in reasoning_content, which
+    is where a reasoning model puts it. Raises JudgeTruncated when the token
+    budget was the problem, RuntimeError when the reply is simply unusable.
+    """
+    content, reasoning, finish_reason = judge_reply(ops, judge_prompt_for(item, answer), judge_key)
+    verdict = parse_verdict(content)
+    if verdict is not None:
+        return verdict
+    if finish_reason == "length":
+        raise JudgeTruncated(
+            f"finish_reason=length with no usable content at max_tokens={JUDGE_MAX_TOKENS}"
+        )
+    verdict = parse_verdict(reasoning, prefer_last=True)
+    if verdict is not None:
+        return verdict
+    raise RuntimeError("judge reply unparsable")
 
 
 # ── Scoring ─────────────────────────────────────────────────────────────────
@@ -367,9 +487,17 @@ def percentile(values: list[float], fraction: float) -> float:
 
 
 def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[float]) -> dict[str, Any]:
-    """Percentage maths for one probe set. judge_error is excluded from rates."""
-    pairs = [(item, verdict) for item, verdict in zip(items, verdicts) if verdict != JUDGE_ERROR]
+    """Percentage maths for one probe set. judge_error, no_answer and any
+    unrecognised verdict are excluded from the rates and reported separately."""
     judge_errors = sum(1 for verdict in verdicts if verdict == JUDGE_ERROR)
+    no_answers = sum(1 for verdict in verdicts if verdict == NO_ANSWER)
+    unknown_verdicts = sum(
+        1 for verdict in verdicts
+        if verdict not in EXCLUDED_VERDICTS and verdict not in VERDICT_VALUES
+    )
+    pairs = [
+        (item, verdict) for item, verdict in zip(items, verdicts) if verdict in VERDICT_VALUES
+    ]
     total = len(pairs)
 
     counts: dict[str, int] = {value: 0 for value in VERDICT_VALUES}
@@ -402,6 +530,8 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
         "n": len(verdicts),
         "judged": total,
         "judge_errors": judge_errors,
+        "no_answers": no_answers,
+        "unknown_verdicts": unknown_verdicts,
         "counts": counts,
         "correct_pct": pct(counts["correct"]),
         "partial_credit_pct": round(100.0 * (counts["correct"] + 0.5 * counts["partial"]) / total, 2) if total else 0.0,
@@ -414,6 +544,40 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
         "latency_p50": round(percentile(latencies, 0.50), 2),
         "latency_p95": round(percentile(latencies, 0.95), 2),
     }
+
+
+RESULTS_TABLE_HEADER = (
+    "| experiment | status | dev correct% | dev correct+0.5*partial% | heldout correct% "
+    "| heldout correct+0.5*partial% | heldout halluc% | refusal acc% | p50 s | p95 s | judge errors |\n"
+    "|---|---|---|---|---|---|---|---|---|---|---|\n"
+)
+
+
+def results_row(
+    name: str,
+    status: str,
+    dev: dict[str, Any],
+    heldout: dict[str, Any],
+    p50: float,
+    p95: float,
+) -> str:
+    """One markdown row. Shared by results.md and results-rejudged.md so the two
+    tables stay comparable."""
+    judge_errors = int(dev.get("judge_errors", 0)) + int(heldout.get("judge_errors", 0))
+    refusal = heldout.get("refusal_accuracy_pct")
+    return "| {name} | {status} | {dc} | {dp} | {hc} | {hp} | {hh} | {ra} | {p50} | {p95} | {je} |\n".format(
+        name=name,
+        status=status,
+        dc=dev.get("correct_pct", 0.0),
+        dp=dev.get("partial_credit_pct", 0.0),
+        hc=heldout.get("correct_pct", 0.0),
+        hp=heldout.get("partial_credit_pct", 0.0),
+        hh=heldout.get("hallucination_pct", 0.0),
+        ra=refusal if refusal is not None else "n/a",
+        p50=p50,
+        p95=p95,
+        je=judge_errors,
+    )
 
 
 def meets_success(heldout: dict[str, Any]) -> bool:
@@ -606,6 +770,7 @@ class Loop:
         self.hard_deadline = 0.0
         self.abort_requested = False
         self.judge_key = os.environ.get("OVERNIGHT_JUDGE_API_KEY", JUDGE_KEY_DEFAULT)
+        self.judge_truncated = 0
         self.plan: list[str] = []
 
     # ── logging, heartbeat, state ──────────────────────────────────────────
@@ -693,6 +858,8 @@ class Loop:
                 return action()
             except FatalRun:
                 raise
+            except JudgeTruncated:
+                raise  # deterministic: retrying just burns another 300 s
             except Exception as exc:
                 last_error = exc
                 self.log(f"{what}: attempt {attempt} failed: {exc}")
@@ -979,33 +1146,7 @@ class Loop:
     # ── step 5: judge ──────────────────────────────────────────────────────
 
     def _judge_one(self, item: dict[str, Any], answer: str) -> dict[str, str]:
-        prompt = JUDGE_PROMPT.format(
-            question=item.get("question") or "",
-            expected_answer=item.get("expected_answer") or "",
-            evidence=item.get("evidence") or "",
-            answer=answer,
-        )
-        payload = {
-            "model": JUDGE_MODEL,
-            "temperature": 0,
-            "max_tokens": 400,
-            "stream": False,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        status, body = self.ops.http_json(
-            "POST", JUDGE_URL,
-            headers={"Authorization": f"Bearer {self.judge_key}"},
-            payload=payload,
-            timeout=180,
-        )
-        if status >= 400:
-            raise RuntimeError(f"judge returned HTTP {status}")
-        choices = body.get("choices") or [{}]
-        content = ((choices[0] or {}).get("message") or {}).get("content")
-        verdict = parse_verdict(content)
-        if verdict is None:
-            raise RuntimeError("judge reply unparsable")
-        return verdict
+        return judge_answer(self.ops, item, answer, self.judge_key)
 
     def _judge_set(self, items: list[dict[str, Any]], results: list[dict[str, Any]]) -> list[str]:
         verdicts: list[str] = []
@@ -1020,17 +1161,16 @@ class Loop:
                     attempts=2,
                 )
                 verdicts.append(verdict["verdict"])
+            except JudgeTruncated:
+                self.judge_truncated += 1
+                verdicts.append(JUDGE_ERROR)
             except StepError:
                 verdicts.append(JUDGE_ERROR)
         return verdicts
 
     # ── step 6: record ─────────────────────────────────────────────────────
 
-    RESULTS_HEADER = (
-        "| experiment | status | dev correct% | dev correct+0.5*partial% | heldout correct% "
-        "| heldout correct+0.5*partial% | heldout halluc% | refusal acc% | p50 s | p95 s | judge errors |\n"
-        "|---|---|---|---|---|---|---|---|---|---|---|\n"
-    )
+    RESULTS_HEADER = RESULTS_TABLE_HEADER
 
     def _ensure_results_header(self) -> None:
         if not Path(self.results_path).exists():
@@ -1077,6 +1217,7 @@ class Loop:
         dev_items = self._load_probe_items(DEV_PROBE_FILE)
         heldout_items = self._load_probe_items(HELDOUT_PROBE_FILE)
         dev_rows = self._run_set(dev_items, experiment["probe_concurrency"])
+        self.judge_truncated = 0
         dev_verdicts = self._judge_set(dev_items, dev_rows)
         self._record(experiment, "dev", dev_items, dev_rows, dev_verdicts)
         heldout_rows = self._run_set(heldout_items, experiment["probe_concurrency"])
@@ -1094,6 +1235,10 @@ class Loop:
             "env": set_values,
         }
         self.ops.write_json_atomic(self.out / name / "summary.json", summary)
+        if self.judge_truncated:
+            self.log(
+                f"judge truncated (raise JUDGE_MAX_TOKENS): {self.judge_truncated} call(s) in {name}"
+            )
 
         stored = self.state.setdefault("results", {}).setdefault(name, {})
         stored.update({
@@ -1112,18 +1257,7 @@ class Loop:
         heldout, dev = summary["heldout"], summary["dev"]
         self.ops.append_text(
             self.results_path,
-            "| {name} | done | {dc} | {dp} | {hc} | {hp} | {hh} | {ra} | {p50} | {p95} | {je} |\n".format(
-                name=name,
-                dc=dev["correct_pct"],
-                dp=dev["partial_credit_pct"],
-                hc=heldout["correct_pct"],
-                hp=heldout["partial_credit_pct"],
-                hh=heldout["hallucination_pct"],
-                ra=heldout["refusal_accuracy_pct"] if heldout["refusal_accuracy_pct"] is not None else "n/a",
-                p50=summary["all_latencies_p50"],
-                p95=summary["all_latencies_p95"],
-                je=heldout["judge_errors"] + dev["judge_errors"],
-            ),
+            results_row(name, "done", dev, heldout, summary["all_latencies_p50"], summary["all_latencies_p95"]),
         )
         self.log(
             f"{name}: dev correct {dev['correct_pct']}% (+0.5p {dev['partial_credit_pct']}%), "
@@ -1285,6 +1419,223 @@ class Loop:
         self.print_fn("\n".join(lines))
 
 
+# ── offline re-judge mode ────────────────────────────────────────────
+
+def read_jsonl_tolerant(ops: Ops, path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Read a JSONL file, skipping anything unparsable.
+
+    The loop writes answers.jsonl from several threads while --rejudge may be
+    running, so a half-written final line is expected and must never crash it.
+    """
+    try:
+        text = ops.read_text(path)
+    except OSError:
+        return [], 0
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+        else:
+            skipped += 1
+    return rows, skipped
+
+
+def load_probe_maps(root: Path, ops: Ops) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """id -> probe item for the dev file and the heldout file."""
+    maps = []
+    for relative in (DEV_PROBE_FILE, HELDOUT_PROBE_FILE):
+        rows, _skipped = read_jsonl_tolerant(ops, Path(root) / relative)
+        maps.append({str(row["id"]): row for row in rows if row.get("id") is not None})
+    return maps[0], maps[1]
+
+
+def resolve_set(row: dict[str, Any], dev_map: dict[str, Any], heldout_map: dict[str, Any]) -> str | None:
+    """Which probe set an answer row belongs to.
+
+    The driver writes an explicit "set" field; older or hand-edited files may not,
+    so fall back to which probe file holds the id, then to the id prefix (probe
+    ids are shaped like dev35 / held12).
+    """
+    explicit = str(row.get("set") or "").strip().lower()
+    if explicit in ("dev", "heldout"):
+        return explicit
+    ident = str(row.get("id") or "")
+    in_dev, in_heldout = ident in dev_map, ident in heldout_map
+    if in_dev and not in_heldout:
+        return "dev"
+    if in_heldout and not in_dev:
+        return "heldout"
+    lowered = ident.lower()
+    if lowered.startswith("dev"):
+        return "dev"
+    if lowered.startswith("held") or lowered.startswith("ho"):
+        return "heldout"
+    return None
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def rejudge_experiment(
+    directory: Path,
+    *,
+    ops: Ops,
+    judge_key: str,
+    dev_map: dict[str, Any],
+    heldout_map: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Re-grade one experiment directory. Returns (name, counts, summary)."""
+    answers, skipped_lines = read_jsonl_tolerant(ops, directory / "answers.jsonl")
+    existing_rows, _skipped = read_jsonl_tolerant(ops, directory / "verdicts.jsonl")
+    previous = {str(row.get("id") or ""): str(row.get("verdict") or "") for row in existing_rows}
+
+    counts = {"answers": len(answers), "judged": 0, "kept": 0, "no_answer": 0,
+              "errors": 0, "unmatched": 0, "skipped_lines": skipped_lines}
+    verdict_rows: list[dict[str, Any]] = []
+    per_set: dict[str, tuple[list[dict[str, Any]], list[str], list[float]]] = {
+        "dev": ([], [], []), "heldout": ([], [], []),
+    }
+    all_latencies: list[float] = []
+    probe_errors = 0
+
+    for row in answers:
+        ident = str(row.get("id") or "")
+        set_name = resolve_set(row, dev_map, heldout_map)
+        item = (dev_map if set_name == "dev" else heldout_map).get(ident) if set_name else None
+        if item is None:
+            verdict = JUDGE_ERROR
+            counts["unmatched"] += 1
+        elif row.get("error") or not str(row.get("answer") or "").strip():
+            verdict = NO_ANSWER
+            counts["no_answer"] += 1
+            probe_errors += 1
+        elif previous.get(ident) in VERDICT_VALUES:
+            verdict = previous[ident]  # a good verdict is kept, never re-paid for
+            counts["kept"] += 1
+        else:
+            try:
+                verdict = judge_answer(ops, item, str(row.get("answer") or ""), judge_key)["verdict"]
+                counts["judged"] += 1
+            except Exception:
+                verdict = JUDGE_ERROR
+                counts["errors"] += 1
+
+        verdict_rows.append({
+            "set": set_name or str(row.get("set") or ""),
+            "id": ident,
+            "type": row.get("type") if item is None else (row.get("type") or item.get("type")),
+            "verdict": verdict,
+        })
+        if set_name in per_set and item is not None:
+            latency = _as_float(row.get("latency"))
+            per_set[set_name][0].append(item)
+            per_set[set_name][1].append(verdict)
+            per_set[set_name][2].append(latency)
+            all_latencies.append(latency)
+
+    ops.write_text_atomic(
+        directory / "verdicts.jsonl",
+        "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in verdict_rows),
+    )
+
+    try:
+        summary = ops.read_json(directory / "summary.json")
+        if not isinstance(summary, dict):
+            summary = {}
+    except (OSError, json.JSONDecodeError):
+        summary = {}
+
+    dev_items, dev_verdicts, dev_latencies = per_set["dev"]
+    heldout_items, heldout_verdicts, heldout_latencies = per_set["heldout"]
+    summary["dev"] = score_set(dev_items, dev_verdicts, dev_latencies)
+    summary["heldout"] = score_set(heldout_items, heldout_verdicts, heldout_latencies)
+    summary["all_latencies_p50"] = percentile(all_latencies, 0.5)
+    summary["all_latencies_p95"] = percentile(all_latencies, 0.95)
+    summary["probe_errors"] = probe_errors
+    summary["unmatched"] = counts["unmatched"]
+    summary["rejudged_counts"] = counts
+    summary["rejudged_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    ops.write_json_atomic(directory / "summary.json", summary)
+    return directory.name, counts, summary
+
+
+def rejudge(out_dir: Path, root: Path, *, ops: Ops | None = None, print_fn: Callable[[str], None] | None = None) -> int:
+    """Re-grade saved answers offline, calling only the oMLX judge.
+
+    Touches nothing else: no .env, no docker, no LightRAG, no gateway, no sigma,
+    and never results.md or state.json. Safe to run repeatedly and while the loop
+    is still running.
+    """
+    ops = ops or Ops()
+    out_dir, root = Path(out_dir), Path(root)
+    print_fn = print_fn or (lambda line: print(line, flush=True))
+    judge_key = os.environ.get("OVERNIGHT_JUDGE_API_KEY", JUDGE_KEY_DEFAULT)
+
+    dev_map, heldout_map = load_probe_maps(root, ops)
+    if not dev_map or not heldout_map:
+        print_fn(
+            f"refusing to re-judge: need both {DEV_PROBE_FILE} and {HELDOUT_PROBE_FILE} "
+            f"with ids under {root}"
+        )
+        return 3
+
+    directories = sorted(
+        path for path in out_dir.iterdir() if path.is_dir() and (path / "answers.jsonl").exists()
+    ) if out_dir.exists() else []
+    if not directories:
+        print_fn(f"nothing to do: no <name>/answers.jsonl under {out_dir}")
+        return 0
+
+    rows: list[str] = []
+    notes: list[str] = []
+    for directory in directories:
+        name, counts, summary = rejudge_experiment(
+            directory, ops=ops, judge_key=judge_key, dev_map=dev_map, heldout_map=heldout_map
+        )
+        rows.append(
+            results_row(
+                name, "rejudged", summary["dev"], summary["heldout"],
+                summary["all_latencies_p50"], summary["all_latencies_p95"],
+            )
+        )
+        # counts only: never questions, answers or judge reasons
+        print_fn(
+            f"{name}: judged {counts['judged']} kept {counts['kept']} "
+            f"no_answer {counts['no_answer']} errors {counts['errors']} "
+            f"unmatched {counts['unmatched']} skipped_lines {counts['skipped_lines']}"
+        )
+        if counts["unmatched"]:
+            notes.append(
+                f"- {name}: {counts['unmatched']} answer(s) had no matching probe id, "
+                "excluded from the percentages"
+            )
+        if counts["skipped_lines"]:
+            notes.append(
+                f"- {name}: {counts['skipped_lines']} unparsable line(s) in answers.jsonl "
+                "(the loop may still be writing)"
+            )
+
+    table = "# Overnight loop results (re-judged)\n\n" + RESULTS_TABLE_HEADER + "".join(rows)
+    if notes:
+        table += "\nNotes\n\n" + "\n".join(notes) + "\n"
+    ops.write_text_atomic(out_dir / "results-rejudged.md", table)
+    print_fn(f"wrote {out_dir / 'results-rejudged.md'} ({len(rows)} experiment(s))")
+    return 0
+
+
 def build_plan_lines(config: dict[str, Any]) -> list[str]:
     """Human-readable plan, used by --dry-run and at the start of a real run."""
     lines = ["plan:"]
@@ -1300,12 +1651,24 @@ def build_plan_lines(config: dict[str, Any]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Unattended overnight accuracy-loop driver")
     parser.add_argument("--root", required=True, help="project root on the Thinkpad (~/rag-project)")
-    parser.add_argument("--experiments", required=True, help="path to experiments.json")
-    parser.add_argument("--out", required=True, help="output/state directory")
+    parser.add_argument("--experiments", help="path to experiments.json (not needed with --rejudge)")
+    parser.add_argument("--out", help="output/state directory (not needed with --rejudge)")
     parser.add_argument("--max-hours", type=float, default=11.0, help="stop starting experiments after this many hours")
     parser.add_argument("--dry-run", action="store_true", help="run the plan against a fake Ops; touches nothing real")
     parser.add_argument("--resume", action="store_true", help="skip experiments already done/error in state.json")
+    parser.add_argument(
+        "--rejudge",
+        metavar="OUT_DIR",
+        help="offline mode: re-grade saved answers in OUT_DIR/<name>/answers.jsonl using only "
+             "the judge endpoint, then write OUT_DIR/results-rejudged.md",
+    )
     arguments = parser.parse_args(argv)
+
+    if arguments.rejudge:
+        return rejudge(Path(arguments.rejudge).expanduser(), Path(arguments.root).expanduser())
+
+    if not arguments.experiments or not arguments.out:
+        parser.error("--experiments and --out are required unless --rejudge is given")
 
     try:
         config = load_experiments(Path(arguments.experiments))
