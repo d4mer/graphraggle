@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import settings
 from .lightrag_client import client
+from .pptx_extract import PptxExtractError, cap_extracted_text, extract_pptx_text
 from .state_store import (
     build_company_attribution,
     get_document_by_path,
@@ -24,6 +25,10 @@ from .validation import validate_file
 
 SUPPORTED = {".txt", ".md", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json", ".html", ".htm"}
 TEXT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json", ".csv"}
+# packet-27: .pptx is NOT a TEXT_EXTENSION (that means "decode the bytes as
+# text"). It is extracted with python-pptx into structured text and then
+# submitted through the same /documents/text path.
+PPTX_EXTENSIONS = {".pptx"}
 TERMINAL_SUCCESS = {"ingested"}
 LIGHTRAG_INTERNAL_DIRS = {"__enqueued__"}
 
@@ -153,6 +158,35 @@ def normalize_text_submission_payload(text: str) -> str:
     normalized = re.sub(r"(?:^|\n)(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*", "\n", normalized)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized.strip()
+
+
+def uses_pptx_extract(path: Path) -> bool:
+    """True when this file is extracted by the worker instead of uploaded."""
+    return bool(settings.worker_pptx_extract_enabled) and path.suffix.lower() in PPTX_EXTENSIONS
+
+
+def extract_pptx_payload(path: Path) -> str:
+    """Byte-guard, extract, normalise and cap a .pptx submission payload.
+
+    Raises :class:`PptxExtractError` with the worker ``error_code``. python-pptx
+    loads the whole package into memory, so ``WORKER_PPTX_MAX_BYTES`` is the
+    guard against the zip-bomb class of files.
+    """
+    limit = int(settings.worker_pptx_max_bytes or 0)
+    if limit:
+        size = path.stat().st_size
+        if size > limit:
+            raise PptxExtractError(
+                f"PPTX too large to extract: {size} bytes exceeds WORKER_PPTX_MAX_BYTES={limit}",
+                error_code="pptx_extract_failed",
+            )
+    text = normalize_text_submission_payload(extract_pptx_text(path))
+    if not text.strip():
+        raise PptxExtractError(
+            "PPTX extraction produced no text; nothing to submit",
+            error_code="pptx_empty",
+        )
+    return cap_extracted_text(text, int(settings.worker_pptx_max_chars or 0) or None)
 
 
 def parse_warning_metadata(raw: str | None) -> dict[str, Any]:
@@ -420,6 +454,40 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
                     }),
                 ),
             )
+            return
+    elif uses_pptx_extract(path):
+        # packet-27: extract the deck (slides, tables, groups, notes) and submit
+        # it as text. LightRAG's own pptx extractor drops all of that.
+        try:
+            text_payload = extract_pptx_payload(path)
+        except PptxExtractError as exc:
+            await update_document_state(
+                str(path),
+                sha256=digest,
+                status="failed",
+                validation_state=existing.get("validation_state") if existing else "accept",
+                error_stage="extract",
+                error_code=exc.error_code,
+                error_message="Worker failed to extract PPTX content",
+                error_detail=str(exc),
+                last_error=str(exc),
+                track_id=None,
+                query_ready=False,
+                content_hash=digest,
+                byte_size=byte_size,
+                ingested_at=None,
+                warnings_json=merge_warning_metadata(
+                    warnings_json,
+                    duplicate_of=None,
+                    worker_updates=cleared_reindex_updates({
+                        "dedupe_action": None,
+                        "failure_class": "terminal",
+                        "submission_blocked": None,
+                        "retryable": False,
+                    }),
+                ),
+            )
+            warn(f"PPTX extraction failed for {path}: {exc.error_code}: {exc}")
             return
 
     if verdict.verdict == "warn":

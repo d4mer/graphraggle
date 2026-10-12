@@ -21,6 +21,17 @@ class Settings(BaseSettings):
     ingest_max_retries: int = Field(default=3, alias="INGEST_MAX_RETRIES")
     request_timeout_seconds: int = Field(default=300, alias="REQUEST_TIMEOUT_SECONDS")
 
+    # packet-27: the worker extracts .pptx itself (python-pptx) into structured
+    # text and submits it through /documents/text, because LightRAG's built-in
+    # pptx extractor drops tables, grouped shapes, speaker notes and slide
+    # numbers. Set false to fall back to the old upload path.
+    worker_pptx_extract_enabled: bool = Field(default=True, alias="WORKER_PPTX_EXTRACT_ENABLED")
+    # python-pptx reads the whole package into memory, so this byte limit is the
+    # guard against the zip-bomb class of files.
+    worker_pptx_max_bytes: int = Field(default=104_857_600, alias="WORKER_PPTX_MAX_BYTES")
+    # Extracted text is capped before submission; the cap leaves a marker line.
+    worker_pptx_max_chars: int = Field(default=2_000_000, alias="WORKER_PPTX_MAX_CHARS")
+
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
     rerank_binding_api_key: Optional[str] = Field(default=None, alias="RERANK_BINDING_API_KEY")

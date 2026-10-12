@@ -6,3 +6,4 @@ pydantic-settings==2.8.1
 python-multipart==0.0.20
 aiofiles==24.1.0
 aiosqlite==0.20.0
+python-pptx==1.0.2
