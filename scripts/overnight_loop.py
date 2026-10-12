@@ -1,0 +1,1303 @@
+#!/usr/bin/env python3
+"""scripts/overnight_loop.py — unattended overnight accuracy-loop driver.
+
+Runs an ordered list of experiments against a live LightRAG stack on the
+Thinkpad with no agent and no approval prompts: change whitelisted LightRAG
+env vars, optionally re-ingest the transcript corpus, run the probe sets, judge
+every answer with an independent LLM, record scores, and always put the
+production config back at the end.
+
+Usage:
+    python3 scripts/overnight_loop.py --root ~/rag-project \
+        --experiments experiments.json --out ~/rag-project/probe/loop \
+        --max-hours 11 [--dry-run] [--resume]
+
+Outputs, all under --out:
+    state.json     resumable run state, written atomically after every step
+    heartbeat      ISO timestamp, rewritten at least every 60 s while waiting
+    loop.log       human-readable log (appended)
+    results.md     one row per experiment, dev + heldout columns
+    env.original   the untouched copy of <root>/.env (chmod 600)
+    <name>/answers.jsonl, verdicts.jsonl, summary.json
+
+Stdlib only (urllib, json, subprocess, argparse, time, pathlib, re). Every side
+effect goes through the Ops class so the tests can replace it with a fake: no
+network, no docker, no sleeping in tests.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+# ── Configuration surface ───────────────────────────────────────────────────
+
+# The only .env keys this script may ever change.
+ENV_WHITELIST = frozenset({
+    "MAX_ASYNC",
+    "LLM_MODEL_MAX_ASYNC",
+    "MAX_PARALLEL_INSERT",
+    "MAX_GLEANING",
+    "CHUNK_SIZE",
+    "CHUNK_OVERLAP_SIZE",
+    "TOP_K",
+    "CHUNK_TOP_K",
+    "MAX_ENTITY_TOKENS",
+    "MAX_RELATION_TOKENS",
+    "MAX_TOTAL_TOKENS",
+    "ENTITY_TYPES",
+    "SUMMARY_MAX_TOKENS",
+    "FORCE_LLM_SUMMARY_ON_MERGE",
+    "RELATED_CHUNK_NUMBER",
+    "KG_CHUNK_PICK_METHOD",
+    "RERANK_BY_DEFAULT",
+})
+
+# Never changeable, even if a future edit whitelists them. The whitelist above is
+# the only allow-list, so LLM_* / EMBEDDING_* are already excluded except
+# LLM_MODEL_MAX_ASYNC, which the brief whitelists on purpose: it is an
+# async-concurrency knob, not model selection. Credentials are banned by name and
+# suffix regardless.
+NEVER_CHANGE_EXACT = frozenset({
+    "LIGHTRAG_API_KEY",
+    "OPENAI_API_KEY",
+    "LLM_MODEL",
+    "LLM_BINDING",
+    "LLM_BINDING_HOST",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_BINDING",
+    "EMBEDDING_BINDING_HOST",
+})
+NEVER_CHANGE_SUFFIX = re.compile(r"(_API_KEY|_API_KEYS|_KEY|_SECRET|_PASSWORD)$")
+
+# Local oMLX judge endpoint. The key is the placeholder the local server
+# expects; it is never logged. Override with OVERNIGHT_JUDGE_API_KEY.
+JUDGE_URL = "http://192.168.1.190:1234/v1/chat/completions"
+JUDGE_MODEL = "qwen3.6-35b"
+JUDGE_KEY_DEFAULT = "1234"
+
+# Service liveness probe ("sigma" on the Thinkpad).
+SIGMA_URL = "http://192.168.1.195:1234/v1/models"
+
+GATEWAY_URL = "http://127.0.0.1:8020"
+LIGHTRAG_URL = "http://localhost:9621"
+CONTAINER = "lightrag-server"
+WORKER_CONTAINER = "rag-ingest-worker"
+
+DEV_PROBE_FILE = "probe/solvay-dev-v1.jsonl"
+HELDOUT_PROBE_FILE = "probe/solvay-heldout-v1.jsonl"
+CORPUS_FILE = "probe/loop_corpus.json"
+
+# Timeouts, in seconds.
+HEALTH_TIMEOUT = 300
+CLEAR_TIMEOUT = 600
+DOC_TIMEOUT = 90 * 60
+PROBE_TIMEOUT = 900
+SERVICE_DOWN_WAIT = 600
+HARD_ABORT_GRACE = 3600
+HEARTBEAT_INTERVAL = 60
+
+SUCCESS_HELDOUT_CORRECT_PCT = 90.0
+SUCCESS_HALLUCINATION_PCT = 5.0
+SUCCESS_REFUSAL_ACCURACY_PCT = 80.0
+
+VERDICT_VALUES = ("correct", "partial", "wrong", "hallucinated", "refused_ok", "refused_wrong")
+JUDGE_ERROR = "judge_error"
+
+JUDGE_PROMPT = """You are grading one answer from a document question-answering system.
+
+Question:
+{question}
+
+Expected answer (ground truth):
+{expected_answer}
+
+Evidence quote from the documents:
+{evidence}
+
+System answer:
+{answer}
+
+Rules:
+- Judge ONLY against the evidence and the expected answer above. Never use outside knowledge.
+- If the expected answer says the information is not in the documents, then a clear
+  statement that the information is not available is refused_ok, and anything invented is
+  hallucinated.
+- correct: answers the question the way the evidence does.
+- partial: right direction but materially incomplete or imprecise.
+- wrong: contradicts the evidence, or answers a different question.
+- hallucinated: states something the evidence does not support.
+- refused_ok: declined to answer, and the evidence does not answer the question.
+- refused_wrong: declined to answer, but the evidence does answer the question.
+
+Reply with ONLY this JSON object and nothing else:
+{{"verdict": "correct|partial|wrong|hallucinated|refused_ok|refused_wrong", "reason": "<one sentence>"}}
+"""
+
+
+class LoopConfigError(Exception):
+    """The experiments file is invalid or tries to change a forbidden key."""
+
+
+class StepError(Exception):
+    """A step failed after its retries; the experiment is marked error."""
+
+
+class FatalRun(Exception):
+    """Unsafe to continue the run at all (for example the worker is running)."""
+
+
+# ── experiments.json ────────────────────────────────────────────────────────
+
+def is_forbidden_key(key: str) -> bool:
+    """Credential and model-selection keys: never touchable, whitelist or not."""
+    if key in NEVER_CHANGE_EXACT or NEVER_CHANGE_SUFFIX.search(key):
+        return True
+    return False
+
+
+def check_env_keys(mapping: dict[str, Any], where: str) -> None:
+    for key in mapping:
+        key = str(key)
+        if key not in ENV_WHITELIST:
+            raise LoopConfigError(f"{where}: key {key} is not in the whitelist")
+        if is_forbidden_key(key):
+            raise LoopConfigError(f"{where}: key {key} may never be changed")
+
+
+def load_experiments(path: Path) -> dict[str, Any]:
+    """Parse and validate experiments.json, preserving file order."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise LoopConfigError(f"experiments file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise LoopConfigError(f"experiments file is not valid JSON: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise LoopConfigError("experiments file must be a JSON object")
+    baseline = raw.get("baseline_env") or {}
+    if not isinstance(baseline, dict):
+        raise LoopConfigError("baseline_env must be an object")
+    check_env_keys(baseline, "baseline_env")
+
+    entries = raw.get("experiments")
+    if not isinstance(entries, list) or not entries:
+        raise LoopConfigError("experiments must be a non-empty list")
+
+    experiments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise LoopConfigError(f"experiments[{index}] must be an object")
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            raise LoopConfigError(f"experiments[{index}]: name is required")
+        if name in seen:
+            raise LoopConfigError(f"duplicate experiment name: {name}")
+        seen.add(name)
+        env = entry.get("env") or {}
+        if not isinstance(env, dict):
+            raise LoopConfigError(f"experiment {name}: env must be an object")
+        check_env_keys(env, f"experiment {name}")
+        concurrency = int(entry.get("probe_concurrency", 1) or 1)
+        if concurrency < 1:
+            raise LoopConfigError(f"experiment {name}: probe_concurrency must be >= 1")
+        experiments.append({
+            "name": name,
+            "env": {str(k): str(v) for k, v in env.items()},
+            "reingest": bool(entry.get("reingest", False)),
+            "probe_concurrency": concurrency,
+        })
+    return {
+        "baseline_env": {str(k): str(v) for k, v in baseline.items()},
+        "experiments": experiments,
+    }
+
+
+# ── .env rewriting (every untouched line stays byte-identical) ──────────────
+
+_ENV_LINE = re.compile(r"^(\s*)(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _quote_value(value: str) -> str:
+    if value == "":
+        return '""'
+    if re.search(r'[\s#"\']', value):
+        return '"' + value.replace('"', '\\"') + '"'
+    return value
+
+
+def rewrite_env(text: str, set_values: dict[str, str], remove_keys: set[str] | None = None) -> str:
+    """Set/remove whitelisted keys in place; leave every other line identical.
+
+    A set key that already exists is replaced in place (indentation and line
+    ending preserved). A set key that does not exist is appended at the end.
+    Keys in ``remove_keys`` — keys a previous experiment of this run added and
+    this experiment no longer wants — are deleted.
+    """
+    remove_keys = remove_keys or set()
+    lines = text.splitlines(keepends=True)
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in lines:
+        stripped = line.rstrip("\r\n")
+        ending = line[len(stripped):] or "\n"
+        match = _ENV_LINE.match(stripped)
+        if match:
+            key = match.group(2)
+            if key in set_values:
+                seen.add(key)
+                output.append(f"{match.group(1)}{key}={_quote_value(set_values[key])}{ending}")
+                continue
+            if key in remove_keys:
+                continue
+        output.append(line)
+
+    additions = [f"{key}={_quote_value(value)}" for key, value in set_values.items() if key not in seen]
+    if additions:
+        if output and not output[-1].endswith(("\n", "\r")):
+            output[-1] = output[-1] + "\n"
+        output.extend(addition + "\n" for addition in additions)
+    return "".join(output)
+
+
+def env_value(text: str, key: str) -> str | None:
+    for line in text.splitlines():
+        match = _ENV_LINE.match(line.strip())
+        if match and match.group(2) == key:
+            return match.group(3).strip().strip('"').strip("'")
+    return None
+
+
+# ── Judge output parsing ────────────────────────────────────────────────────
+
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def first_json_object(text: str) -> dict[str, Any] | None:
+    """Return the first balanced JSON object found anywhere in ``text``."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start:index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def parse_verdict(text: str | None) -> dict[str, str] | None:
+    """Extract ``{"verdict": ..., "reason": ...}`` from a judge reply.
+
+    Handles clean JSON, markdown-fenced JSON and prose wrapped around the
+    object. Returns None when nothing usable is present.
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    fenced = _FENCE.search(candidate)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    obj = first_json_object(candidate)
+    if obj is None:
+        return None
+    verdict = str(obj.get("verdict", "")).strip().lower()
+    if verdict not in VERDICT_VALUES:
+        return None
+    return {"verdict": verdict, "reason": str(obj.get("reason", "")).strip()}
+
+
+# ── Scoring ─────────────────────────────────────────────────────────────────
+
+UNANSWERABLE = re.compile(
+    r"(not in the documents|not available|not mentioned|unanswerable|no answer)",
+    re.IGNORECASE,
+)
+
+
+def is_unanswerable(item: dict[str, Any]) -> bool:
+    expected = str(item.get("expected_answer") or "").strip()
+    return expected == "" or bool(UNANSWERABLE.search(expected))
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    rank = max(1, int(round(fraction * len(ordered))))
+    return float(ordered[min(rank - 1, len(ordered) - 1)])
+
+
+def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[float]) -> dict[str, Any]:
+    """Percentage maths for one probe set. judge_error is excluded from rates."""
+    pairs = [(item, verdict) for item, verdict in zip(items, verdicts) if verdict != JUDGE_ERROR]
+    judge_errors = sum(1 for verdict in verdicts if verdict == JUDGE_ERROR)
+    total = len(pairs)
+
+    counts: dict[str, int] = {value: 0 for value in VERDICT_VALUES}
+    for _, verdict in pairs:
+        counts[verdict] += 1
+
+    def pct(numerator: int) -> float:
+        return round(100.0 * numerator / total, 2) if total else 0.0
+
+    by_type: dict[str, dict[str, Any]] = {}
+    for item, verdict in pairs:
+        bucket = by_type.setdefault(
+            str(item.get("type") or "unknown"),
+            {"n": 0, "correct": 0, "partial": 0, "hallucinated": 0},
+        )
+        bucket["n"] += 1
+        if verdict in bucket:
+            bucket[verdict] += 1
+    for bucket in by_type.values():
+        bucket["partial_credit_pct"] = round(
+            100.0 * (bucket["correct"] + 0.5 * bucket["partial"]) / bucket["n"], 2
+        ) if bucket["n"] else 0.0
+
+    unanswerable = [(item, verdict) for item, verdict in pairs if is_unanswerable(item)]
+    refusal_accuracy = round(
+        100.0 * sum(1 for _, verdict in unanswerable if verdict == "refused_ok") / len(unanswerable), 2
+    ) if unanswerable else None
+
+    return {
+        "n": len(verdicts),
+        "judged": total,
+        "judge_errors": judge_errors,
+        "counts": counts,
+        "correct_pct": pct(counts["correct"]),
+        "partial_credit_pct": round(100.0 * (counts["correct"] + 0.5 * counts["partial"]) / total, 2) if total else 0.0,
+        "partial_credit_raw": round(counts["correct"] + 0.5 * counts["partial"], 2),
+        "hallucination_pct": pct(counts["hallucinated"]),
+        "refused_wrong": counts["refused_wrong"],
+        "refusal_accuracy_pct": refusal_accuracy,
+        "unanswerable_n": len(unanswerable),
+        "by_type": by_type,
+        "latency_p50": round(percentile(latencies, 0.50), 2),
+        "latency_p95": round(percentile(latencies, 0.95), 2),
+    }
+
+
+def meets_success(heldout: dict[str, Any]) -> bool:
+    """SUCCESS: heldout correct% >= 90 AND hallucination% < 5 AND refusal >= 80."""
+    refusal = heldout.get("refusal_accuracy_pct")
+    return (
+        heldout.get("correct_pct", 0.0) >= SUCCESS_HELDOUT_CORRECT_PCT
+        and heldout.get("hallucination_pct", 100.0) < SUCCESS_HALLUCINATION_PCT
+        and refusal is not None
+        and refusal >= SUCCESS_REFUSAL_ACCURACY_PCT
+    )
+
+
+# ── Side effects ────────────────────────────────────────────────────────────
+
+class Ops:
+    """Every side effect the driver performs. Tests replace this with a fake."""
+
+    def now(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(max(0.0, seconds))
+
+    def read_text(self, path: Path) -> str:
+        return Path(path).read_text(encoding="utf-8")
+
+    def write_text_atomic(self, path: Path, text: str, *, mode: int | None = None) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        temp.write_text(text, encoding="utf-8")
+        if mode is not None:
+            os.chmod(temp, mode)
+        os.replace(temp, path)
+
+    def append_text(self, path: Path, text: str) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def read_json(self, path: Path) -> Any:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def write_json_atomic(self, path: Path, payload: Any) -> None:
+        self.write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    def http_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        payload: Any = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, Any]:
+        """Return (status_code, parsed_body). Raises on transport errors."""
+        data = None
+        request_headers = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            request_headers.setdefault("Content-Type", "application/json")
+        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                status = response.getcode()
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            status = exc.code
+        try:
+            body = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            body = {"raw": raw}
+        return status, body
+
+    def run(self, argv: list[str], *, cwd: Path | None = None, timeout: float = 180.0) -> tuple[int, str, str]:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return completed.returncode, completed.stdout, completed.stderr
+
+
+class DryRunOps(Ops):
+    """A fake that lets --dry-run execute the whole plan harmlessly.
+
+    No docker, no HTTP, no sleeping; the only files written are under --out.
+    """
+
+    def __init__(self) -> None:
+        self.clock = 0.0
+        self.commands: list[list[str]] = []
+        self.requests: list[tuple[str, str]] = []
+
+    def now(self) -> float:
+        return self.clock
+
+    def sleep(self, seconds: float) -> None:
+        self.clock += max(0.0, seconds)
+
+    def http_json(self, method, url, *, headers=None, payload=None, timeout=30.0):
+        self.requests.append((method, url))
+        if url.endswith("/health"):
+            return 200, {"status": "healthy"}
+        if url.endswith("/status_counts"):
+            return 200, {"processing": 0, "pending": 0, "failed": 0, "preprocessed": 0, "processed": 0}
+        if "/documents/text" in url:
+            return 200, {"track_id": "dryrun-track"}
+        if "/documents/track_status/" in url:
+            return 200, {"documents": [{"status": "processed"}]}
+        if url.endswith("/v1/models"):
+            return 200, {"data": [{"id": JUDGE_MODEL}]}
+        if url.endswith("/api/chat"):
+            return 200, {"message": {"content": "dry-run answer"}}
+        if url.endswith("/v1/chat/completions"):
+            return 200, {"choices": [{"message": {"content": '{"verdict": "correct", "reason": "dry run"}'}}]}
+        return 200, {}
+
+    def run(self, argv, *, cwd=None, timeout=180.0):
+        self.commands.append(list(argv))
+        if argv[:2] == ["docker", "ps"]:
+            return 0, "rag-gateway-api\nlightrag-server\n", ""      # no worker
+        if argv[:2] == ["docker", "exec"]:
+            return 0, "", ""
+        return 0, "", ""
+
+
+# ── Driver ──────────────────────────────────────────────────────────────────
+
+class Loop:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        out: Path,
+        config: dict[str, Any],
+        ops: Ops,
+        max_hours: float = 11.0,
+        dry_run: bool = False,
+        resume: bool = False,
+        handle_signals: bool = True,
+        print_fn: Callable[[str], None] | None = None,
+    ) -> None:
+        self.root = Path(root)
+        self.out = Path(out)
+        self.config = config
+        self.ops = ops
+        self.max_hours = float(max_hours)
+        self.dry_run = dry_run
+        self.resume = resume
+        self.handle_signals = handle_signals
+        self.print_fn = print_fn or (lambda line: print(line, flush=True))
+
+        self.real_env_path = self.root / ".env"
+        # --dry-run never rewrites the production .env: it writes a shadow copy.
+        self.env_path = (self.out / "dryrun.env") if dry_run else self.real_env_path
+        self.env_original_path = self.out / "env.original"
+        self.state_path = self.out / "state.json"
+        self.heartbeat_path = self.out / "heartbeat"
+        self.log_path = self.out / "loop.log"
+        self.results_path = self.out / "results.md"
+
+        self.state: dict[str, Any] = {}
+        self.original_env_text = ""
+        self.changed_keys: set[str] = set()
+        self.start_time = 0.0
+        self.deadline = 0.0
+        self.hard_deadline = 0.0
+        self.abort_requested = False
+        self.judge_key = os.environ.get("OVERNIGHT_JUDGE_API_KEY", JUDGE_KEY_DEFAULT)
+        self.plan: list[str] = []
+
+    # ── logging, heartbeat, state ──────────────────────────────────────────
+
+    def log(self, message: str) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        line = f"{stamp} {message}"
+        self.ops.append_text(self.log_path, line + "\n")
+        self.print_fn(line)
+
+    def heartbeat(self) -> None:
+        self.ops.write_text_atomic(self.heartbeat_path, time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+
+    def load_state(self) -> None:
+        if self.resume and self.state_path.exists():
+            try:
+                self.state = self.ops.read_json(self.state_path)
+            except (OSError, json.JSONDecodeError):
+                self.log("state.json unreadable; starting a fresh state")
+        if not self.state:
+            self.state = {
+                "status": "running",
+                "dry_run": self.dry_run,
+                "experiments": {},
+                "changed_keys": [],
+                "corpus_built_by": None,
+                "results": {},
+            }
+
+    def save_state(self) -> None:
+        self.state["changed_keys"] = sorted(self.changed_keys)
+        self.state["heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.ops.write_json_atomic(self.state_path, self.state)
+
+    def _install_signals(self) -> None:
+        if not self.handle_signals:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        def handler(signum, _frame):
+            self.abort_requested = True
+            self.log(f"signal {signum} received; finishing the current step then finalising")
+
+        for name in ("SIGINT", "SIGTERM"):
+            number = getattr(signal, name, None)
+            if number is not None:
+                try:
+                    signal.signal(number, handler)
+                except (ValueError, OSError):
+                    pass  # not the main thread (tests)
+
+    # ── waiting helpers ────────────────────────────────────────────────────
+
+    def _check_abort(self) -> None:
+        if self.abort_requested:
+            raise FatalRun("abort requested")
+        if self.ops.now() > self.hard_deadline:
+            raise FatalRun(f"hard abort at max-hours + {HARD_ABORT_GRACE}s")
+
+    def _wait_until(
+        self,
+        probe: Callable[[], tuple[bool, Any]],
+        *,
+        timeout: float,
+        interval: float,
+        what: str,
+    ) -> Any:
+        deadline = self.ops.now() + timeout
+        while True:
+            self._check_abort()
+            ok, value = probe()
+            if ok:
+                return value
+            self.heartbeat()
+            remaining = deadline - self.ops.now()
+            if remaining <= 0:
+                raise StepError(f"timeout waiting for {what}")
+            self.ops.sleep(min(interval, remaining, HEARTBEAT_INTERVAL))
+
+    def _attempt(self, action: Callable[[], Any], *, what: str, attempts: int = 2) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return action()
+            except FatalRun:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self.log(f"{what}: attempt {attempt} failed: {exc}")
+                self.heartbeat()
+        raise StepError(f"{what}: {last_error}")
+
+    # ── steps 1 and 2: env, restart, verify ────────────────────────────────
+
+    def _target_env(self, experiment: dict[str, Any]) -> tuple[dict[str, str], set[str]]:
+        """Env for one experiment: original values, then baseline, then the
+        experiment's own env. Keys an earlier experiment added but this one does
+        not want are removed, so experiments never stack."""
+        baseline = self.config.get("baseline_env") or {}
+        env = experiment.get("env") or {}
+        set_values: dict[str, str] = {}
+        for key in sorted(self.changed_keys):
+            original = env_value(self.original_env_text, key)
+            if original is not None:
+                set_values[key] = original
+        remove_keys = {
+            key for key in self.changed_keys
+            if key not in set_values and key not in baseline and key not in env
+        }
+        set_values.update(baseline)
+        set_values.update(env)
+        return set_values, remove_keys
+
+    def _apply_env(self, experiment: dict[str, Any]) -> dict[str, str]:
+        set_values, remove_keys = self._target_env(experiment)
+        check_env_keys(set_values, f"experiment {experiment['name']}")
+        text = self.ops.read_text(self.env_path) if Path(self.env_path).exists() else self.original_env_text
+        self.ops.write_text_atomic(self.env_path, rewrite_env(text, set_values, remove_keys))
+        self.changed_keys |= set(set_values) | remove_keys
+        self.log(f"{experiment['name']}: env set to " + ", ".join(f"{k}={set_values[k]}" for k in sorted(set_values)))
+        return set_values
+
+    def _compose(self, *args: str) -> tuple[int, str, str]:
+        return self.ops.run(
+            ["docker", "compose", "-f", str(self.root / "compose.yml"), *args],
+            cwd=self.root,
+            timeout=300,
+        )
+
+    def _restart_server(self) -> None:
+        code, out, err = self._compose("up", "-d", "--no-deps", CONTAINER)
+        if code != 0:
+            raise StepError(f"compose up failed rc={code}: {err.strip() or out.strip()}")
+        self.log(f"{CONTAINER}: recreated")
+
+    def _health(self) -> tuple[bool, Any]:
+        try:
+            status, body = self.ops.http_json("GET", f"{LIGHTRAG_URL}/health", timeout=15)
+        except Exception as exc:
+            return False, str(exc)
+        return status == 200 and str(body.get("status", "")).lower() == "healthy", body
+
+    def _wait_healthy(self) -> None:
+        self._wait_until(self._health, timeout=HEALTH_TIMEOUT, interval=10, what=f"{CONTAINER} health")
+        self.log(f"{CONTAINER}: healthy")
+
+    def _sigma_up(self) -> tuple[bool, Any]:
+        try:
+            status, body = self.ops.http_json(
+                "GET", SIGMA_URL, headers={"Authorization": f"Bearer {self.judge_key}"}, timeout=15
+            )
+        except Exception as exc:
+            return False, str(exc)
+        return status == 200, body
+
+    def _ensure_services(self) -> None:
+        """Wait out a down LightRAG or sigma judge for up to 10 minutes."""
+        self._wait_until(self._health, timeout=SERVICE_DOWN_WAIT, interval=15, what="LightRAG /health")
+        self._wait_until(self._sigma_up, timeout=SERVICE_DOWN_WAIT, interval=15, what="judge service (sigma)")
+
+    def _container_env(self) -> dict[str, str]:
+        code, out, err = self.ops.run(["docker", "exec", CONTAINER, "env"], timeout=60)
+        if code != 0:
+            raise StepError(f"docker exec env failed rc={code}: {err.strip()}")
+        values: dict[str, str] = {}
+        for line in out.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        return values
+
+    def _verify_env(self, set_values: dict[str, str]) -> None:
+        if self.dry_run:
+            self.log(f"dry run: skipping 'docker exec env' verification of {len(set_values)} key(s)")
+            return
+        actual = self._container_env()
+        mismatched = {
+            key: (value, actual.get(key))
+            for key, value in set_values.items()
+            if actual.get(key) != value
+        }
+        if mismatched:
+            detail = ", ".join(f"{k}: wanted {wanted!s} got {got!s}" for k, (wanted, got) in mismatched.items())
+            raise StepError(f"container env not applied: {detail}")
+        self.log(f"{CONTAINER}: env verified for {len(set_values)} key(s)")
+
+    # ── step 3: reingest ───────────────────────────────────────────────────
+
+    def _worker_running(self) -> bool:
+        code, out, _err = self.ops.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            cwd=self.root,
+            timeout=60,
+        )
+        if code != 0:
+            raise StepError(f"docker ps failed rc={code}")
+        return any(WORKER_CONTAINER in line for line in out.splitlines())
+
+    def _guard_worker(self) -> None:
+        if self._worker_running():
+            raise FatalRun(
+                f"{WORKER_CONTAINER} is running; refusing to clear LightRAG under it. "
+                "Stop the worker yourself and rerun with --resume."
+            )
+        self.log("worker is stopped; safe to clear LightRAG")
+
+    def _api_key(self) -> str:
+        key = env_value(self.original_env_text, "LIGHTRAG_API_KEY")
+        if not key:
+            raise StepError("LIGHTRAG_API_KEY not found in .env; cannot call LightRAG")
+        return key
+
+    def _clear_lightrag(self) -> None:
+        headers = {"X-API-Key": self._api_key()}
+        status, body = self.ops.http_json("DELETE", f"{LIGHTRAG_URL}/documents", headers=headers, timeout=120)
+        if status >= 400:
+            raise StepError(f"DELETE /documents returned {status}")
+        self.log("LightRAG clear requested")
+
+        def counts_zero() -> tuple[bool, Any]:
+            code, payload = self.ops.http_json("GET", f"{LIGHTRAG_URL}/documents/status_counts", headers=headers, timeout=30)
+            if code != 200:
+                return False, payload
+            counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else payload
+            numeric = [value for value in counts.values() if isinstance(value, (int, float))]
+            return bool(numeric) and all(value == 0 for value in numeric), payload
+
+        self._wait_until(counts_zero, timeout=CLEAR_TIMEOUT, interval=15, what="status_counts to reach 0")
+        self.log("LightRAG is empty")
+
+    def _corpus_paths(self) -> list[Path]:
+        try:
+            raw = self.ops.read_json(self.root / CORPUS_FILE)
+        except json.JSONDecodeError as exc:
+            raise StepError(f"{CORPUS_FILE} is not valid JSON: {exc}")
+        except OSError as exc:
+            raise StepError(f"cannot read {CORPUS_FILE}: {exc}")
+        if not isinstance(raw, list) or not raw:
+            raise StepError(f"{CORPUS_FILE} must be a non-empty JSON list of file paths")
+        return [Path(str(entry)) for entry in raw]
+
+    def _insert_one(self, path: Path) -> float:
+        started = self.ops.now()
+        text = self.ops.read_text(path)
+        status, body = self.ops.http_json(
+            "POST",
+            f"{LIGHTRAG_URL}/documents/text",
+            headers={"X-API-Key": self._api_key()},
+            payload={"text": text, "file_source": str(path)},
+            timeout=120,
+        )
+        if status >= 400:
+            raise RuntimeError(f"POST /documents/text returned {status}")
+        track_id = body.get("track_id")
+        if not track_id:
+            raise RuntimeError("POST /documents/text returned no track_id")
+
+        def processed() -> tuple[bool, Any]:
+            code, payload = self.ops.http_json(
+                "GET", f"{LIGHTRAG_URL}/documents/track_status/{track_id}",
+                headers={"X-API-Key": self._api_key()}, timeout=30,
+            )
+            if code != 200:
+                return False, payload
+            documents = payload.get("documents") or []
+            statuses = [str(doc.get("status", "")).lower() for doc in documents]
+            if any(state == "failed" for state in statuses):
+                raise RuntimeError(f"track {track_id} reported failed")
+            return bool(statuses) and all(state == "processed" for state in statuses), payload
+
+        self._wait_until(processed, timeout=DOC_TIMEOUT, interval=30, what=f"{path.name} to process")
+        return round(self.ops.now() - started, 1)
+
+    def _reingest(self, experiment: dict[str, Any]) -> None:
+        self._guard_worker()
+        self._clear_lightrag()
+        seconds_per_doc: list[float] = []
+        for path in self._corpus_paths():
+            seconds = self._attempt(lambda p=path: self._insert_one(p), what=f"insert {path.name}", attempts=2)
+            seconds_per_doc.append(seconds)
+            self.log(f"{experiment['name']}: inserted {path.name} in {seconds}s")
+        self.state["corpus_built_by"] = experiment["name"]
+        self.state.setdefault("results", {}).setdefault(experiment["name"], {})["seconds_per_doc"] = seconds_per_doc
+        self.save_state()
+
+    # ── step 4: probes ─────────────────────────────────────────────────────
+
+    def _load_probe_items(self, relative: str) -> list[dict[str, Any]]:
+        path = self.root / relative
+        text = self.ops.read_text(path)
+        items: list[dict[str, Any]] = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise StepError(f"{path}:{lineno}: invalid JSONL: {exc}")
+            if not isinstance(parsed, dict) or "question" not in parsed:
+                raise StepError(f"{path}:{lineno}: probe line needs at least a question")
+            items.append(parsed)
+        if not items:
+            raise StepError(f"{path}: no probe items")
+        return items
+
+    def _ask(self, item: dict[str, Any]) -> tuple[str, float]:
+        messages = [
+            {"role": str(turn.get("role") or "user"), "content": str(turn.get("content") or "")}
+            for turn in (item.get("history") or [])
+        ]
+        messages.append({"role": "user", "content": str(item.get("question") or "")})
+        payload = {"model": "lightrag:latest", "stream": False, "messages": messages}
+        started = self.ops.now()
+        status, body = self.ops.http_json("POST", f"{GATEWAY_URL}/api/chat", payload=payload, timeout=PROBE_TIMEOUT)
+        latency = round(self.ops.now() - started, 2)
+        if status >= 400:
+            raise RuntimeError(f"/api/chat returned HTTP {status}")
+        answer = (body.get("message") or {}).get("content")
+        if answer is None:
+            raise RuntimeError("/api/chat response has no message.content")
+        return str(answer), latency
+
+    def _run_set(self, items: list[dict[str, Any]], concurrency: int) -> list[dict[str, Any]]:
+        results: list[dict[str, Any] | None] = [None] * len(items)
+        cursor = [0]
+        lock = threading.Lock()
+
+        def worker_thread() -> None:
+            while True:
+                with lock:
+                    index = cursor[0]
+                    if index >= len(items):
+                        return
+                    cursor[0] += 1
+                item = items[index]
+                row = {
+                    "id": item.get("id"),
+                    "type": item.get("type"),
+                    "question": item.get("question"),
+                    "answer": "",
+                    "latency": 0.0,
+                    "error": None,
+                }
+                try:
+                    answer, latency = self._attempt(
+                        lambda: self._ask(item), what=f"probe {item.get('id')}", attempts=2
+                    )
+                    row["answer"], row["latency"] = answer, latency
+                except StepError as exc:
+                    row["error"] = str(exc)
+                results[index] = row
+                self.heartbeat()
+
+        threads = [threading.Thread(target=worker_thread) for _ in range(max(1, int(concurrency)))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return [row for row in results if row is not None]
+
+    # ── step 5: judge ──────────────────────────────────────────────────────
+
+    def _judge_one(self, item: dict[str, Any], answer: str) -> dict[str, str]:
+        prompt = JUDGE_PROMPT.format(
+            question=item.get("question") or "",
+            expected_answer=item.get("expected_answer") or "",
+            evidence=item.get("evidence") or "",
+            answer=answer,
+        )
+        payload = {
+            "model": JUDGE_MODEL,
+            "temperature": 0,
+            "max_tokens": 400,
+            "stream": False,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        status, body = self.ops.http_json(
+            "POST", JUDGE_URL,
+            headers={"Authorization": f"Bearer {self.judge_key}"},
+            payload=payload,
+            timeout=180,
+        )
+        if status >= 400:
+            raise RuntimeError(f"judge returned HTTP {status}")
+        choices = body.get("choices") or [{}]
+        content = ((choices[0] or {}).get("message") or {}).get("content")
+        verdict = parse_verdict(content)
+        if verdict is None:
+            raise RuntimeError("judge reply unparsable")
+        return verdict
+
+    def _judge_set(self, items: list[dict[str, Any]], results: list[dict[str, Any]]) -> list[str]:
+        verdicts: list[str] = []
+        for item, row in zip(items, results):
+            if row.get("error"):
+                verdicts.append(JUDGE_ERROR)
+                continue
+            try:
+                verdict = self._attempt(
+                    lambda i=item, r=row: self._judge_one(i, r["answer"]),
+                    what=f"judge {item.get('id')}",
+                    attempts=2,
+                )
+                verdicts.append(verdict["verdict"])
+            except StepError:
+                verdicts.append(JUDGE_ERROR)
+        return verdicts
+
+    # ── step 6: record ─────────────────────────────────────────────────────
+
+    RESULTS_HEADER = (
+        "| experiment | status | dev correct% | dev correct+0.5*partial% | heldout correct% "
+        "| heldout correct+0.5*partial% | heldout halluc% | refusal acc% | p50 s | p95 s | judge errors |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|\n"
+    )
+
+    def _ensure_results_header(self) -> None:
+        if not Path(self.results_path).exists():
+            self.ops.write_text_atomic(
+                self.results_path,
+                "# Overnight loop results\n\n" + self.RESULTS_HEADER,
+            )
+
+    def _record(
+        self,
+        experiment: dict[str, Any],
+        set_name: str,
+        items: list[dict[str, Any]],
+        rows: list[dict[str, Any]],
+        verdicts: list[str],
+    ) -> None:
+        exp_dir = self.out / experiment["name"]
+        answers = [
+            {"set": set_name, **{key: row.get(key) for key in ("id", "type", "question", "answer", "latency", "error")}}
+            for row in rows
+        ]
+        judged = [
+            {"set": set_name, "id": item.get("id"), "type": item.get("type"), "verdict": verdict}
+            for item, verdict in zip(items, verdicts)
+        ]
+        self.ops.append_text(
+            exp_dir / "answers.jsonl", "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in answers)
+        )
+        self.ops.append_text(
+            exp_dir / "verdicts.jsonl", "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in judged)
+        )
+
+    def _run_experiment(self, experiment: dict[str, Any]) -> dict[str, Any]:
+        name = experiment["name"]
+        self.log(f"{name}: start (reingest={experiment['reingest']}, concurrency={experiment['probe_concurrency']})")
+        set_values = self._apply_env(experiment)
+        self.save_state()
+        self._restart_server()
+        self._wait_healthy()
+        self._verify_env(set_values)
+        if experiment["reingest"]:
+            self._reingest(experiment)
+
+        dev_items = self._load_probe_items(DEV_PROBE_FILE)
+        heldout_items = self._load_probe_items(HELDOUT_PROBE_FILE)
+        dev_rows = self._run_set(dev_items, experiment["probe_concurrency"])
+        dev_verdicts = self._judge_set(dev_items, dev_rows)
+        self._record(experiment, "dev", dev_items, dev_rows, dev_verdicts)
+        heldout_rows = self._run_set(heldout_items, experiment["probe_concurrency"])
+        heldout_verdicts = self._judge_set(heldout_items, heldout_rows)
+        self._record(experiment, "heldout", heldout_items, heldout_rows, heldout_verdicts)
+
+        latencies = [row["latency"] for row in dev_rows + heldout_rows if not row.get("error")]
+        summary = {
+            "dev": score_set(dev_items, dev_verdicts, [row["latency"] for row in dev_rows]),
+            "heldout": score_set(heldout_items, heldout_verdicts, [row["latency"] for row in heldout_rows]),
+            "all_latencies_p50": percentile(latencies, 0.5),
+            "all_latencies_p95": percentile(latencies, 0.95),
+            "probe_errors": sum(1 for row in dev_rows + heldout_rows if row.get("error")),
+            "reingest": experiment["reingest"],
+            "env": set_values,
+        }
+        self.ops.write_json_atomic(self.out / name / "summary.json", summary)
+
+        stored = self.state.setdefault("results", {}).setdefault(name, {})
+        stored.update({
+            "dev_correct_pct": summary["dev"]["correct_pct"],
+            "dev_partial_credit_pct": summary["dev"]["partial_credit_pct"],
+            "heldout_correct_pct": summary["heldout"]["correct_pct"],
+            "heldout_partial_credit_pct": summary["heldout"]["partial_credit_pct"],
+            "heldout_hallucination_pct": summary["heldout"]["hallucination_pct"],
+            "refusal_accuracy_pct": summary["heldout"]["refusal_accuracy_pct"],
+            "latency_p50": summary["all_latencies_p50"],
+            "latency_p95": summary["all_latencies_p95"],
+            "judge_errors": summary["dev"]["judge_errors"] + summary["heldout"]["judge_errors"],
+            "env": set_values,
+        })
+        self._ensure_results_header()
+        heldout, dev = summary["heldout"], summary["dev"]
+        self.ops.append_text(
+            self.results_path,
+            "| {name} | done | {dc} | {dp} | {hc} | {hp} | {hh} | {ra} | {p50} | {p95} | {je} |\n".format(
+                name=name,
+                dc=dev["correct_pct"],
+                dp=dev["partial_credit_pct"],
+                hc=heldout["correct_pct"],
+                hp=heldout["partial_credit_pct"],
+                hh=heldout["hallucination_pct"],
+                ra=heldout["refusal_accuracy_pct"] if heldout["refusal_accuracy_pct"] is not None else "n/a",
+                p50=summary["all_latencies_p50"],
+                p95=summary["all_latencies_p95"],
+                je=heldout["judge_errors"] + dev["judge_errors"],
+            ),
+        )
+        self.log(
+            f"{name}: dev correct {dev['correct_pct']}% (+0.5p {dev['partial_credit_pct']}%), "
+            f"heldout correct {heldout['correct_pct']}%, halluc {heldout['hallucination_pct']}%, "
+            f"refusal {heldout['refusal_accuracy_pct']}"
+        )
+        self.save_state()
+        return summary
+
+    # ── run control ────────────────────────────────────────────────────────
+
+    def _prepare(self) -> None:
+        self.ops.write_text_atomic(self.heartbeat_path, "")  # creates out/
+        current = self.ops.read_text(self.real_env_path)
+        if self.env_original_path.exists():
+            # --resume: .env may currently hold experiment values; env.original
+            # is the authority for what production looked like before the run.
+            self.original_env_text = self.ops.read_text(self.env_original_path)
+            self.changed_keys = set(self.state.get("changed_keys") or [])
+        else:
+            self.original_env_text = current
+            self.ops.write_text_atomic(self.env_original_path, current, mode=0o600)
+            self.log(f"backed up .env to {self.env_original_path} (chmod 600)")
+        if self.dry_run:
+            self.ops.write_text_atomic(self.env_path, self.original_env_text)
+
+    def _run_experiments(self) -> None:
+        consecutive_errors = 0
+        for experiment in self.config["experiments"]:
+            name = experiment["name"]
+            record = self.state["experiments"].get(name)
+            if self.resume and record and record.get("status") in ("done", "error"):
+                self.log(f"{name}: already {record['status']} in state.json; skipping (--resume)")
+                continue
+            if self.ops.now() > self.deadline:
+                self.state["stop_reason"] = "time_budget"
+                self.log(f"max-hours {self.max_hours} reached; not starting {name}")
+                return
+            self._check_abort()
+            record = self.state["experiments"].setdefault(name, {"status": "pending"})
+            self.state["current"] = name
+            record["status"] = "running"
+            self.save_state()
+            self.heartbeat()
+            try:
+                self._ensure_services()
+                summary = self._run_experiment(experiment)
+                record["status"] = "done"
+                record.pop("error", None)
+                consecutive_errors = 0
+                if meets_success(summary["heldout"]):
+                    self.state["status"] = "success"
+                    self.state["stop_reason"] = f"success in {name}"
+                    self.log(f"{name}: SUCCESS thresholds met; skipping the remaining experiments")
+                    self.save_state()
+                    return
+            except FatalRun as exc:
+                record["status"] = "error"
+                record["error"] = str(exc)
+                self.state["status"] = "aborted"
+                self.state["stop_reason"] = "fatal"
+                self.log(f"{name}: FATAL, stopping the run: {exc}")
+                self.save_state()
+                return
+            except StepError as exc:
+                record["status"] = "error"
+                record["error"] = str(exc)
+                consecutive_errors += 1
+                self.log(f"{name}: experiment error ({consecutive_errors} consecutive): {exc}")
+                if consecutive_errors >= 3:
+                    self.state["stop_reason"] = "three_consecutive_errors"
+                    self.log("3 consecutive experiment errors; stopping the run")
+                    self.save_state()
+                    return
+            self.save_state()
+
+    def run(self) -> int:
+        self._install_signals()
+        self.load_state()
+        self.start_time = self.ops.now()
+        self.deadline = self.start_time + self.max_hours * 3600
+        self.hard_deadline = self.deadline + HARD_ABORT_GRACE
+        exit_code = 0
+        try:
+            self._prepare()
+            self._run_experiments()
+            if self.state.get("status") == "running":
+                self.state["status"] = "complete"
+        except FatalRun as exc:
+            self.log(f"run aborted: {exc}")
+            self.state["status"] = "aborted"
+            self.state["stop_reason"] = str(exc)
+            exit_code = 1
+        except Exception as exc:  # never leave the stack in an experiment config
+            self.log(f"unexpected error: {type(exc).__name__}: {exc}")
+            self.state["status"] = "fatal"
+            self.state["stop_reason"] = f"{type(exc).__name__}: {exc}"
+            exit_code = 2
+        finally:
+            self._finalise()
+            self._write_recommendation()
+            self.heartbeat()
+        return exit_code
+
+    # ── finalise ───────────────────────────────────────────────────────────
+
+    def _finalise(self) -> None:
+        try:
+            if self.changed_keys:
+                self.ops.write_text_atomic(self.env_path, self.original_env_text)
+                self.log(f"env restored from {self.env_original_path.name} ({len(self.changed_keys)} key(s) reverted)")
+                self._restart_server()
+                self._wait_healthy()
+            else:
+                self.log("no env keys were changed; nothing to restore")
+        except Exception as exc:  # finalise must never raise
+            self.log(f"FINALISE FAILED (restore by hand from {self.env_original_path}): {exc}")
+        self.save_state()
+
+    def _best_experiment(self) -> tuple[str | None, dict[str, Any]]:
+        results = self.state.get("results") or {}
+        ranked = sorted(
+            ((name, values) for name, values in results.items() if "dev_partial_credit_pct" in values),
+            key=lambda entry: (entry[1]["dev_partial_credit_pct"], -entry[1].get("latency_p95", 0.0)),
+            reverse=True,
+        )
+        return ranked[0] if ranked else (None, {})
+
+    def _write_recommendation(self) -> None:
+        baseline = self.config.get("baseline_env") or {}
+        best_name, best = self._best_experiment()
+        self._ensure_results_header()
+        lines = [
+            "\n## Final state\n",
+            f"- run status: **{self.state.get('status')}**"
+            + (f" ({self.state.get('stop_reason')})" if self.state.get("stop_reason") else ""),
+            f"- current corpus built by: **{self.state.get('corpus_built_by') or 'no reingest ran'}**",
+        ]
+        if best_name:
+            diff = {
+                key: value
+                for key, value in (best.get("env") or {}).items()
+                if str(baseline.get(key)) != str(value)
+            }
+            lines.append(f"- best experiment by dev correct+0.5*partial%: **{best_name}** "
+                         f"({best.get('dev_partial_credit_pct')}%, p95 {best.get('latency_p95')} s)")
+            if diff:
+                lines.append("- recommended env diff (NOT applied — apply by hand if you agree):")
+                lines.extend(f"  - `{key}={value}`" for key, value in sorted(diff.items()))
+            else:
+                lines.append("- best experiment used the baseline env; no change recommended")
+        else:
+            lines.append("- no experiment produced a score; nothing to recommend")
+        self.ops.append_text(self.results_path, "\n".join(lines) + "\n")
+        self.print_fn("\n".join(lines))
+
+
+def build_plan_lines(config: dict[str, Any]) -> list[str]:
+    """Human-readable plan, used by --dry-run and at the start of a real run."""
+    lines = ["plan:"]
+    for index, experiment in enumerate(config["experiments"], 1):
+        env = ", ".join(f"{k}={v}" for k, v in sorted(experiment["env"].items())) or "(baseline only)"
+        lines.append(
+            f"  {index}. {experiment['name']}: env[{env}] reingest={experiment['reingest']} "
+            f"probe_concurrency={experiment['probe_concurrency']}"
+        )
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Unattended overnight accuracy-loop driver")
+    parser.add_argument("--root", required=True, help="project root on the Thinkpad (~/rag-project)")
+    parser.add_argument("--experiments", required=True, help="path to experiments.json")
+    parser.add_argument("--out", required=True, help="output/state directory")
+    parser.add_argument("--max-hours", type=float, default=11.0, help="stop starting experiments after this many hours")
+    parser.add_argument("--dry-run", action="store_true", help="run the plan against a fake Ops; touches nothing real")
+    parser.add_argument("--resume", action="store_true", help="skip experiments already done/error in state.json")
+    arguments = parser.parse_args(argv)
+
+    try:
+        config = load_experiments(Path(arguments.experiments))
+    except LoopConfigError as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 3
+
+    ops: Ops = DryRunOps() if arguments.dry_run else Ops()
+    loop = Loop(
+        root=Path(arguments.root).expanduser(),
+        out=Path(arguments.out).expanduser(),
+        config=config,
+        ops=ops,
+        max_hours=arguments.max_hours,
+        dry_run=arguments.dry_run,
+        resume=arguments.resume,
+    )
+    for line in build_plan_lines(config):
+        loop.log(line)
+    if arguments.dry_run:
+        loop.log(f"dry run: max_hours={arguments.max_hours}")
+    return loop.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
