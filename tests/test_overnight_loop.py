@@ -8,12 +8,21 @@ byte-preservation behaviour is exactly what is under test.
 
 from __future__ import annotations
 
+import ast
+import builtins
+import dis
 import io
 import json
+import os
+import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -655,6 +664,522 @@ class TestLightRagApiKey(_Case):
         self.assertNotIn(self.KEY, state["experiments"]["E1"]["error"])
         self.assertNotIn(self.KEY, (self.out / "loop.log").read_text(encoding="utf-8"))
         self.assertNotIn(self.KEY, json.dumps(state))
+
+
+# ── static integrity: no undefined names (packet-30) ────────────────────────
+
+class TestStaticIntegrity(unittest.TestCase):
+    """The fake-Ops tests never execute Ops.run, so a missing import crashed the
+    first real run. This catches undefined names statically."""
+
+    MODULE_PATH = ROOT_DIR / "scripts" / "overnight_loop.py"
+    ALLOWED = {"__name__", "__file__", "__module__", "__doc__", "__builtins__"}
+
+    def _module_level_names(self, tree: ast.Module) -> set[str]:
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    names.update(n.id for n in ast.walk(target) if isinstance(n, ast.Name))
+            elif isinstance(node, ast.TypeAlias):
+                names.add(node.name.id)
+        return names
+
+    def test_no_undefined_names(self):
+        source = self.MODULE_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(self.MODULE_PATH))
+        defined = self._module_level_names(tree) | self.ALLOWED
+        code = compile(tree, str(self.MODULE_PATH), "exec")
+        undefined: dict[str, list[str]] = {}
+
+        def walk(co, scope):
+            for instr in dis.get_instructions(co):
+                # Functions/classes load globals by name; the module body (and
+                # class bodies) use LOAD_NAME for both.
+                if instr.opname == "LOAD_GLOBAL" or (
+                    co.co_name == "<module>" and instr.opname == "LOAD_NAME"
+                ):
+                    name = instr.argval
+                    if name in defined or hasattr(builtins, name):
+                        continue
+                    undefined.setdefault(name, []).append(scope)
+            for const in co.co_consts:
+                if hasattr(const, "co_name"):
+                    walk(const, f"{scope}.{const.co_name}")
+
+        walk(code, "<module>")
+        self.assertEqual(undefined, {}, f"undefined names: {undefined}")
+
+    def test_names_used_in_annotations_are_defined(self):
+        """`from __future__ import annotations` hides these from the bytecode."""
+        source = self.MODULE_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(self.MODULE_PATH))
+        defined = self._module_level_names(tree) | self.ALLOWED
+        annotations = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.arg) and node.annotation is not None:
+                annotations.append(node.annotation)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+                annotations.append(node.returns)
+            elif isinstance(node, ast.AnnAssign):
+                annotations.append(node.annotation)
+        used = {n.id for ann in annotations for n in ast.walk(ann) if isinstance(n, ast.Name)}
+        missing = sorted(name for name in used if name not in defined and not hasattr(builtins, name))
+        self.assertEqual(missing, [], f"annotation names not defined: {missing}")
+
+
+# ── a stub HTTP service used by the real-path tests ────────────────────────
+
+class _RawBody:
+    """Force the stub to answer with a non-JSON body."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _StubHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):  # keep the test output clean
+        pass
+
+    def _respond(self, method: str) -> None:
+        stub = self.server.stub
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        record = {
+            "method": method,
+            "path": self.path,
+            "headers": {key.lower(): value for key, value in self.headers.items()},
+            "body": raw,
+        }
+        stub.records.append(record)
+        status, payload = stub.routes.get((method, self.path)) or stub.routes.get((method, "*")) or (
+            404,
+            {"error": f"no stub route for {method} {self.path}"},
+        )
+        if isinstance(payload, _RawBody):
+            body = payload.text.encode("utf-8")
+            content_type = "text/plain"
+        else:
+            body = json.dumps(payload).encode("utf-8")
+            content_type = "application/json"
+        self.send_response(status)
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._respond("GET")
+
+    def do_POST(self):
+        self._respond("POST")
+
+    def do_DELETE(self):
+        self._respond("DELETE")
+
+
+class _StubServer:
+    """stdlib ThreadingHTTPServer on an ephemeral port, with recorded requests."""
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+        self.routes: dict[tuple[str, str], tuple[int, object]] = {}
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        self._httpd.stub = self
+        self._thread = threading.Thread(target=self._httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self._httpd.server_address[1]}"
+
+    def calls(self, method: str, path: str | None = None) -> list[dict]:
+        return [
+            record
+            for record in self.records
+            if record["method"] == method and (path is None or record["path"] == path)
+        ]
+
+
+# ── real Ops, no fakes (packet-30) ──────────────────────────────────────
+
+class TestRealOps(unittest.TestCase):
+    def setUp(self):
+        self.ops = ol.Ops()
+        self.stub = _StubServer()
+        self.stub.routes = {
+            ("GET", "/thing"): (200, {"ok": True}),
+            ("POST", "/thing"): (201, {"created": True}),
+            ("DELETE", "/thing"): (200, {"deleted": True}),
+            ("GET", "/missing"): (404, {"error": "nope"}),
+            ("GET", "/broken"): (500, {"error": "boom"}),
+            ("GET", "/plain"): (200, {"note": "see headers"}),
+        }
+        self.stub.start()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.stub.stop()
+
+    # ── subprocess ────────────────────────────────────────────────────────
+
+    def test_run_returns_stdout_and_empty_stderr(self):
+        self.assertEqual(self.ops.run(["echo", "hi"]), (0, "hi\n", ""))
+
+    def test_run_reports_failure_returncode(self):
+        code, _out, err = self.ops.run(["sh", "-c", "echo bad >&2; exit 7"])
+        self.assertEqual(code, 7)
+        self.assertEqual(err.strip(), "bad")
+
+    def test_run_nonexistent_command_returns_127_without_raising(self):
+        code, _out, err = self.ops.run(["definitely-not-a-command-xyz", "arg"])
+        self.assertEqual(code, 127)
+        self.assertIn("command not found", err)
+
+    def test_run_timeout_returns_124_without_raising(self):
+        code, _out, err = self.ops.run(["sleep", "5"], timeout=0.2)
+        self.assertEqual(code, 124)
+        self.assertIn("timed out", err)
+
+    # ── http ───────────────────────────────────────────────────────────────
+
+    def test_http_json_get_sends_headers_and_parses_json(self):
+        status, body = self.ops.http_json(
+            "GET", f"{self.stub.base}/thing", headers={"X-API-Key": "k1"}, timeout=10
+        )
+        self.assertEqual((status, body), (200, {"ok": True}))
+        record = self.stub.calls("GET", "/thing")[-1]
+        self.assertEqual(record["headers"]["x-api-key"], "k1")
+
+    def test_http_json_post_sends_json_body_and_content_type(self):
+        status, body = self.ops.http_json(
+            "POST", f"{self.stub.base}/thing", payload={"text": "hello", "n": 2}, timeout=10
+        )
+        self.assertEqual((status, body), (201, {"created": True}))
+        record = self.stub.calls("POST", "/thing")[-1]
+        self.assertEqual(record["headers"]["content-type"], "application/json")
+        self.assertEqual(json.loads(record["body"]), {"text": "hello", "n": 2})
+
+    def test_http_json_delete_uses_the_delete_method(self):
+        status, body = self.ops.http_json("DELETE", f"{self.stub.base}/thing", timeout=10)
+        self.assertEqual((status, body), (200, {"deleted": True}))
+        self.assertEqual(len(self.stub.calls("DELETE", "/thing")), 1)
+
+    def test_http_json_returns_non_200_codes_as_values(self):
+        for path, expected in (("/missing", 404), ("/broken", 500)):
+            status, body = self.ops.http_json("GET", f"{self.stub.base}{path}", timeout=10)
+            self.assertEqual(status, expected)
+            self.assertIn("error", body)
+
+    def test_http_json_unparsable_body_comes_back_raw(self):
+        self.stub.routes[("GET", "/notjson")] = (200, _RawBody("<html>gateway error</html>"))
+        status, body = self.ops.http_json("GET", f"{self.stub.base}/notjson", timeout=10)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"raw": "<html>gateway error</html>"})
+
+    def test_http_json_connection_refused_raises(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        with self.assertRaises(urllib.error.URLError):
+            self.ops.http_json("GET", f"http://127.0.0.1:{port}/health", timeout=5)
+
+    # ── files, clock ───────────────────────────────────────────────────────
+
+    def test_read_text_and_write_text_atomic_roundtrip(self):
+        target = self.root / "nested" / "file.txt"
+        self.ops.write_text_atomic(target, "first\n")
+        self.assertEqual(self.ops.read_text(target), "first\n")
+        self.ops.write_text_atomic(target, "second\n")
+        self.assertEqual(self.ops.read_text(target), "second\n")
+        self.assertEqual(list(target.parent.glob("*.tmp")), [])
+
+    def test_write_text_atomic_applies_mode(self):
+        target = self.root / "secret.env"
+        self.ops.write_text_atomic(target, "a=b\n", mode=0o600)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_atomic_writes_to_one_path_do_not_race(self):
+        """A shared '<name>.tmp' let one thread rename the file out from under
+        another, which killed probe threads calling heartbeat()."""
+        target = self.root / "heartbeat"
+        errors: list[str] = []
+
+        def writer() -> None:
+            for _ in range(40):
+                try:
+                    self.ops.write_text_atomic(target, "tick\n")
+                except Exception as exc:  # pragma: no cover - the bug under test
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=writer) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.ops.read_text(target), "tick\n")
+
+    def test_sleep_and_clock_are_callable_and_real(self):
+        self.assertIsNone(self.ops.sleep(0))
+        self.assertIsNone(self.ops.sleep(-1))  # clamped, never negative
+        first = self.ops.now()
+        self.ops.sleep(0.01)
+        self.assertGreaterEqual(self.ops.now(), first)
+
+
+# ── end-to-end with the REAL Ops: fake docker on PATH + stub services ──────
+
+FAKE_DOCKER = """#!/usr/bin/env bash
+# Records its arguments, then answers the three subcommands overnight_loop uses.
+echo "$*" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  ps)   echo "lightrag-server"; echo "rag-gateway-api"; exit 0;;
+  compose) exit 0;;
+  exec)
+    if [ "$2" = "lightrag-server" ] && [ "$3" = "env" ]; then
+      grep -E '^[A-Z_][A-Z0-9_]*=' "$FAKE_DOCKER_ENV_FILE"
+      exit 0
+    fi
+    exit 1;;
+esac
+exit 0
+"""
+
+E2E_ENV = (
+    "RAG_API_KEY=gw-secret-do-not-log\n"
+    "LIGHTRAG_API_KEY=lightrag-secret-do-not-log\n"
+    "MAX_ASYNC=1\n"
+    "CHUNK_SIZE=1200\n"
+    "# a comment line that must survive\n"
+    "LLM_MODEL=qwen3.6-35b\n"
+)
+
+
+class _FastOps(ol.Ops):
+    """Real Ops; only sleeping is shortened."""
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(0)
+
+
+class TestEndToEndRealOps(unittest.TestCase):
+    """No fake Ops here: real subprocess calls to a fake docker on PATH, real
+    HTTP to a stub server, real files. The fake docker prints the current .env,
+    so container-env verification is exercised for real too."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "rag-project"
+        self.out = self.root / "probe" / "loop"
+        self.root.mkdir(parents=True)
+
+        (self.root / ".env").write_text(E2E_ENV, encoding="utf-8")
+        (self.root / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+        probe = self.root / "probe"
+        probe.mkdir(parents=True, exist_ok=True)
+        dev = [
+            {"id": "d1", "question": "Who is in Paris?", "expected_answer": "Marie", "evidence": "Marie is in Paris", "type": "single-fact",
+             "history": [{"role": "user", "content": "Earlier context"}, {"role": "assistant", "content": "Noted."}]},
+            {"id": "d2", "question": "Board decision?", "expected_answer": "fund phase 2", "evidence": "the board funded phase 2", "type": "multi-fact"},
+            {"id": "d3", "question": "Anything about Mars?", "expected_answer": "not in the documents", "evidence": "", "type": "unanswerable"},
+        ]
+        heldout = [
+            {"id": "h1", "question": "Where is the office?", "expected_answer": "Brussels", "evidence": "the office is in Brussels", "type": "single-fact"},
+            {"id": "h2", "question": "Anything about the moon?", "expected_answer": "not in the documents", "evidence": "", "type": "unanswerable"},
+        ]
+        (probe / "solvay-dev-v1.jsonl").write_text(_jsonl(dev), encoding="utf-8")
+        (probe / "solvay-heldout-v1.jsonl").write_text(_jsonl(heldout), encoding="utf-8")
+
+        corpus_dir = self.root / "corpus"
+        corpus_dir.mkdir()
+        transcript = corpus_dir / "t1.txt"
+        transcript.write_text("transcript one: Marie is in Paris\n", encoding="utf-8")
+        (probe / "loop_corpus.json").write_text(json.dumps([str(transcript)]), encoding="utf-8")
+
+        # fake docker, first on PATH
+        bin_dir = Path(self.tmp.name) / "bin"
+        bin_dir.mkdir()
+        docker = bin_dir / "docker"
+        docker.write_text(FAKE_DOCKER, encoding="utf-8")
+        docker.chmod(0o755)
+        self.docker_log = bin_dir / "docker.calls"
+        self.environ_backup = dict(os.environ)
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        os.environ["FAKE_DOCKER_LOG"] = str(self.docker_log)
+        os.environ["FAKE_DOCKER_ENV_FILE"] = str(self.root / ".env")
+        self.addCleanup(self._restore_env)
+
+        self.stub = _StubServer()
+        self.stub.routes = {
+            ("GET", "/health"): (200, {"status": "healthy"}),
+            ("DELETE", "/documents"): (200, {"status": "cleared"}),
+            ("GET", "/documents/status_counts"): (200, {"counts": {"processing": 0, "pending": 0, "processed": 0}}),
+            ("POST", "/documents/text"): (200, {"track_id": "tr1"}),
+            ("GET", "/documents/track_status/tr1"): (200, {"documents": [{"status": "processed"}]}),
+            ("POST", "/api/chat"): (200, {"message": {"content": "stub answer from the stack"}}),
+            ("GET", "/v1/models"): (200, {"data": [{"id": "qwen3.6-35b"}]}),
+            ("POST", "/v1/chat/completions"): (
+                200,
+                {"choices": [{"message": {"content": '{"verdict": "correct", "reason": "stub judge"}'}}]},
+            ),
+        }
+        self.stub.start()
+        self.addCleanup(self.stub.stop)
+
+        self.url_backup = {name: getattr(ol, name) for name in ("LIGHTRAG_URL", "GATEWAY_URL", "JUDGE_URL", "SIGMA_URL")}
+        ol.LIGHTRAG_URL = self.stub.base
+        ol.GATEWAY_URL = self.stub.base
+        ol.JUDGE_URL = f"{self.stub.base}/v1/chat/completions"
+        ol.SIGMA_URL = f"{self.stub.base}/v1/models"
+        self.addCleanup(self._restore_urls)
+
+        self.dev_items, self.heldout_items = dev, heldout
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self.environ_backup)
+
+    def _restore_urls(self):
+        for name, value in self.url_backup.items():
+            setattr(ol, name, value)
+
+    def _config_path(self) -> Path:
+        path = Path(self.tmp.name) / "experiments.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "baseline_env": {"MAX_ASYNC": "1"},
+                    "experiments": [
+                        {"name": "E1-reingest", "env": {"CHUNK_SIZE": "1200"}, "reingest": True, "probe_concurrency": 2},
+                        {"name": "E2-probes", "env": {"CHUNK_SIZE": "800", "MAX_ASYNC": "4"}, "reingest": False, "probe_concurrency": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_full_run_with_real_ops(self):
+        config = ol.load_experiments(self._config_path())
+        loop = ol.Loop(
+            root=self.root,
+            out=self.out,
+            config=config,
+            ops=_FastOps(),
+            max_hours=1.0,
+            handle_signals=False,
+            print_fn=lambda line: None,
+        )
+        self.assertEqual(loop.run(), 0)
+
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["experiments"]["E1-reingest"]["status"], "done")
+        self.assertEqual(state["experiments"]["E2-probes"]["status"], "done")
+        self.assertEqual(state["corpus_built_by"], "E1-reingest")
+
+        results = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertEqual(len([line for line in results.splitlines() if line.startswith("| E")]), 2)
+        self.assertIn("## Final state", results)
+
+        # production .env is back exactly as it was, and the backup is private
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
+        original = self.out / "env.original"
+        self.assertEqual(original.read_text(encoding="utf-8"), E2E_ENV)
+        self.assertEqual(original.stat().st_mode & 0o777, 0o600)
+
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertNotIn("gw-secret-do-not-log", log)
+        self.assertNotIn("lightrag-secret-do-not-log", log)
+
+        # real subprocess path: compose recreations (E1, E2, finalise) and env reads
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        ups = [line for line in calls if line.startswith("compose -f") and "up -d --no-deps lightrag-server" in line]
+        self.assertEqual(len(ups), 3)
+        self.assertEqual([line for line in calls if line == "ps --format {{.Names}}"], ["ps --format {{.Names}}"])
+        self.assertEqual(len([line for line in calls if line == "exec lightrag-server env"]), 2)
+
+        # reingest happened over real HTTP, with the key from .env
+        cleared = self.stub.calls("DELETE", "/documents")
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(cleared[0]["headers"].get("x-api-key"), "lightrag-secret-do-not-log")
+        inserted = self.stub.calls("POST", "/documents/text")
+        self.assertEqual(len(inserted), 1)
+        payload = json.loads(inserted[0]["body"])
+        self.assertEqual(payload["file_source"], str(self.root / "corpus" / "t1.txt"))
+        self.assertIn("Marie is in Paris", payload["text"])
+        self.assertTrue(self.stub.calls("GET", "/documents/track_status/tr1"))
+
+        # probes went through the gateway: history first, question last
+        asks = self.stub.calls("POST", "/api/chat")
+        self.assertEqual(len(asks), 10)  # 2 experiments x (3 dev + 2 heldout)
+        bodies = [json.loads(record["body"]) for record in asks]
+        self.assertEqual({body["model"] for body in bodies}, {"lightrag:latest"})
+        self.assertEqual({body["stream"] for body in bodies}, {False})
+        by_question = {body["messages"][-1]["content"]: body for body in bodies}
+        self.assertEqual(
+            set(by_question),
+            {item["question"] for item in self.dev_items} | {item["question"] for item in self.heldout_items},
+        )
+        paris = by_question["Who is in Paris?"]
+        self.assertEqual([turn["role"] for turn in paris["messages"]], ["user", "assistant", "user"])
+        self.assertEqual(paris["messages"][0]["content"], "Earlier context")
+
+        # every probe was judged, graded against the item's own evidence
+        judged = self.stub.calls("POST", "/v1/chat/completions")
+        self.assertEqual(len(judged), 10)
+        prompts = [json.loads(record["body"])["messages"][0]["content"] for record in judged]
+        self.assertTrue(any("Marie is in Paris" in prompt for prompt in prompts))
+        self.assertTrue(all(json.loads(record["body"])["model"] == ol.JUDGE_MODEL for record in judged))
+
+        for name in ("E1-reingest", "E2-probes"):
+            summary = json.loads((self.out / name / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["dev"]["correct_pct"], 100.0)
+            self.assertEqual(summary["heldout"]["correct_pct"], 100.0)
+            self.assertEqual(summary["probe_errors"], 0)
+            self.assertEqual(len((self.out / name / "answers.jsonl").read_text(encoding="utf-8").splitlines()), 5)
+            self.assertEqual(len((self.out / name / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()), 5)
+
+    def test_resume_after_a_first_run_skips_finished_experiments(self):
+        config = ol.load_experiments(self._config_path())
+        first = ol.Loop(root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+                        handle_signals=False, print_fn=lambda line: None)
+        self.assertEqual(first.run(), 0)
+        docker_calls_before = len(self.docker_log.read_text(encoding="utf-8").splitlines())
+        asks_before = len(self.stub.calls("POST", "/api/chat"))
+
+        resumed = ol.Loop(root=self.root, out=self.out, config=ol.load_experiments(self._config_path()),
+                          ops=_FastOps(), max_hours=1.0, resume=True, handle_signals=False,
+                          print_fn=lambda line: None)
+        self.assertEqual(resumed.run(), 0)
+        self.assertEqual(len(self.stub.calls("POST", "/api/chat")), asks_before)
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("E1-reingest: already done in state.json; skipping (--resume)", log)
+        self.assertIn("E2-probes: already done in state.json; skipping (--resume)", log)
+        self.assertLess(len(self.docker_log.read_text(encoding="utf-8").splitlines()), docker_calls_before + 3)
 
 
 if __name__ == "__main__":

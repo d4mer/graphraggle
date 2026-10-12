@@ -32,11 +32,13 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -442,7 +444,11 @@ class Ops:
     def write_text_atomic(self, path: Path, text: str, *, mode: int | None = None) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_name(path.name + ".tmp")
+        # The temp name must be unique per process AND thread: heartbeat() and
+        # state writes happen on probe threads, and a shared "<name>.tmp" lets one
+        # thread rename the file out from under another (FileNotFoundError in
+        # os.replace, which killed a probe thread).
+        temp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         temp.write_text(text, encoding="utf-8")
         if mode is not None:
             os.chmod(temp, mode)
@@ -490,13 +496,26 @@ class Ops:
         return status, body
 
     def run(self, argv: list[str], *, cwd: Path | None = None, timeout: float = 180.0) -> tuple[int, str, str]:
-        completed = subprocess.run(
-            argv,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        """Run a command and return (returncode, stdout, stderr).
+
+        A missing executable and a timeout come back as non-zero return codes
+        (127 and 124) rather than exceptions, so callers that already branch on
+        rc=0 treat them as failures instead of aborting the whole run.
+        """
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd) if cwd else None,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            return 127, "", f"command not found: {argv[0]}"
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {timeout}s: {' '.join(argv)}"
+        except OSError as exc:
+            return 126, "", f"failed to run {' '.join(argv)}: {exc}"
         return completed.returncode, completed.stdout, completed.stderr
 
 
