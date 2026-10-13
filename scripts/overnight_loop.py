@@ -177,6 +177,11 @@ JUDGE_ERROR = "judge_error"
 NO_ANSWER = "no_answer"
 EXCLUDED_VERDICTS = (JUDGE_ERROR, NO_ANSWER)
 
+# Judge rubric v2. v1 left refusals and paraphrase to the judge's taste and a
+# failure analysis of 165 graded answers found a correct refusal graded "wrong"
+# and a clean refusal graded "hallucinated" for naming a real-but-adjacent entity.
+# The rules below are asserted as text in tests/test_overnight_loop.py: if they
+# silently disappear the scores move for the wrong reason and nothing notices.
 JUDGE_PROMPT = """You are grading one answer from a document question-answering system.
 
 Question:
@@ -191,20 +196,34 @@ Evidence quote from the documents:
 System answer:
 {answer}
 
-Rules:
-- Judge ONLY against the evidence and the expected answer above. Never use outside knowledge.
-- If the expected answer says the information is not in the documents, then a clear
-  statement that the information is not available is refused_ok, and anything invented is
-  hallucinated.
-- correct: answers the question the way the evidence does.
-- partial: right direction but materially incomplete or imprecise.
-- wrong: contradicts the evidence, or answers a different question.
-- hallucinated: states something the evidence does not support.
-- refused_ok: declined to answer, and the evidence does not answer the question.
-- refused_wrong: declined to answer, but the evidence does answer the question.
+Rules (apply in this order, and name the rule that decided the verdict):
+1. Unanswerable question - the expected answer is "not in the documents": a clear
+   statement that the information is not available or not found in the provided
+   context is refused_ok, EVEN IF the answer names real entities or mentions
+   nearby facts, as long as it does not assert the requested fact itself. Verdict
+   hallucinated ONLY if the answer asserts a specific value, name, date or
+   decision that answers the question and is not supported by the evidence or the
+   expected answer.
+2. Answerable question - the expected answer is a real fact: accept paraphrase,
+   different wording, extra correct detail and a different order of the facts.
+   correct = every key fact in the expected answer is present and nothing
+   contradicts the evidence. partial = some key facts are present and none
+   contradict. wrong = key facts are missing or contradicted. A refusal ("not in
+   the documents") on an answerable question is refused_wrong, unless the question
+   is itself unanswerable from the evidence (then refused_ok).
+3. Speaker attribution: do not mark an answer wrong merely because it attributes a
+   statement to a different speaker label, or omits who said it, unless the
+   question explicitly asks who said it.
+4. Judge only against the evidence quote and the expected answer given, never
+   against outside knowledge. Extra detail that is not in the evidence is not an
+   error unless it contradicts the evidence.
+5. The "reason" must be ONE sentence and must name which rule decided it, for
+   example "rule1 clean refusal" or "rule2 all key facts present".
+
+Verdicts: correct, partial, wrong, hallucinated, refused_ok, refused_wrong.
 
 Reply with ONLY this JSON object and nothing else:
-{{"verdict": "correct|partial|wrong|hallucinated|refused_ok|refused_wrong", "reason": "<one sentence>"}}
+{{"verdict": "correct|partial|wrong|hallucinated|refused_ok|refused_wrong", "reason": "<one sentence naming the deciding rule>"}}
 """
 
 

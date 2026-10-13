@@ -2034,5 +2034,140 @@ class TestGatewayEnvExperiments(_E2EFixture, unittest.TestCase):
         self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
 
 
+# ── judge rubric v2: refusals, paraphrase, attribution (packet-34) ─────
+
+
+class TestJudgeRubricV2(unittest.TestCase):
+    """The rubric text itself is the contract.
+
+    A failure analysis of 165 graded answers found 2 of 9 "failures" were the
+    judge being wrong: a correct refusal graded wrong, and a clean refusal graded
+    hallucinated because it named a real-but-adjacent entity. Those rules are
+    asserted here as text, because if they quietly leave the prompt the scores
+    move for the wrong reason and no other test notices.
+    """
+
+    def setUp(self):
+        self.item = {
+            "id": "dev01",
+            "question": "Which retrieval system was chosen?",
+            "expected_answer": "LightRAG",
+            "evidence": "we settled on LightRAG for retrieval",
+        }
+        self.flat = " ".join(ol.JUDGE_PROMPT.split())
+
+    def test_rule_1_clean_refusals_and_the_hallucination_boundary(self):
+        for phrase in (
+            'the expected answer is "not in the documents"',
+            "a clear statement that the information is not available or not found in the provided context is refused_ok",
+            "EVEN IF the answer names real entities or mentions nearby facts",
+            "as long as it does not assert the requested fact itself",
+            "hallucinated ONLY if the answer asserts a specific value, name, date or decision",
+            "is not supported by the evidence or the expected answer",
+        ):
+            self.assertIn(phrase, self.flat, f"rule 1 lost: {phrase!r}")
+
+    def test_rule_2_paraphrase_tolerance_and_the_answerable_ladder(self):
+        for phrase in (
+            "accept paraphrase, different wording, extra correct detail and a different order of the facts",
+            "correct = every key fact in the expected answer is present and nothing contradicts the evidence",
+            "partial = some key facts are present and none contradict",
+            "wrong = key facts are missing or contradicted",
+            'refusal ("not in the documents") on an answerable question is refused_wrong',
+            "unless the question is itself unanswerable from the evidence (then refused_ok)",
+        ):
+            self.assertIn(phrase, self.flat, f"rule 2 lost: {phrase!r}")
+
+    def test_rule_3_speaker_attribution_is_not_a_failure_by_itself(self):
+        for phrase in (
+            "do not mark an answer wrong merely because it attributes a statement to a different speaker label",
+            "or omits who said it",
+            "unless the question explicitly asks who said it",
+        ):
+            self.assertIn(phrase, self.flat, f"rule 3 lost: {phrase!r}")
+
+    def test_rule_4_evidence_only_and_harmless_extra_detail(self):
+        for phrase in (
+            "Judge only against the evidence quote and the expected answer given, never against outside knowledge",
+            "Extra detail that is not in the evidence is not an error unless it contradicts the evidence",
+        ):
+            self.assertIn(phrase, self.flat, f"rule 4 lost: {phrase!r}")
+
+    def test_rule_5_reason_is_one_sentence_and_names_the_rule(self):
+        for phrase in (
+            '"reason" must be ONE sentence and must name which rule decided it',
+            "name which rule decided it",
+            '"rule1 clean refusal"',
+        ):
+            self.assertIn(phrase, self.flat, f"rule 5 lost: {phrase!r}")
+
+    def test_output_contract_and_six_verdict_words_survive(self):
+        formatted = ol.judge_prompt_for(self.item, "they picked LightRAG")
+        self.assertIn(
+            '{"verdict": "correct|partial|wrong|hallucinated|refused_ok|refused_wrong", '
+            '"reason": "<one sentence naming the deciding rule>"}',
+            formatted,
+        )
+        self.assertIn("Reply with ONLY this JSON object and nothing else:", formatted)
+        for verdict in ol.VERDICT_VALUES:
+            self.assertIn(verdict, ol.JUDGE_PROMPT)
+        self.assertEqual(len(ol.VERDICT_VALUES), 6)
+        # the five rules are numbered in order, so the reason can cite one
+        numbered = [line[:2] for line in formatted.splitlines() if line[:2] in ("1.", "2.", "3.", "4.", "5.")]
+        self.assertEqual(numbered, ["1.", "2.", "3.", "4.", "5."])
+
+    def test_prompt_stays_small_enough_for_a_reasoning_judge(self):
+        # 318 words of rubric; a bloated prompt eats the same 4000-token budget the
+        # chain of thought needs
+        self.assertLess(len(ol.JUDGE_PROMPT), 3000)
+
+    def test_only_the_four_known_placeholders_are_used(self):
+        import string
+
+        names = {name for _text, name, _spec, _conv in string.Formatter().parse(ol.JUDGE_PROMPT) if name}
+        self.assertEqual(names, {"question", "expected_answer", "evidence", "answer"})
+
+    def test_placeholders_are_filled_and_content_braces_are_inert(self):
+        item = {
+            "id": "dev02",
+            "question": "What did they say about {the budget} and {it}?",
+            "expected_answer": "{2} million",
+            "evidence": "budget was {2} million",
+        }
+        prompt = ol.judge_prompt_for(item, "It was {2} million, per {the deck}.")
+        for text in ("{the budget}", "{it}", "{2} million", "{the deck}"):
+            self.assertIn(text, prompt)
+        for placeholder in ("{question}", "{expected_answer}", "{evidence}", "{answer}"):
+            self.assertNotIn(placeholder, prompt)
+
+    def test_verdict_parses_with_braces_in_the_reply(self):
+        reply = "thinking about {several} candidates ... {\"verdict\": \"refused_ok\", \"reason\": \"rule1 clean refusal\"}"
+        parsed = ol.parse_verdict(reply, prefer_last=True)
+        self.assertEqual(parsed, {"verdict": "refused_ok", "reason": "rule1 clean refusal"})
+
+    def test_the_rubric_is_what_actually_reaches_the_judge(self):
+        class _RecordingOps(ol.Ops):
+            def http_json(self, method, url, *, headers=None, payload=None, timeout=30.0):
+                self.sent = payload
+                return 200, {"choices": [{
+                    "message": {"content": '{"verdict": "refused_ok", "reason": "rule1 clean refusal"}'},
+                    "finish_reason": "stop",
+                }]}
+
+        ops = _RecordingOps()
+        out = ol.judge_answer(
+            ops,
+            {"id": "dev03", "question": "When did the board meet?", "expected_answer": "not in the documents", "evidence": ""},
+            "The provided context does not say when the board met; it does mention the pilot.",
+            "key",
+        )
+        self.assertEqual(out["verdict"], "refused_ok")
+        self.assertEqual(out["reason"], "rule1 clean refusal")
+        sent = " ".join(ops.sent["messages"][0]["content"].split())
+        self.assertIn("EVEN IF the answer names real entities or mentions nearby facts", sent)
+        self.assertIn("hallucinated ONLY if the answer asserts a specific value", sent)
+        self.assertEqual(ops.sent["max_tokens"], ol.JUDGE_MAX_TOKENS)
+
+
 if __name__ == "__main__":
     unittest.main()
