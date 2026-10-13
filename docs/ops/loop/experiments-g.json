@@ -1,0 +1,9 @@
+{
+  "baseline_env": {"MAX_GLEANING": "0"},
+  "experiments": [
+    {"name": "G1-more-context", "env": {}, "gateway_env": {"BRIDGE_TOP_K": "80", "BRIDGE_CHUNK_TOP_K": "40"}, "reingest": true, "probe_concurrency": 1},
+    {"name": "G2-no-rerank", "env": {}, "gateway_env": {"BRIDGE_ENABLE_RERANK": "false"}, "reingest": false, "probe_concurrency": 1},
+    {"name": "G3-bigger-budget", "env": {}, "gateway_env": {"BRIDGE_MAX_TOTAL_TOKENS": "48000", "BRIDGE_MAX_ENTITY_TOKENS": "15000", "BRIDGE_MAX_RELATION_TOKENS": "15000"}, "reingest": false, "probe_concurrency": 1},
+    {"name": "G4-less-context", "env": {}, "gateway_env": {"BRIDGE_TOP_K": "20", "BRIDGE_CHUNK_TOP_K": "10"}, "reingest": false, "probe_concurrency": 1}
+  ]
+}
