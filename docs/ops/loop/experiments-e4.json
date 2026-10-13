@@ -1,0 +1,6 @@
+{
+  "baseline_env": {},
+  "experiments": [
+    {"name": "E4-chunk600", "env": {"CHUNK_SIZE": "600", "CHUNK_OVERLAP_SIZE": "100"}, "reingest": true, "probe_concurrency": 1}
+  ]
+}
