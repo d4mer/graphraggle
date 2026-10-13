@@ -181,7 +181,7 @@ SERVICE_DOWN_WAIT = 600
 HARD_ABORT_GRACE = 3600
 HEARTBEAT_INTERVAL = 60
 
-SUCCESS_HELDOUT_CORRECT_PCT = 90.0
+SUCCESS_HELDOUT_OK_PCT = 90.0
 SUCCESS_HALLUCINATION_PCT = 5.0
 SUCCESS_REFUSAL_ACCURACY_PCT = 80.0
 
@@ -630,7 +630,13 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
         "unknown_verdicts": unknown_verdicts,
         "counts": counts,
         "correct_pct": pct(counts["correct"]),
+        # ok% also counts a correct refusal, so refusing an unanswerable probe
+        # correctly is no longer scored below answering it wrongly.
+        "ok_pct": pct(counts["correct"] + counts["refused_ok"]),
         "partial_credit_pct": round(100.0 * (counts["correct"] + 0.5 * counts["partial"]) / total, 2) if total else 0.0,
+        "ok_partial_credit_pct": round(
+            100.0 * (counts["correct"] + counts["refused_ok"] + 0.5 * counts["partial"]) / total, 2
+        ) if total else 0.0,
         "partial_credit_raw": round(counts["correct"] + 0.5 * counts["partial"], 2),
         "hallucination_pct": pct(counts["hallucinated"]),
         "refused_wrong": counts["refused_wrong"],
@@ -643,9 +649,10 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
 
 
 RESULTS_TABLE_HEADER = (
-    "| experiment | status | dev correct% | dev correct+0.5*partial% | heldout correct% "
-    "| heldout correct+0.5*partial% | heldout halluc% | refusal acc% | p50 s | p95 s | judge errors |\n"
-    "|---|---|---|---|---|---|---|---|---|---|---|\n"
+    "| experiment | status | dev correct% | dev ok% | dev correct+0.5*partial% | heldout correct% "
+    "| heldout ok% | heldout correct+0.5*partial% | heldout halluc% | refusal acc% | p50 s | p95 s "
+    "| judge errors |\n"
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
 )
 
 
@@ -661,12 +668,20 @@ def results_row(
     tables stay comparable."""
     judge_errors = int(dev.get("judge_errors", 0)) + int(heldout.get("judge_errors", 0))
     refusal = heldout.get("refusal_accuracy_pct")
-    return "| {name} | {status} | {dc} | {dp} | {hc} | {hp} | {hh} | {ra} | {p50} | {p95} | {je} |\n".format(
+
+    def cell(mapping: dict[str, Any], key: str) -> Any:
+        """A summary saved before a key existed renders as n/a instead of crashing."""
+        value = mapping.get(key)
+        return value if isinstance(value, (int, float)) else "n/a"
+
+    return "| {name} | {status} | {dc} | {dok} | {dp} | {hc} | {hok} | {hp} | {hh} | {ra} | {p50} | {p95} | {je} |\n".format(
         name=name,
         status=status,
         dc=dev.get("correct_pct", 0.0),
+        dok=cell(dev, "ok_pct"),
         dp=dev.get("partial_credit_pct", 0.0),
         hc=heldout.get("correct_pct", 0.0),
+        hok=cell(heldout, "ok_pct"),
         hp=heldout.get("partial_credit_pct", 0.0),
         hh=heldout.get("hallucination_pct", 0.0),
         ra=refusal if refusal is not None else "n/a",
@@ -728,10 +743,14 @@ def emit(print_fn: Callable[[str], None] | None, line: str) -> None:
 
 
 def meets_success(heldout: dict[str, Any]) -> bool:
-    """SUCCESS: heldout correct% >= 90 AND hallucination% < 5 AND refusal >= 80."""
+    """SUCCESS: heldout ok% >= 90 AND hallucination% < 5 AND refusal accuracy >= 80.
+
+    ok% counts "correct" plus "refused_ok", i.e. how often the system answered
+    right, including a correct refusal of an unanswerable probe.
+    """
     refusal = heldout.get("refusal_accuracy_pct")
     return (
-        heldout.get("correct_pct", 0.0) >= SUCCESS_HELDOUT_CORRECT_PCT
+        heldout.get("ok_pct", 0.0) >= SUCCESS_HELDOUT_OK_PCT
         and heldout.get("hallucination_pct", 100.0) < SUCCESS_HALLUCINATION_PCT
         and refusal is not None
         and refusal >= SUCCESS_REFUSAL_ACCURACY_PCT
@@ -1527,8 +1546,11 @@ class Loop:
         stored = self.state.setdefault("results", {}).setdefault(name, {})
         stored.update({
             "dev_correct_pct": summary["dev"]["correct_pct"],
+            "dev_ok_pct": summary["dev"]["ok_pct"],
             "dev_partial_credit_pct": summary["dev"]["partial_credit_pct"],
+            "dev_ok_partial_credit_pct": summary["dev"]["ok_partial_credit_pct"],
             "heldout_correct_pct": summary["heldout"]["correct_pct"],
+            "heldout_ok_pct": summary["heldout"]["ok_pct"],
             "heldout_partial_credit_pct": summary["heldout"]["partial_credit_pct"],
             "heldout_hallucination_pct": summary["heldout"]["hallucination_pct"],
             "refusal_accuracy_pct": summary["heldout"]["refusal_accuracy_pct"],
@@ -1544,9 +1566,10 @@ class Loop:
             results_row(name, "done", dev, heldout, summary["all_latencies_p50"], summary["all_latencies_p95"]),
         )
         self.log(
-            f"{name}: dev correct {dev['correct_pct']}% (+0.5p {dev['partial_credit_pct']}%), "
-            f"heldout correct {heldout['correct_pct']}%, halluc {heldout['hallucination_pct']}%, "
-            f"refusal {heldout['refusal_accuracy_pct']}"
+            f"{name}: dev correct {dev['correct_pct']}% (+0.5p {dev['partial_credit_pct']}%, "
+            f"ok {dev['ok_pct']}%), heldout correct {heldout['correct_pct']}% "
+            f"(ok {heldout['ok_pct']}%), "
+            f"halluc {heldout['hallucination_pct']}%, refusal {heldout['refusal_accuracy_pct']}"
         )
         self.save_state()
         return summary
@@ -1705,10 +1728,26 @@ class Loop:
         self.save_state()
 
     def _best_experiment(self) -> tuple[str | None, dict[str, Any]]:
+        """Rank experiments by dev ok+0.5*partial% (a correct refusal counts).
+
+        A state.json written before that key existed still ranks by the old
+        correct+0.5*partial% number, so --resume across the change works.
+        """
         results = self.state.get("results") or {}
+
+        def score(values: dict[str, Any]) -> float:
+            for key in ("dev_ok_partial_credit_pct", "dev_partial_credit_pct"):
+                value = values.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return 0.0
+
         ranked = sorted(
-            ((name, values) for name, values in results.items() if "dev_partial_credit_pct" in values),
-            key=lambda entry: (entry[1]["dev_partial_credit_pct"], -entry[1].get("latency_p95", 0.0)),
+            (
+                (name, values) for name, values in results.items()
+                if "dev_ok_partial_credit_pct" in values or "dev_partial_credit_pct" in values
+            ),
+            key=lambda entry: (score(entry[1]), -entry[1].get("latency_p95", 0.0)),
             reverse=True,
         )
         return ranked[0] if ranked else (None, {})
@@ -1729,8 +1768,9 @@ class Loop:
                 for key, value in (best.get("env") or {}).items()
                 if str(baseline.get(key)) != str(value)
             }
-            lines.append(f"- best experiment by dev correct+0.5*partial%: **{best_name}** "
-                         f"({best.get('dev_partial_credit_pct')}%, p95 {best.get('latency_p95')} s)")
+            lines.append(f"- best experiment by dev ok+0.5*partial%: **{best_name}** "
+                         f"({best.get('dev_ok_partial_credit_pct', best.get('dev_partial_credit_pct'))}%, "
+                         f"p95 {best.get('latency_p95')} s)")
             if diff:
                 lines.append("- recommended env diff (NOT applied — apply by hand if you agree):")
                 lines.extend(f"  - `{key}={value}`" for key, value in sorted(diff.items()))

@@ -48,6 +48,9 @@ DEV_ITEMS = [
 HELDOUT_ITEMS = [
     {"id": "h1", "question": "Where is the office?", "expected_answer": "Brussels", "evidence": "the office is in Brussels", "type": "single-fact"},
     {"id": "h2", "question": "Anything about the moon?", "expected_answer": "not in the documents", "evidence": "", "type": "unanswerable"},
+    # "MISMATCH:" makes the fake judge say "wrong" (see FakeOps): without a wrong
+    # answer here the set would score ok% 100 and every run would stop at SUCCESS.
+    {"id": "h3", "question": "What is in the vault?", "expected_answer": "MISMATCH: gold", "evidence": "the vault holds nothing", "type": "single-fact"},
 ]
 
 
@@ -153,7 +156,10 @@ class FakeOps(ol.Ops):
                 return 200, {"choices": [{"message": {"content": "I am unable to decide"}}]}
             prompt = payload["messages"][0]["content"]
             expected = prompt.split("Expected answer (ground truth):", 1)[1].split("Evidence quote", 1)[0].strip()
-            verdict = "refused_ok" if "not in the documents" in expected else "correct"
+            if expected.startswith("MISMATCH:"):
+                verdict = "wrong"
+            else:
+                verdict = "refused_ok" if "not in the documents" in expected else "correct"
             return 200, {"choices": [{"message": {"content": json.dumps({"verdict": verdict, "reason": "matches the evidence"})}}]}
         return 200, {}
 
@@ -361,12 +367,67 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(ol.percentile([3.0], 0.95), 3.0)
 
     def test_success_thresholds(self):
-        good = {"correct_pct": 90.0, "hallucination_pct": 4.9, "refusal_accuracy_pct": 80.0}
+        good = {"ok_pct": 90.0, "hallucination_pct": 4.9, "refusal_accuracy_pct": 80.0}
         self.assertTrue(ol.meets_success(good))
-        self.assertFalse(ol.meets_success({**good, "correct_pct": 89.9}))
+        self.assertFalse(ol.meets_success({**good, "ok_pct": 89.9}))
         self.assertFalse(ol.meets_success({**good, "hallucination_pct": 5.0}))
         self.assertFalse(ol.meets_success({**good, "refusal_accuracy_pct": 79.9}))
         self.assertFalse(ol.meets_success({**good, "refusal_accuracy_pct": None}))
+
+    def _forty_items(self, unanswerable: int) -> list[dict]:
+        items = []
+        for index in range(40):
+            if index < unanswerable:
+                items.append({"id": f"h{index}", "type": "unanswerable", "question": f"q{index}",
+                              "expected_answer": "not in the documents", "evidence": ""})
+            else:
+                items.append({"id": f"h{index}", "type": "single-fact", "question": f"q{index}",
+                              "expected_answer": "a", "evidence": "e"})
+        return items
+
+    def test_ok_pct_counts_a_correct_refusal_as_answered_right(self):
+        """loop4: 33 correct + 6 refused_ok + 1 wrong of 40 reported 82.5%."""
+        summary = ol.score_set(self._forty_items(6), ["refused_ok"] * 6 + ["correct"] * 33 + ["wrong"], [])
+        self.assertEqual(summary["judged"], 40)
+        self.assertEqual(summary["correct_pct"], 82.5)           # unchanged, backward compatible
+        self.assertEqual(summary["partial_credit_pct"], 82.5)    # unchanged
+        self.assertEqual(summary["ok_pct"], 97.5)
+        self.assertEqual(summary["ok_partial_credit_pct"], 97.5)
+        self.assertEqual(summary["refusal_accuracy_pct"], 100.0)
+        self.assertTrue(ol.meets_success(summary))               # 82.5% correct used to fail this
+
+    def test_ok_pct_and_the_hallucination_boundary_on_40_probes(self):
+        items = self._forty_items(4)
+        summary = ol.score_set(items, ["refused_ok"] * 4 + ["correct"] * 34 + ["hallucinated"] * 2, [])
+        self.assertEqual(summary["ok_pct"], 95.0)
+        self.assertEqual(summary["hallucination_pct"], 5.0)
+        self.assertFalse(ol.meets_success(summary))              # hallucination must stay < 5
+
+        summary = ol.score_set(items, ["refused_ok"] * 4 + ["correct"] * 36, [])
+        self.assertEqual(summary["ok_pct"], 100.0)
+        self.assertEqual(summary["ok_partial_credit_pct"], 100.0)
+        self.assertEqual(summary["hallucination_pct"], 0.0)
+        self.assertTrue(ol.meets_success(summary))
+
+    def test_ok_partial_credit_pct_adds_half_of_partial(self):
+        summary = ol.score_set(self._forty_items(4),
+                               ["refused_ok"] * 4 + ["correct"] * 20 + ["partial"] * 8 + ["wrong"] * 8, [])
+        self.assertEqual(summary["ok_pct"], 60.0)
+        self.assertEqual(summary["partial_credit_pct"], 60.0)
+        self.assertEqual(summary["ok_partial_credit_pct"], 70.0)  # 60 + 0.5 * 20
+
+    def test_results_row_renders_an_old_summary_without_the_new_keys(self):
+        old = {"correct_pct": 80.0, "partial_credit_pct": 85.0, "hallucination_pct": 1.0,
+               "refusal_accuracy_pct": 90.0, "judge_errors": 0}
+        header_cells = ol.RESULTS_TABLE_HEADER.splitlines()[0].count("|")
+        row = ol.results_row("E1", "done", old, old, 1.0, 2.0)
+        self.assertEqual(row.count("|"), header_cells)
+        self.assertIn("| n/a |", row)
+        new = dict(old, ok_pct=90.0, ok_partial_credit_pct=95.0)
+        row = ol.results_row("E1", "done", new, new, 1.0, 2.0)
+        self.assertEqual(row.count("|"), header_cells)
+        self.assertNotIn("n/a", row)
+        self.assertIn("| 90.0 |", row)
 
 
 # ── driver behaviour ────────────────────────────────────────────────────────
@@ -547,6 +608,43 @@ class TestDriver(_Case):
         self.assertIn("| E1-async3 | done |", results)
         self.assertIn("| E2-topk | done |", results)
         self.assertIn("current corpus built by: **E1-async3**", results)
+        self.assertIn("dev ok%", results)
+        self.assertIn("heldout ok%", results)
+
+    def test_ok_percentages_land_in_state_json(self):
+        config = self.two_experiments()
+        self.make_loop(config).run()
+        stored = self.state()["results"]["E1-async3"]
+        self.assertEqual(stored["dev_ok_pct"], 100.0)            # d1 + d2 correct, d3 refused_ok
+        self.assertEqual(stored["dev_ok_partial_credit_pct"], 100.0)
+        self.assertEqual(stored["dev_correct_pct"], 66.67)       # old keys unchanged
+        self.assertEqual(stored["heldout_ok_pct"], 66.67)        # h1 + h2 of 3, h3 judged wrong
+        self.assertEqual(stored["heldout_correct_pct"], 33.33)
+
+    def test_best_experiment_ranks_by_dev_ok_partial_credit(self):
+        config = self.two_experiments()
+        loop = self.make_loop(config)
+        loop.load_state()
+        loop.state["results"] = {
+            "A": {"dev_partial_credit_pct": 92.0, "dev_ok_partial_credit_pct": 91.5,
+                  "latency_p95": 5.0, "env": {}},
+            "B": {"dev_partial_credit_pct": 90.0, "dev_ok_partial_credit_pct": 93.0,
+                  "latency_p95": 5.0, "env": {}},
+        }
+        self.assertEqual(loop._best_experiment()[0], "B")        # the old metric would pick A
+        loop._write_recommendation()
+        text = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertIn("best experiment by dev ok+0.5*partial%: **B** (93.0%", text)
+
+    def test_an_old_state_json_still_ranks_without_the_new_key(self):
+        config = self.two_experiments()
+        loop = self.make_loop(config)
+        loop.load_state()
+        loop.state["results"] = {
+            "A": {"dev_partial_credit_pct": 90.0, "latency_p95": 5.0, "env": {}},
+            "B": {"dev_partial_credit_pct": 88.0, "latency_p95": 5.0, "env": {}},
+        }
+        self.assertEqual(loop._best_experiment()[0], "A")
 
     def test_best_experiment_env_is_recommended_but_not_applied(self):
         config = self.write_experiments({
@@ -658,7 +756,7 @@ class TestProbeFileSelection(_Case):
         self.assertIn(
             "probe files: dev=probe/solvay-dev-v1.jsonl heldout=probe/solvay-heldout-v1.jsonl", printed
         )
-        self.assertEqual(self._answer_ids(), ["d1", "d2", "d3", "h1", "h2"])
+        self.assertEqual(self._answer_ids(), ["d1", "d2", "d3", "h1", "h2", "h3"])
 
     def test_custom_relative_names_are_used_instead(self):
         self._v2_files()
@@ -1632,6 +1730,32 @@ class TestRejudge(unittest.TestCase):
         self.assertEqual(ol.rejudge(self.out, empty_root, ops=self.ops, print_fn=printed.append), 3)
         self.assertIn("refusing to re-judge", "\n".join(printed))
         self.assertFalse((self.out / "results-rejudged.md").exists())
+
+    def test_rejudge_recomputes_ok_pct_from_saved_verdicts(self):
+        """loop4 can be re-scored without re-running anything: ok% comes from the
+        verdicts already on disk."""
+        out = Path(self.tmp.name) / "ok-out"
+        exp = out / "E9"
+        exp.mkdir(parents=True)
+        (exp / "answers.jsonl").write_text("".join([
+            json.dumps({"set": "heldout", "id": "held1", "answer": "Delta",
+                        "latency": 1.0, "error": None}) + "\n",
+            json.dumps({"set": "heldout", "id": "held2", "answer": "nothing in the documents",
+                        "latency": 1.0, "error": None}) + "\n",
+        ]), encoding="utf-8")
+        self.stub.routes[("POST", "/v1/chat/completions")] = (
+            200,
+            {"choices": [{"message": {"content": '{"verdict": "refused_ok", "reason": "rule 1"}'},
+                          "finish_reason": "stop"}]},
+        )
+        printed: list[str] = []
+        self.assertEqual(ol.rejudge(out, self.root, ops=self.ops, print_fn=printed.append), 0)
+        summary = json.loads((exp / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["correct_pct"], 0.0)
+        self.assertEqual(summary["heldout"]["ok_pct"], 100.0)
+        self.assertEqual(summary["heldout"]["counts"]["refused_ok"], 2)
+        self.assertEqual(summary["heldout"]["refusal_accuracy_pct"], 100.0)
+        self.assertIn("rejudged", (out / "results-rejudged.md").read_text(encoding="utf-8"))
 
     def test_rejudge_on_an_empty_out_dir_is_not_an_error(self):
         empty_out = Path(self.tmp.name) / "empty-out"
