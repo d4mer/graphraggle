@@ -1,44 +1,31 @@
 # Handoff - lead
 
-Last updated: 2026-10-12 (after production wipe + model switch)
+Last updated: 2026-10-13 07:30 (after the overnight accuracy loop)
 
 ## Goal
-Run GraphRAG (rc-1) in production for first use; next feature = pptx support. Keep `master` green on GitHub.
-Lead delegates all code to dev-worker@graphraggle and prod ops to Hermes (ops-hermes@thinkpad-ops via
-`rig send --host thinkpad ...`); lead verifies and pushes.
+Run GraphRAG rc-1 in production for the new Solvay corpus (GSK data wiped 2026-10-12, backup on deltahome ~/backups/graphraggle-20261012). Lead delegates code to
+dev-worker@graphraggle, prod ops to Hermes (ops-hermes@thinkpad-ops, via `rig send --host thinkpad`). RULE: only Hermes may read corpus/LightRAG content (see memory corpus-data-access-hermes-only).
 
-## State (2026-10-12)
-- rc-1 is live on the Thinkpad (~/rag-project); Gate 4 = GO (docs/ops/gate4-go-no-go.md).
-- Operator discontinued the GSK project: ALL production data WIPED (LightRAG store, inputs, source_docs,
-  uploads, worker state DB, logs, old backups dir). Verified: LightRAG healthy, 0 docs; worker up with fresh
-  state/ingest.db. chromadb belongs to another stack (memory-stack volume), untouched.
-- Full backup of everything (incl. source files, old backups, .env/compose) on deltahome:
-  192.168.1.180:~/backups/graphraggle-20261012 (9 tgz + SHA256SUMS, verified). None kept on the Thinkpad.
-  Rollback commands in the Gate 4 doc that point at Thinkpad backups/ are obsolete; restore from deltahome.
-- LightRAG ingestion LLM switched to sigma Strata qwen3.8-flash (http://192.168.1.195:1234/v1,
-  header `Authorization: Bearer 1234`; reachable from Thinkpad over LAN only). Embeddings still oMLX
-  192.168.1.190 (mxbai-embed-large-v1). Env change needs `docker compose up -d --no-deps lightrag-server`
-  (recreate), not `docker start`. Canary: 1 chunk in 164 s, 31 entities/45 relations, no parse errors.
-- packet-27 (pptx extraction, master 1f90c0e) merged but NOT deployed: needs image rebuild with python-pptx.
-- Understory note /projects/graphraggle-status-2026-10-12.md and Plane GRAG-43..50 written/updated
-  (understory MCP not loaded in session: call http://192.168.1.185:3800/mcp by curl JSON-RPC, one request at a
-  time, long timeout; Plane via REST at 192.168.1.185:8088 workspace "agents", run from macbookm1.local
-  with ~/plane-selfhost/plane-mcp/agent-tokens.env sourced; project GRAG).
+## State
+- Thinkpad prod: lightrag-server (qwen3.8-flash on sigma http://192.168.1.195:1234/v1, Bearer 1234; embeddings oMLX) healthy, baseline .env (identical to loop3/env.original). Store holds the 3 loop-corpus
+  transcripts (built gleaning-off, chunk 1200). rag-ingest-worker is STOPPED (stopped for the loop; restart with `docker start rag-ingest-worker` when ingestion should resume). Gateway on baseline retrieval settings.
+- Staged Solvay files: ~/rag-project/staging/Solvay (8 transcripts, 1 pdf, 1 docx, 1 pptx). 8 transcripts were ingested via the worker earlier; the loop later wiped/rebuilt with 3.
+- Overnight loop driver: scripts/overnight_loop.py (packets 28-33 merged, master dc52419 + docs). Runs in tmux on the Thinkpad; outputs ~/rag-project/probe/loop, loop2 (E4 aborted), loop3. Stop a run with `kill -TERM <python pid>` only
+  (never kill the tmux wrapper; if it dies, restore: cp <out>/env.original ~/rag-project/.env && docker compose up -d --no-deps lightrag-server [gateway-api]).
+- Probe sets: ~/rag-project/probe/solvay-dev-v1.jsonl (40 q), solvay-heldout-v1.jsonl (15 q). Judge = qwen3.6-35b on oMLX 192.168.1.190 (reasoning model, JUDGE_MAX_TOKENS 4000).
 
-## Hermes approval handling
-Approval dialogs appear only in Hermes tmux pane (`ssh 100.64.0.6 tmux capture-pane -p -t ops-hermes@thinkpad-ops`).
-Expand "Show full command", accept only commands in the brief; Hermes' terminal masks the key 1234 as `***`.
+## Results (dev 40 / held-out 15; all hallucination 0 except E2)
+E0 baseline 80/80 (re-judged) | E1 gleaning off 82.5/80 | E2 chunk2000 82.5/80, halluc 6.7% | G1 top_k 80 82.5/80 | G2 rerank off 75/80 (worse) | G3 bigger budget 82.5/80 | G4 less context 80/80.
+E3 (ENTITY_TYPES) impossible: unsupported in LightRAG v1.5.7; E4 chunk600 aborted (too slow). Median query ~40-48 s.
+Hermes failure analysis (9 failures/165 verdicts): 6 of 9 are probe_bad (4) or judge_wrong (2); 3 are one multi-fact synthesis defect (fluent wrong synonym for a garbled ASR term). No evidence of extraction/retrieval loss.
+=> accuracy ceiling is test/judge quality, not config. Held-out has only 15 questions (1 question = 6.7 points).
 
-## Open
-- Data is empty: no corpus yet. Operator decides what to ingest next. Before the first real ingest:
-  deploy packet-27 (rebuild image, test real decks), consider fixing entity quality (speaker labels,
-  duplicate names; GRAG-50). Sigma Strata is shared with dev-worker: ingestion competes with agent sessions.
-- Probe-set-v1 was built on GSK docs, so the Gate 2 baseline must be rebuilt on the new corpus.
-- Rotate OpenWebUI key; real .docx end-to-end check on new data; OpenWebUI chat history still holds GSK chats.
-- Leftover GSK-quoting files remain on Thinkpad (probe/, docs/ops/runs/*) - operator decision pending.
-- Optional: oMLX memory policy (GRAG-42), sigma->Thinkpad tailscale gap, packet-22-ll-seed branch (parked).
+## Decisions pending (operator)
+1. Adopt MAX_GLEANING=0 in prod (no accuracy cost, halves extraction calls) - recommended; keep rerank ON and other defaults.
+2. Probe set v2 (Hermes: fix bad probes, disambiguate, bigger held-out ~40) + judge prompt fix (clean refusals, attribution) via dev-worker packet; then re-judge saved answers (cheap, `--rejudge`).
+3. Resume ingestion of the full Solvay corpus (restart worker; pptx needs packet-27 deploy with python-pptx image rebuild first).
+4. Multi-fact synthesis defect: consider transcript cleaning at ingest / prompt change.
 
-## Next three actions
-1. Ask operator what corpus comes next; run a pptx real-deck dry run with Hermes, then deploy packet-27.
-2. Tune ingestion on sigma (LLM_MODEL_MAX_ASYNC, timeouts) on a small first batch; measure time per doc.
-3. Rebuild the probe set and quality baseline on the new corpus; start hypercare (Gate 5).
+## Other open
+Rotate OpenWebUI key; real .docx e2e check; GRAG-42 oMLX memory policy; Plane GRAG-43..50 exist (update from macbookm1.local REST); understory note /projects/graphraggle-status-2026-10-12.md (call by curl, one request at a time).
+Hermes cannot rig-send to this session (address gone) -> have it write summary files and read them.
