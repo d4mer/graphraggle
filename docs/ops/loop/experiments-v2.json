@@ -1,0 +1,6 @@
+{
+  "baseline_env": {"MAX_GLEANING": "0"},
+  "experiments": [
+    {"name": "V2-baseline", "env": {}, "reingest": true, "probe_concurrency": 1}
+  ]
+}
