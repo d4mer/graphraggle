@@ -609,6 +609,103 @@ class TestCommandLine(_Case):
         self.assertEqual(code, 3)
 
 
+# ── probe file selection (packet-35) ───────────────────────────────────────
+
+class TestProbeFileSelection(_Case):
+    """--dev-probes / --heldout-probes: defaults unchanged, everything else explicit."""
+
+    def _v2_files(self) -> None:
+        probe = self.root / "probe"
+        (probe / "solvay-dev-v2.jsonl").write_text(_jsonl([
+            {"id": "dev90", "question": "V2 dev question?", "expected_answer": "Marie",
+             "evidence": "Marie is in Paris", "type": "single-fact"},
+        ]), encoding="utf-8")
+        (probe / "solvay-heldout-v2.jsonl").write_text(_jsonl([
+            {"id": "ho90", "question": "V2 heldout question?", "expected_answer": "Brussels",
+             "evidence": "the office is in Brussels", "type": "single-fact"},
+        ]), encoding="utf-8")
+
+    def _one_experiment(self) -> None:
+        self.write_experiments({"baseline_env": {}, "experiments": [{"name": "E1", "env": {"MAX_ASYNC": "2"}}]})
+
+    def _answer_ids(self) -> list[str]:
+        return [json.loads(line)["id"]
+                for line in (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    def _run_cli(self, extra: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = ol.main([
+                "--root", str(self.root),
+                "--experiments", str(self.experiments_path),
+                "--out", str(self.out),
+                "--dry-run", *extra,
+            ])
+        return code, buffer.getvalue()
+
+    def test_resolution_rules(self):
+        self.assertEqual(ol.resolve_probe_path(ol.DEV_PROBE_FILE), "probe/solvay-dev-v1.jsonl")
+        self.assertEqual(ol.resolve_probe_path(ol.HELDOUT_PROBE_FILE), "probe/solvay-heldout-v1.jsonl")
+        self.assertEqual(ol.resolve_probe_path("solvay-dev-v2.jsonl"), "probe/solvay-dev-v2.jsonl")
+        self.assertEqual(ol.resolve_probe_path("probe/solvay-dev-v2.jsonl"), "probe/solvay-dev-v2.jsonl")
+        self.assertEqual(ol.resolve_probe_path("/tmp/elsewhere/x.jsonl"), "/tmp/elsewhere/x.jsonl")
+
+    def test_defaults_are_still_the_v1_files(self):
+        self._v2_files()
+        self._one_experiment()
+        code, printed = self._run_cli([])
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "probe files: dev=probe/solvay-dev-v1.jsonl heldout=probe/solvay-heldout-v1.jsonl", printed
+        )
+        self.assertEqual(self._answer_ids(), ["d1", "d2", "d3", "h1", "h2"])
+
+    def test_custom_relative_names_are_used_instead(self):
+        self._v2_files()
+        self._one_experiment()
+        code, printed = self._run_cli([
+            "--dev-probes", "solvay-dev-v2.jsonl", "--heldout-probes", "solvay-heldout-v2.jsonl",
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "probe files: dev=probe/solvay-dev-v2.jsonl heldout=probe/solvay-heldout-v2.jsonl", printed
+        )
+        self.assertEqual(self._answer_ids(), ["dev90", "ho90"])
+
+    def test_probe_prefixed_and_absolute_forms_work_too(self):
+        self._v2_files()
+        elsewhere = self.root / "elsewhere" / "heldout-v3.jsonl"
+        elsewhere.parent.mkdir()
+        elsewhere.write_text(_jsonl([
+            {"id": "ho77", "question": "Absolute path question?", "expected_answer": "Brussels",
+             "evidence": "the office is in Brussels", "type": "single-fact"},
+        ]), encoding="utf-8")
+        self._one_experiment()
+        code, printed = self._run_cli([
+            "--dev-probes", "probe/solvay-dev-v2.jsonl", "--heldout-probes", str(elsewhere),
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn(f"heldout={elsewhere}", printed)
+        self.assertEqual(self._answer_ids(), ["dev90", "ho77"])
+
+    def test_a_missing_probe_file_refuses_before_any_docker_or_http(self):
+        import contextlib
+
+        self._one_experiment()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = ol.main([
+                "--root", str(self.root),
+                "--experiments", str(self.experiments_path),
+                "--out", str(self.out),
+                "--dry-run", "--dev-probes", "nope.jsonl",
+            ])
+        self.assertEqual(code, 3)
+        self.assertIn("--dev-probes file not found", stderr.getvalue())
+        self.assertIn(str(self.root / "probe" / "nope.jsonl"), stderr.getvalue())
+        self.assertFalse(self.out.exists())
+
+
 # ── LightRAG API key is optional (packet-29) ───────────────────────────────
 
 class TestLightRagApiKey(_Case):
@@ -1571,6 +1668,53 @@ class TestRejudge(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             ol.main(["--root", str(self.root)])
         self.assertEqual(raised.exception.code, 2)
+
+    def _v2_probe_files(self) -> None:
+        probe = self.root / "probe"
+        (probe / "solvay-dev-v2.jsonl").write_text(_jsonl([
+            {"id": "dev1", "question": "Question one?", "expected_answer": "Alpha",
+             "evidence": "evidence alpha", "type": "single-fact"},
+        ]), encoding="utf-8")
+        (probe / "solvay-heldout-v2.jsonl").write_text(_jsonl([
+            {"id": "held1", "question": "Question four?", "expected_answer": "Delta",
+             "evidence": "evidence delta", "type": "single-fact"},
+            {"id": "held2", "question": "Question five?", "expected_answer": "not in the documents",
+             "evidence": "", "type": "unanswerable"},
+        ]), encoding="utf-8")
+
+    def test_rejudge_grades_against_the_probe_files_it_is_handed(self):
+        """dev2/dev3 exist only in the v1 file, so with v2 they are unmatched."""
+        self._v2_probe_files()
+        printed: list[str] = []
+        code = ol.rejudge(
+            self.out, self.root,
+            dev_probe="probe/solvay-dev-v2.jsonl", heldout_probe="probe/solvay-heldout-v2.jsonl",
+            ops=self.ops, print_fn=printed.append,
+        )
+        self.assertEqual(code, 0)
+        joined = "\n".join(printed)
+        self.assertIn(
+            "probe files: dev=probe/solvay-dev-v2.jsonl heldout=probe/solvay-heldout-v2.jsonl", joined
+        )
+        self.assertIn("unmatched 2", joined)
+        self.assertEqual([row["verdict"] for row in self._read_verdicts("E1")],
+                         ["wrong", ol.JUDGE_ERROR, ol.JUDGE_ERROR])
+        self.assertEqual([row["verdict"] for row in self._read_verdicts("E2")],
+                         ["wrong", "wrong", ol.JUDGE_ERROR])
+
+    def test_cli_passes_probe_names_to_rejudge(self):
+        self._v2_probe_files()
+        with redirect_stdout(io.StringIO()) as captured:
+            code = ol.main([
+                "--root", str(self.root), "--rejudge", str(self.out),
+                "--dev-probes", "solvay-dev-v2.jsonl", "--heldout-probes", "solvay-heldout-v2.jsonl",
+            ])
+        self.assertEqual(code, 0)
+        printed = captured.getvalue()
+        self.assertIn("dev=probe/solvay-dev-v2.jsonl", printed)
+        self.assertIn("unmatched 2", printed)
+        self.assertNotIn("Question one?", printed)  # counts only, never question text
+        self.assertTrue((self.out / "results-rejudged.md").exists())
 
 
 # ── real LightRAG response shapes (packet-32) ────────────────────────────

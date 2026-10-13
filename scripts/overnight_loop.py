@@ -156,6 +156,22 @@ DEV_PROBE_FILE = "probe/solvay-dev-v1.jsonl"
 HELDOUT_PROBE_FILE = "probe/solvay-heldout-v1.jsonl"
 CORPUS_FILE = "probe/loop_corpus.json"
 
+
+def resolve_probe_path(raw: str) -> str:
+    """Normalise a --dev-probes / --heldout-probes value.
+
+    An absolute path stays absolute; a value that already starts with "probe/"
+    stays root-relative (the shape of the built-in defaults); anything else is
+    taken relative to <root>/probe. The result is always used as <root> / value,
+    and Path drops the left side when the right one is absolute.
+    """
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    if candidate.parts and candidate.parts[0] == "probe":
+        return str(candidate)
+    return str(Path("probe") / candidate)
+
 # Timeouts, in seconds.
 HEALTH_TIMEOUT = 300
 CLEAR_TIMEOUT = 600
@@ -890,6 +906,8 @@ class Loop:
         dry_run: bool = False,
         resume: bool = False,
         retry_errors: bool = False,
+        dev_probe_file: str = DEV_PROBE_FILE,
+        heldout_probe_file: str = HELDOUT_PROBE_FILE,
         handle_signals: bool = True,
         print_fn: Callable[[str], None] | None = None,
     ) -> None:
@@ -901,6 +919,8 @@ class Loop:
         self.dry_run = dry_run
         self.resume = resume
         self.retry_errors = retry_errors
+        self.dev_probe_file = dev_probe_file
+        self.heldout_probe_file = heldout_probe_file
         self.handle_signals = handle_signals
         self.print_fn = print_fn or (lambda line: print(line, flush=True))
 
@@ -1478,8 +1498,8 @@ class Loop:
         if experiment["reingest"]:
             self._reingest(experiment)
 
-        dev_items = self._load_probe_items(DEV_PROBE_FILE)
-        heldout_items = self._load_probe_items(HELDOUT_PROBE_FILE)
+        dev_items = self._load_probe_items(self.dev_probe_file)
+        heldout_items = self._load_probe_items(self.heldout_probe_file)
         dev_rows = self._run_set(dev_items, experiment["probe_concurrency"])
         self.judge_truncated = 0
         dev_verdicts = self._judge_set(dev_items, dev_rows)
@@ -1752,10 +1772,16 @@ def read_jsonl_tolerant(ops: Ops, path: Path) -> tuple[list[dict[str, Any]], int
     return rows, skipped
 
 
-def load_probe_maps(root: Path, ops: Ops) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+def load_probe_maps(
+    root: Path,
+    ops: Ops,
+    *,
+    dev_probe: str = DEV_PROBE_FILE,
+    heldout_probe: str = HELDOUT_PROBE_FILE,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """id -> probe item for the dev file and the heldout file."""
     maps = []
-    for relative in (DEV_PROBE_FILE, HELDOUT_PROBE_FILE):
+    for relative in (dev_probe, heldout_probe):
         rows, _skipped = read_jsonl_tolerant(ops, Path(root) / relative)
         maps.append({str(row["id"]): row for row in rows if row.get("id") is not None})
     return maps[0], maps[1]
@@ -1875,7 +1901,15 @@ def rejudge_experiment(
     return directory.name, counts, summary
 
 
-def rejudge(out_dir: Path, root: Path, *, ops: Ops | None = None, print_fn: Callable[[str], None] | None = None) -> int:
+def rejudge(
+    out_dir: Path,
+    root: Path,
+    *,
+    dev_probe: str = DEV_PROBE_FILE,
+    heldout_probe: str = HELDOUT_PROBE_FILE,
+    ops: Ops | None = None,
+    print_fn: Callable[[str], None] | None = None,
+) -> int:
     """Re-grade saved answers offline, calling only the oMLX judge.
 
     Touches nothing else: no .env, no docker, no LightRAG, no gateway, no sigma,
@@ -1887,10 +1921,11 @@ def rejudge(out_dir: Path, root: Path, *, ops: Ops | None = None, print_fn: Call
     print_fn = print_fn or (lambda line: print(line, flush=True))
     judge_key = os.environ.get("OVERNIGHT_JUDGE_API_KEY", JUDGE_KEY_DEFAULT)
 
-    dev_map, heldout_map = load_probe_maps(root, ops)
+    emit(print_fn, f"probe files: dev={dev_probe} heldout={heldout_probe}")
+    dev_map, heldout_map = load_probe_maps(root, ops, dev_probe=dev_probe, heldout_probe=heldout_probe)
     if not dev_map or not heldout_map:
         emit(print_fn,
-             f"refusing to re-judge: need both {DEV_PROBE_FILE} and {HELDOUT_PROBE_FILE} "
+             f"refusing to re-judge: need both {dev_probe} and {heldout_probe} "
              f"with ids under {root}")
         return 3
 
@@ -1974,10 +2009,29 @@ def main(argv: list[str] | None = None) -> int:
         help="offline mode: re-grade saved answers in OUT_DIR/<name>/answers.jsonl using only "
              "the judge endpoint, then write OUT_DIR/results-rejudged.md",
     )
+    parser.add_argument(
+        "--dev-probes",
+        metavar="PATH",
+        default=DEV_PROBE_FILE,
+        help=f"dev probe JSONL: absolute, or relative to <root>/probe (default: {DEV_PROBE_FILE})",
+    )
+    parser.add_argument(
+        "--heldout-probes",
+        metavar="PATH",
+        default=HELDOUT_PROBE_FILE,
+        help=f"held-out probe JSONL, resolved the same way (default: {HELDOUT_PROBE_FILE})",
+    )
     arguments = parser.parse_args(argv)
 
+    root_path = Path(arguments.root).expanduser()
+    dev_probe = resolve_probe_path(arguments.dev_probes)
+    heldout_probe = resolve_probe_path(arguments.heldout_probes)
+
     if arguments.rejudge:
-        return rejudge(Path(arguments.rejudge).expanduser(), Path(arguments.root).expanduser())
+        return rejudge(
+            Path(arguments.rejudge).expanduser(), root_path,
+            dev_probe=dev_probe, heldout_probe=heldout_probe,
+        )
 
     if not arguments.experiments or not arguments.out:
         parser.error("--experiments and --out are required unless --rejudge is given")
@@ -1987,6 +2041,12 @@ def main(argv: list[str] | None = None) -> int:
     except LoopConfigError as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
         return 3
+
+    # Names are checked before docker or HTTP is touched, so a typo costs nothing.
+    for label, spec in (("--dev-probes", dev_probe), ("--heldout-probes", heldout_probe)):
+        if not (root_path / spec).is_file():
+            print(f"refusing to run: {label} file not found: {root_path / spec}", file=sys.stderr)
+            return 3
 
     ops: Ops = DryRunOps() if arguments.dry_run else Ops()
     loop = Loop(
@@ -1998,7 +2058,11 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=arguments.dry_run,
         resume=arguments.resume,
         retry_errors=arguments.retry_errors,
+        dev_probe_file=dev_probe,
+        heldout_probe_file=heldout_probe,
     )
+    # file names only, never their contents
+    loop.log(f"probe files: dev={dev_probe} heldout={heldout_probe}")
     for line in build_plan_lines(config):
         loop.log(line)
     if arguments.dry_run:
