@@ -28,6 +28,19 @@ still restores .env and recreates lightrag-server, but a clean SIGTERM is the
 intended way to stop. --retry-errors (with --resume) re-runs experiments whose
 recorded status is "error"; "done" experiments stay skipped.
 
+Failure isolation: after any experiment ends in error the driver rewrites .env to
+the baseline, recreates every service the run has touched (lightrag-server, and
+gateway-api if gateway_env was used) and waits for them to answer. If that does
+not recover within HEALTH_TIMEOUT the whole run stops with status "fatal" and the
+container's masked ERROR lines in the message. Readiness waits also poll
+``docker ps -a --filter name=<container> --format {{.State}}``, so a container that
+exited or keeps restarting fails in seconds instead of minutes.
+
+An experiment may also carry ``"gateway_env": {...}`` with the gateway knobs
+(BRIDGE_*, GATEWAY_CHUNK_TOP_K, CITATION_TOP_K). They live in the same .env, are
+verified against the rag-gateway-api container, and that service is recreated and
+waited for too. ENTITY_TYPES is refused: LightRAG v1.5.7 will not start with it.
+
 Outputs, all under --out:
     state.json     resumable run state, written atomically after every step
     heartbeat      ISO timestamp, rewritten at least every 60 s while waiting
@@ -73,7 +86,6 @@ ENV_WHITELIST = frozenset({
     "MAX_ENTITY_TOKENS",
     "MAX_RELATION_TOKENS",
     "MAX_TOTAL_TOKENS",
-    "ENTITY_TYPES",
     "SUMMARY_MAX_TOKENS",
     "FORCE_LLM_SUMMARY_ON_MERGE",
     "RELATED_CHUNK_NUMBER",
@@ -86,6 +98,21 @@ ENV_WHITELIST = frozenset({
 # LLM_MODEL_MAX_ASYNC, which the brief whitelists on purpose: it is an
 # async-concurrency knob, not model selection. Credentials are banned by name and
 # suffix regardless.
+
+# The gateway (rag-gateway-api) reads the same <root>/.env through env_file, so
+# an experiment may tune these too. They are a separate allow-list because the
+# two services read different knobs out of one file.
+GATEWAY_ENV_WHITELIST = frozenset({
+    "BRIDGE_TOP_K",
+    "BRIDGE_CHUNK_TOP_K",
+    "BRIDGE_MAX_ENTITY_TOKENS",
+    "BRIDGE_MAX_RELATION_TOKENS",
+    "BRIDGE_MAX_TOTAL_TOKENS",
+    "BRIDGE_ENABLE_RERANK",
+    "GATEWAY_CHUNK_TOP_K",
+    "CITATION_TOP_K",
+})
+
 NEVER_CHANGE_EXACT = frozenset({
     "LIGHTRAG_API_KEY",
     "OPENAI_API_KEY",
@@ -95,7 +122,13 @@ NEVER_CHANGE_EXACT = frozenset({
     "EMBEDDING_MODEL",
     "EMBEDDING_BINDING",
     "EMBEDDING_BINDING_HOST",
+    "ENTITY_TYPES",
 })
+# Keys that are not credentials but still cannot be set, with the reason that has
+# to appear in the refusal.
+NEVER_CHANGE_REASONS = {
+    "ENTITY_TYPES": "ENTITY_TYPES is not supported by LightRAG v1.5.7 (server refuses to start)",
+}
 NEVER_CHANGE_SUFFIX = re.compile(r"(_API_KEY|_API_KEYS|_KEY|_SECRET|_PASSWORD)$")
 
 # Local oMLX judge endpoint. The key is the placeholder the local server
@@ -115,6 +148,8 @@ SIGMA_URL = "http://192.168.1.195:1234/v1/models"
 GATEWAY_URL = "http://127.0.0.1:8020"
 LIGHTRAG_URL = "http://localhost:9621"
 CONTAINER = "lightrag-server"
+GATEWAY_SERVICE = "gateway-api"
+GATEWAY_CONTAINER = "rag-gateway-api"
 WORKER_CONTAINER = "rag-ingest-worker"
 
 DEV_PROBE_FILE = "probe/solvay-dev-v1.jsonl"
@@ -185,6 +220,11 @@ class FatalRun(Exception):
     """Unsafe to continue the run at all (for example the worker is running)."""
 
 
+class UnrecoverableRun(FatalRun):
+    """The stack cannot be put back into its baseline shape, so no further
+    experiment can be trusted. finalise still runs."""
+
+
 # ── experiments.json ────────────────────────────────────────────────────────
 
 def is_forbidden_key(key: str) -> bool:
@@ -194,13 +234,22 @@ def is_forbidden_key(key: str) -> bool:
     return False
 
 
-def check_env_keys(mapping: dict[str, Any], where: str) -> None:
+def forbidden_reason(key: str) -> str:
+    return NEVER_CHANGE_REASONS.get(key) or f"key {key} may never be changed"
+
+
+def check_env_keys(
+    mapping: dict[str, Any],
+    where: str,
+    *,
+    allow: frozenset[str] = ENV_WHITELIST,
+) -> None:
     for key in mapping:
         key = str(key)
-        if key not in ENV_WHITELIST:
-            raise LoopConfigError(f"{where}: key {key} is not in the whitelist")
         if is_forbidden_key(key):
-            raise LoopConfigError(f"{where}: key {key} may never be changed")
+            raise LoopConfigError(f"{where}: {forbidden_reason(key)}")
+        if key not in allow:
+            raise LoopConfigError(f"{where}: key {key} is not in the whitelist")
 
 
 def load_experiments(path: Path) -> dict[str, Any]:
@@ -238,12 +287,17 @@ def load_experiments(path: Path) -> dict[str, Any]:
         if not isinstance(env, dict):
             raise LoopConfigError(f"experiment {name}: env must be an object")
         check_env_keys(env, f"experiment {name}")
+        gateway_env = entry.get("gateway_env") or {}
+        if not isinstance(gateway_env, dict):
+            raise LoopConfigError(f"experiment {name}: gateway_env must be an object")
+        check_env_keys(gateway_env, f"experiment {name}", allow=GATEWAY_ENV_WHITELIST)
         concurrency = int(entry.get("probe_concurrency", 1) or 1)
         if concurrency < 1:
             raise LoopConfigError(f"experiment {name}: probe_concurrency must be >= 1")
         experiments.append({
             "name": name,
             "env": {str(k): str(v) for k, v in env.items()},
+            "gateway_env": {str(k): str(v) for k, v in gateway_env.items()},
             "reingest": bool(entry.get("reingest", False)),
             "probe_concurrency": concurrency,
         })
@@ -649,6 +703,19 @@ def meets_success(heldout: dict[str, Any]) -> bool:
     )
 
 
+_SECRET_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)\s*=\s*\S+")
+_LOG_ERROR_LINE = re.compile(r"ERROR|Traceback|no longer supported", re.IGNORECASE)
+
+
+def mask_secrets(text: str) -> str:
+    """Blank out any KEY=/TOKEN=/SECRET=/PASSWORD= value in container output.
+
+    Container logs can echo the environment; the driver must never write those
+    values into loop.log or state.json.
+    """
+    return _SECRET_ASSIGN.sub(r"\1=<masked>", text)
+
+
 # ── Side effects ────────────────────────────────────────────────────────────
 
 class Ops:
@@ -836,6 +903,7 @@ class Loop:
         self.abort_requested = False
         self.judge_key = os.environ.get("OVERNIGHT_JUDGE_API_KEY", JUDGE_KEY_DEFAULT)
         self.judge_truncated = 0
+        self.gateway_touched = False
         self.plan: list[str] = []
 
     # ── logging, heartbeat, state ──────────────────────────────────────────
@@ -945,6 +1013,8 @@ class Loop:
         not want are removed, so experiments never stack."""
         baseline = self.config.get("baseline_env") or {}
         env = experiment.get("env") or {}
+        gateway_env = experiment.get("gateway_env") or {}
+        wanted = {**env, **gateway_env}
         set_values: dict[str, str] = {}
         for key in sorted(self.changed_keys):
             original = env_value(self.original_env_text, key)
@@ -952,18 +1022,24 @@ class Loop:
                 set_values[key] = original
         remove_keys = {
             key for key in self.changed_keys
-            if key not in set_values and key not in baseline and key not in env
+            if key not in set_values and key not in baseline and key not in wanted
         }
         set_values.update(baseline)
-        set_values.update(env)
+        set_values.update(wanted)
         return set_values, remove_keys
 
     def _apply_env(self, experiment: dict[str, Any]) -> dict[str, str]:
         set_values, remove_keys = self._target_env(experiment)
-        check_env_keys(set_values, f"experiment {experiment['name']}")
+        check_env_keys(
+            set_values,
+            f"experiment {experiment['name']}",
+            allow=ENV_WHITELIST | GATEWAY_ENV_WHITELIST,
+        )
         text = self.ops.read_text(self.env_path) if Path(self.env_path).exists() else self.original_env_text
         self.ops.write_text_atomic(self.env_path, rewrite_env(text, set_values, remove_keys))
         self.changed_keys |= set(set_values) | remove_keys
+        if experiment.get("gateway_env"):
+            self.gateway_touched = True
         self.log(f"{experiment['name']}: env set to " + ", ".join(f"{k}={set_values[k]}" for k in sorted(set_values)))
         return set_values
 
@@ -974,11 +1050,67 @@ class Loop:
             timeout=300,
         )
 
-    def _restart_server(self) -> None:
-        code, out, err = self._compose("up", "-d", "--no-deps", CONTAINER)
+    def _restart_service(self, service: str, container: str) -> None:
+        code, out, err = self._compose("up", "-d", "--no-deps", service)
         if code != 0:
-            raise StepError(f"compose up failed rc={code}: {err.strip() or out.strip()}")
-        self.log(f"{CONTAINER}: recreated")
+            raise StepError(f"compose up {service} failed rc={code}: {err.strip() or out.strip()}")
+        self.log(f"{container}: recreated")
+
+    def _restart_server(self) -> None:
+        self._restart_service(CONTAINER, CONTAINER)
+
+    def _restart_gateway(self) -> None:
+        self._restart_service(GATEWAY_SERVICE, GATEWAY_CONTAINER)
+
+    def _container_state(self, container: str) -> str:
+        """docker ps -a state for one container: running, exited, restarting, ..."""
+        code, out, _err = self.ops.run(
+            ["docker", "ps", "-a", "--filter", f"name={container}", "--format", "{{.State}}"],
+            cwd=self.root,
+            timeout=60,
+        )
+        if code != 0:
+            return ""
+        for line in out.splitlines():
+            if line.strip():
+                return line.strip().lower()
+        return ""
+
+    def _container_error_lines(self, container: str) -> str:
+        """Up to 5 ERROR/Traceback lines from the container log, secrets masked."""
+        code, out, err = self.ops.run(["docker", "logs", "--tail", "40", container], cwd=self.root, timeout=60)
+        blob = f"{out}\n{err}"
+        if code != 0 and not blob.strip():
+            return f"docker logs {container} failed rc={code}"
+        lines = [mask_secrets(line).strip()[:300] for line in blob.splitlines() if _LOG_ERROR_LINE.search(line)]
+        if not lines:
+            return f"no ERROR lines in the last 40 log lines of {container}"
+        return " | ".join(lines[-5:])
+
+    def _liveness_guard(self, container: str, http_probe: Callable[[], tuple[bool, Any]]) -> Callable[[], tuple[bool, Any]]:
+        """Wrap an HTTP readiness probe so a dead container fails immediately.
+
+        Without this, a server that refuses to start (ENTITY_TYPES in v1.5.7) sat
+        out the whole health timeout and the next experiment inherited the corpse.
+        """
+        restarting = {"streak": 0}
+
+        def check() -> tuple[bool, Any]:
+            state = self._container_state(container)
+            if state in ("exited", "dead"):
+                raise StepError(f"{container} is {state}: {self._container_error_lines(container)}")
+            if state == "restarting":
+                restarting["streak"] += 1
+                if restarting["streak"] >= 2:
+                    raise StepError(
+                        f"{container} kept restarting ({restarting['streak']} polls in a row): "
+                        f"{self._container_error_lines(container)}"
+                    )
+            else:
+                restarting["streak"] = 0
+            return http_probe()
+
+        return check
 
     def _health(self) -> tuple[bool, Any]:
         try:
@@ -988,8 +1120,38 @@ class Loop:
         return status == 200 and str(body.get("status", "")).lower() == "healthy", body
 
     def _wait_healthy(self) -> None:
-        self._wait_until(self._health, timeout=HEALTH_TIMEOUT, interval=10, what=f"{CONTAINER} health")
+        self._wait_until(
+            self._liveness_guard(CONTAINER, self._health),
+            timeout=HEALTH_TIMEOUT,
+            interval=10,
+            what=f"{CONTAINER} health",
+        )
         self.log(f"{CONTAINER}: healthy")
+
+    def _gateway_running(self) -> bool:
+        code, out, _err = self.ops.run(["docker", "ps", "--format", "{{.Names}}"], cwd=self.root, timeout=60)
+        if code != 0:
+            return False
+        return any(GATEWAY_CONTAINER in line for line in out.splitlines())
+
+    def _gateway_up(self) -> tuple[bool, Any]:
+        """The gateway is up once it answers on any path, even a 404."""
+        if not self._gateway_running():
+            return False, f"{GATEWAY_CONTAINER} is not in docker ps"
+        try:
+            status, body = self.ops.http_json("GET", f"{GATEWAY_URL}/", timeout=15)
+        except Exception as exc:
+            return False, str(exc)
+        return True, {"status": status}
+
+    def _wait_gateway_up(self) -> None:
+        self._wait_until(
+            self._liveness_guard(GATEWAY_CONTAINER, self._gateway_up),
+            timeout=HEALTH_TIMEOUT,
+            interval=5,
+            what=f"{GATEWAY_CONTAINER} readiness",
+        )
+        self.log(f"{GATEWAY_CONTAINER}: up")
 
     def _sigma_up(self) -> tuple[bool, Any]:
         try:
@@ -1001,14 +1163,16 @@ class Loop:
         return status == 200, body
 
     def _ensure_services(self) -> None:
-        """Wait out a down LightRAG or sigma judge for up to 10 minutes."""
+        """Wait out a down LightRAG, gateway or sigma judge for up to 10 minutes."""
         self._wait_until(self._health, timeout=SERVICE_DOWN_WAIT, interval=15, what="LightRAG /health")
+        if self.gateway_touched:
+            self._wait_until(self._gateway_up, timeout=SERVICE_DOWN_WAIT, interval=15, what=f"{GATEWAY_CONTAINER}")
         self._wait_until(self._sigma_up, timeout=SERVICE_DOWN_WAIT, interval=15, what="judge service (sigma)")
 
-    def _container_env(self) -> dict[str, str]:
-        code, out, err = self.ops.run(["docker", "exec", CONTAINER, "env"], timeout=60)
+    def _container_env(self, container: str) -> dict[str, str]:
+        code, out, err = self.ops.run(["docker", "exec", container, "env"], timeout=60)
         if code != 0:
-            raise StepError(f"docker exec env failed rc={code}: {err.strip()}")
+            raise StepError(f"docker exec {container} env failed rc={code}: {err.strip()}")
         values: dict[str, str] = {}
         for line in out.splitlines():
             if "=" in line:
@@ -1020,16 +1184,25 @@ class Loop:
         if self.dry_run:
             self.log(f"dry run: skipping 'docker exec env' verification of {len(set_values)} key(s)")
             return
-        actual = self._container_env()
-        mismatched = {
-            key: (value, actual.get(key))
-            for key, value in set_values.items()
-            if actual.get(key) != value
-        }
-        if mismatched:
-            detail = ", ".join(f"{k}: wanted {wanted!s} got {got!s}" for k, (wanted, got) in mismatched.items())
-            raise StepError(f"container env not applied: {detail}")
-        self.log(f"{CONTAINER}: env verified for {len(set_values)} key(s)")
+        # Which service reads a key decides which container proves it: the gateway
+        # allow-list is disjoint from LightRAG's, and both read the same .env.
+        groups = {CONTAINER: {}, GATEWAY_CONTAINER: {}}
+        for key, value in set_values.items():
+            container = GATEWAY_CONTAINER if key in GATEWAY_ENV_WHITELIST else CONTAINER
+            groups[container][key] = value
+        checked = 0
+        for container, values in groups.items():
+            if not values:
+                continue
+            actual = self._container_env(container)
+            mismatched = {key: (value, actual.get(key)) for key, value in values.items() if actual.get(key) != value}
+            if mismatched:
+                detail = ", ".join(f"{k}: wanted {wanted!s} got {got!s}" for k, (wanted, got) in mismatched.items())
+                raise StepError(f"{container} env not applied: {detail}")
+            checked += len(values)
+            self.log(f"{container}: env verified for {len(values)} key(s)")
+        if checked == 0:
+            self.log("no env keys to verify")
 
     # ── step 3: reingest ───────────────────────────────────────────────────
 
@@ -1279,6 +1452,9 @@ class Loop:
         self.save_state()
         self._restart_server()
         self._wait_healthy()
+        if experiment.get("gateway_env"):
+            self._restart_gateway()
+            self._wait_gateway_up()
         self._verify_env(set_values)
         if experiment["reingest"]:
             self._reingest(experiment)
@@ -1357,8 +1533,37 @@ class Loop:
             "LightRAG API key: present" if key else "LightRAG API key: absent (open access)"
         )
 
+    def _recover_to_baseline(self, *, why: str) -> None:
+        """Put the stack back into its baseline config before the next experiment.
+
+        Without this, an experiment that killed the server left the corpse for its
+        successor, which then burned the full health timeout and failed for the
+        wrong reason.
+        """
+        self.log(f"baseline recovery before the next experiment: {why}")
+        self._apply_env({"name": "baseline", "env": {}, "gateway_env": {}, "reingest": False})
+        try:
+            self._restart_server()
+            self._wait_healthy()
+        except StepError as exc:
+            raise UnrecoverableRun(
+                f"cannot restore the baseline {CONTAINER}: {exc}; "
+                f"{self._container_error_lines(CONTAINER)}"
+            ) from exc
+        if self.gateway_touched:
+            try:
+                self._restart_gateway()
+                self._wait_gateway_up()
+            except StepError as exc:
+                raise UnrecoverableRun(
+                    f"cannot restore the baseline {GATEWAY_CONTAINER}: {exc}; "
+                    f"{self._container_error_lines(GATEWAY_CONTAINER)}"
+                ) from exc
+        self.log("baseline recovery done; the next experiment starts from the baseline config")
+
     def _run_experiments(self) -> None:
         consecutive_errors = 0
+        needs_recovery = False
         for experiment in self.config["experiments"]:
             name = experiment["name"]
             record = self.state["experiments"].get(name)
@@ -1368,6 +1573,9 @@ class Loop:
                 continue
             if self.resume and self.retry_errors and record and record.get("status") == "error":
                 self.log(f"{name}: previous status was error; running it again (--retry-errors)")
+            if needs_recovery:
+                self._recover_to_baseline(why="the previous experiment ended in error")
+                needs_recovery = False
             if self.ops.now() > self.deadline:
                 self.state["stop_reason"] = "time_budget"
                 self.log(f"max-hours {self.max_hours} reached; not starting {name}")
@@ -1393,8 +1601,8 @@ class Loop:
             except FatalRun as exc:
                 record["status"] = "error"
                 record["error"] = str(exc)
-                self.state["status"] = "aborted"
-                self.state["stop_reason"] = "fatal"
+                self.state["status"] = "fatal" if isinstance(exc, UnrecoverableRun) else "aborted"
+                self.state["stop_reason"] = "fatal" if isinstance(exc, UnrecoverableRun) else str(exc)
                 self.log(f"{name}: FATAL, stopping the run: {exc}")
                 self.save_state()
                 return
@@ -1402,6 +1610,7 @@ class Loop:
                 record["status"] = "error"
                 record["error"] = str(exc)
                 consecutive_errors += 1
+                needs_recovery = True
                 self.log(f"{name}: experiment error ({consecutive_errors} consecutive): {exc}")
                 if consecutive_errors >= 3:
                     self.state["stop_reason"] = "three_consecutive_errors"
@@ -1424,7 +1633,7 @@ class Loop:
                 self.state["status"] = "complete"
         except FatalRun as exc:
             self.log(f"run aborted: {exc}")
-            self.state["status"] = "aborted"
+            self.state["status"] = "fatal" if isinstance(exc, UnrecoverableRun) else "aborted"
             self.state["stop_reason"] = str(exc)
             exit_code = 1
         except Exception as exc:  # never leave the stack in an experiment config
@@ -1447,6 +1656,9 @@ class Loop:
                 self.log(f"env restored from {self.env_original_path.name} ({len(self.changed_keys)} key(s) reverted)")
                 self._restart_server()
                 self._wait_healthy()
+                if self.gateway_touched:
+                    self._restart_gateway()
+                    self._wait_gateway_up()
             else:
                 self.log("no env keys were changed; nothing to restore")
         except Exception as exc:  # finalise must never raise
@@ -1711,9 +1923,14 @@ def build_plan_lines(config: dict[str, Any]) -> list[str]:
     lines = ["plan:"]
     for index, experiment in enumerate(config["experiments"], 1):
         env = ", ".join(f"{k}={v}" for k, v in sorted(experiment["env"].items())) or "(baseline only)"
+        gateway_env = experiment.get("gateway_env") or {}
+        gateway_part = (
+            " gateway_env[" + ", ".join(f"{k}={v}" for k, v in sorted(gateway_env.items())) + "]"
+            if gateway_env else ""
+        )
         lines.append(
-            f"  {index}. {experiment['name']}: env[{env}] reingest={experiment['reingest']} "
-            f"probe_concurrency={experiment['probe_concurrency']}"
+            f"  {index}. {experiment['name']}: env[{env}]{gateway_part} "
+            f"reingest={experiment['reingest']} probe_concurrency={experiment['probe_concurrency']}"
         )
     return lines
 

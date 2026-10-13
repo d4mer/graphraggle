@@ -66,6 +66,8 @@ class FakeOps(ol.Ops):
         self.http_calls: list[tuple[str, str]] = []
         self.headers_seen: list[tuple[str, dict]] = []
         self.delete_status = 200
+        self.container_states: dict[str, str] = {}
+        self.logs: dict[str, str] = {}
         self.worker_running = False
         self.fail_compose_calls: set[int] = set()
         self.raise_on_exec = False
@@ -90,6 +92,16 @@ class FakeOps(ol.Ops):
                 return 1, "", "compose exploded"
             return 0, "", ""
         if argv[:2] == ["docker", "ps"]:
+            if "-a" in argv:
+                raw = ""
+                for index, arg in enumerate(argv):
+                    if arg.startswith("--filter"):
+                        if arg.startswith("--filter="):
+                            raw = arg.split("=", 1)[1]
+                        elif index + 1 < len(argv):
+                            raw = argv[index + 1]
+                name = raw.removeprefix("name=")
+                return 0, self.container_states.get(name or ol.CONTAINER, "running") + "\n", ""
             names = ["lightrag-server", "rag-gateway-api"]
             if self.worker_running:
                 names.append("rag-ingest-worker")
@@ -441,7 +453,9 @@ class TestDriver(_Case):
             "baseline_env": {},
             "experiments": [{"name": f"E{i}", "env": {}} for i in range(1, 5)],
         })
-        self.ops.fail_compose_calls = {1, 2, 3, 4, 5}
+        # every experiment's own compose fails; the compose that baseline recovery
+        # issues in between succeeds, so the run reaches the 3-error stop
+        self.ops.fail_compose_calls = {1, 3, 5}
         self.make_loop(config).run()
         state = self.state()
         self.assertEqual([state["experiments"][f"E{i}"]["status"] for i in range(1, 4)], ["error", "error", "error"])
@@ -975,20 +989,70 @@ class TestRealOps(unittest.TestCase):
 # ── end-to-end with the REAL Ops: fake docker on PATH + stub services ──────
 
 FAKE_DOCKER = """#!/usr/bin/env bash
-# Records its arguments, then answers the three subcommands overnight_loop uses.
+# Records its arguments, then answers the subcommands overnight_loop uses.
+# Behaviour is steered by files in $FAKE_DOCKER_DIR:
+#   always-exit         every lightrag-server recreate leaves the container exited
+#   always-restarting   every lightrag-server recreate leaves it restarting
+#   state-<container>   the state `docker ps -a` reports (default: running)
+#   logs-<container>    output of `docker logs --tail 40 <container>`
+#   gateway-running     marker set once gateway-api has been recreated
+#   exec-empty-gateway  `docker exec rag-gateway-api env` prints nothing
 echo "$*" >> "$FAKE_DOCKER_LOG"
 case "$1" in
-  ps)   echo "lightrag-server"; echo "rag-gateway-api"; exit 0;;
-  compose) exit 0;;
+  ps)
+    shift
+    format=""; filter=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --filter) filter="$2"; shift ;;
+        --format) format="$2"; shift ;;
+      esac
+      shift
+    done
+    if [ "$format" = "{{.State}}" ]; then
+      name="${filter#name=}"
+      if [ -f "$FAKE_DOCKER_DIR/state-$name" ]; then cat "$FAKE_DOCKER_DIR/state-$name"; else echo running; fi
+      exit 0
+    fi
+    echo lightrag-server
+    if [ -f "$FAKE_DOCKER_DIR/gateway-running" ]; then echo rag-gateway-api; fi
+    exit 0;;
+  compose)
+    case "$*" in
+      *gateway-api*) touch "$FAKE_DOCKER_DIR/gateway-running" ;;
+      *lightrag-server*)
+        if [ -f "$FAKE_DOCKER_DIR/always-exit" ]; then
+          echo exited > "$FAKE_DOCKER_DIR/state-lightrag-server"
+        elif [ -f "$FAKE_DOCKER_DIR/always-restarting" ]; then
+          echo restarting > "$FAKE_DOCKER_DIR/state-lightrag-server"
+        elif grep -q '^CHUNK_SIZE=666' "$FAKE_DOCKER_ENV_FILE"; then
+          echo exited > "$FAKE_DOCKER_DIR/state-lightrag-server"
+        else
+          rm -f "$FAKE_DOCKER_DIR/state-lightrag-server"
+        fi ;;
+    esac
+    exit 0;;
   exec)
-    if [ "$2" = "lightrag-server" ] && [ "$3" = "env" ]; then
+    if [ "$3" = "env" ]; then
+      if [ -f "$FAKE_DOCKER_DIR/exec-empty-gateway" ] && [ "$2" = "rag-gateway-api" ]; then exit 0; fi
       grep -E '^[A-Z_][A-Z0-9_]*=' "$FAKE_DOCKER_ENV_FILE"
       exit 0
     fi
     exit 1;;
+  logs)
+    shift 3
+    if [ -f "$FAKE_DOCKER_DIR/logs-$1" ]; then cat "$FAKE_DOCKER_DIR/logs-$1"; fi
+    exit 0;;
 esac
 exit 0
 """
+
+CONTAINER_LOG_WITH_ERROR = (
+    "INFO: started\n"
+    "ERROR: CHUNK_SIZE environment variable is no longer supported for this value\n"
+    "ERROR: startup aborted with LIGHTRAG_API_KEY=super-secret-value-do-not-log\n"
+    "Traceback (most recent call last):\n"
+)
 
 E2E_ENV = (
     "RAG_API_KEY=gw-secret-do-not-log\n"
@@ -1042,9 +1106,10 @@ class _E2EFixture:
         transcript.write_text("transcript one: Marie is in Paris\n", encoding="utf-8")
         (probe / "loop_corpus.json").write_text(json.dumps([str(transcript)]), encoding="utf-8")
 
-        # fake docker, first on PATH
+        # fake docker, first on PATH; its behaviour is steered by files in bin_dir
         bin_dir = Path(self.tmp.name) / "bin"
         bin_dir.mkdir()
+        self.docker_dir = bin_dir
         docker = bin_dir / "docker"
         docker.write_text(FAKE_DOCKER, encoding="utf-8")
         docker.chmod(0o755)
@@ -1052,6 +1117,7 @@ class _E2EFixture:
         self.environ_backup = dict(os.environ)
         os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
         os.environ["FAKE_DOCKER_LOG"] = str(self.docker_log)
+        os.environ["FAKE_DOCKER_DIR"] = str(bin_dir)
         os.environ["FAKE_DOCKER_ENV_FILE"] = str(self.root / ".env")
         self.addCleanup(self._restore_env)
 
@@ -1679,6 +1745,293 @@ class TestBrokenPipeFinalise(_E2EFixture, unittest.TestCase):
         self.assertIn("env restored", "\n".join(lines))
         state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "complete")
+
+
+# ── packet-33: failure isolation, fail-fast start, gateway env ────────
+
+
+class TestEntityTypesRefused(unittest.TestCase):
+    """LightRAG v1.5.7 refuses to start with ENTITY_TYPES, so the driver must
+    refuse the config instead of paying 5 minutes per experiment for it."""
+
+    def test_entity_types_is_out_of_the_whitelist_and_forbidden(self):
+        self.assertNotIn("ENTITY_TYPES", ol.ENV_WHITELIST)
+        self.assertIn("ENTITY_TYPES", ol.NEVER_CHANGE_EXACT)
+
+    def test_check_env_keys_names_the_real_reason(self):
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            ol.check_env_keys({"ENTITY_TYPES": "Person, Organization"}, "experiment E3")
+        self.assertEqual(
+            str(caught.exception),
+            "experiment E3: ENTITY_TYPES is not supported by LightRAG v1.5.7 (server refuses to start)",
+        )
+
+    def test_experiments_file_using_it_is_refused_at_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "experiments.json"
+            path.write_text(
+                json.dumps({
+                    "baseline_env": {},
+                    "experiments": [{"name": "E3", "env": {"ENTITY_TYPES": "Person, Organization"}}],
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ol.LoopConfigError) as caught:
+                ol.load_experiments(path)
+            self.assertIn(
+                "ENTITY_TYPES is not supported by LightRAG v1.5.7 (server refuses to start)",
+                str(caught.exception),
+            )
+
+    def test_cli_refuses_such_a_config_before_touching_anything(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "experiments.json"
+            path.write_text(
+                json.dumps({"baseline_env": {}, "experiments": [{"name": "E3", "env": {"ENTITY_TYPES": "x"}}]}),
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = ol.main(["--root", tmp, "--experiments", str(path), "--out", f"{tmp}/loop", "--dry-run"])
+            self.assertEqual(code, 3)
+            self.assertIn("server refuses to start", stderr.getvalue())
+            self.assertFalse((Path(tmp) / "loop").exists())
+
+
+class TestGatewayEnvAllowList(unittest.TestCase):
+    def test_only_the_gateway_allow_list_is_accepted(self):
+        for key in sorted(ol.GATEWAY_ENV_WHITELIST):
+            ol.check_env_keys({key: "1"}, "experiment G1", allow=ol.GATEWAY_ENV_WHITELIST)
+        self.assertEqual(
+            set(ol.GATEWAY_ENV_WHITELIST),
+            {
+                "BRIDGE_TOP_K", "BRIDGE_CHUNK_TOP_K", "BRIDGE_MAX_ENTITY_TOKENS",
+                "BRIDGE_MAX_RELATION_TOKENS", "BRIDGE_MAX_TOTAL_TOKENS", "BRIDGE_ENABLE_RERANK",
+                "GATEWAY_CHUNK_TOP_K", "CITATION_TOP_K",
+            },
+        )
+        self.assertFalse(set(ol.GATEWAY_ENV_WHITELIST) & set(ol.ENV_WHITELIST))
+
+    def test_a_lightrag_key_in_gateway_env_is_refused(self):
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            ol.check_env_keys({"CHUNK_SIZE": "1"}, "experiment G1", allow=ol.GATEWAY_ENV_WHITELIST)
+        self.assertIn("not in the whitelist", str(caught.exception))
+
+    def test_load_refuses_a_gateway_key_that_is_not_allow_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "experiments.json"
+            path.write_text(
+                json.dumps({"baseline_env": {}, "experiments": [{"name": "G1", "env": {}, "gateway_env": {"MAX_ASYNC": "4"}}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ol.LoopConfigError) as caught:
+                ol.load_experiments(path)
+            self.assertIn("experiment G1: key MAX_ASYNC is not in the whitelist", str(caught.exception))
+
+    def test_load_refuses_a_credential_in_gateway_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "experiments.json"
+            path.write_text(
+                json.dumps({"baseline_env": {}, "experiments": [{"name": "G1", "gateway_env": {"BRIDGE_API_KEY": "x"}}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ol.LoopConfigError):
+                ol.load_experiments(path)
+
+    def test_plan_lines_show_gateway_env(self):
+        config = {
+            "experiments": [{
+                "name": "G1", "env": {"CHUNK_SIZE": "800"}, "gateway_env": {"BRIDGE_TOP_K": "8"},
+                "reingest": False, "probe_concurrency": 1,
+            }]
+        }
+        line = "\n".join(ol.build_plan_lines(config))
+        self.assertIn("env[CHUNK_SIZE=800]", line)
+        self.assertIn("gateway_env[BRIDGE_TOP_K=8]", line)
+
+
+class TestSecretMasking(unittest.TestCase):
+    def test_key_token_secret_and_password_values_are_masked(self):
+        masked = ol.mask_secrets(
+            "ERROR LIGHTRAG_API_KEY=abc123 OPENAI_TOKEN=tok CLIENT_SECRET=s33t DB_PASSWORD=pw"
+        )
+        for secret in ("abc123", "tok", "s33t", "pw"):
+            self.assertNotIn(secret, masked)
+        self.assertIn("LIGHTRAG_API_KEY=<masked>", masked)
+        self.assertIn("DB_PASSWORD=<masked>", masked)
+
+    def test_an_ordinary_log_line_is_left_alone(self):
+        text = "ERROR: ENTITY_TYPES environment variable is no longer supported"
+        self.assertEqual(ol.mask_secrets(text), text)
+
+
+class TestFailureIsolation(_E2EFixture, unittest.TestCase):
+    """Real Ops against the fake docker on PATH: a container that refuses to start
+    must cost seconds, and the next experiment must start on a restored baseline."""
+
+    def _run(self, experiments: list[dict], baseline_env: dict | None = None) -> tuple[int, dict, float, str]:
+        path = Path(self.tmp.name) / "experiments.json"
+        path.write_text(
+            json.dumps({"baseline_env": baseline_env or {}, "experiments": experiments}), encoding="utf-8"
+        )
+        config = ol.load_experiments(path)
+        loop = ol.Loop(
+            root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+            handle_signals=False, print_fn=lambda line: None,
+        )
+        started = time.monotonic()
+        code = loop.run()
+        elapsed = time.monotonic() - started
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        return code, state, elapsed, log
+
+    def docker_calls(self) -> list[str]:
+        return self.docker_log.read_text(encoding="utf-8").splitlines() if self.docker_log.exists() else []
+
+    def test_exited_container_fails_in_seconds_and_the_next_experiment_gets_a_healthy_baseline(self):
+        (self.docker_dir / "logs-lightrag-server").write_text(CONTAINER_LOG_WITH_ERROR, encoding="utf-8")
+        code, state, elapsed, log = self._run([
+            {"name": "E1-poison", "env": {"CHUNK_SIZE": "666"}, "reingest": False},
+            {"name": "E2-after", "env": {"CHUNK_SIZE": "900"}, "reingest": False},
+        ])
+        # HEALTH_TIMEOUT is 300 s; a run that noticed the exit should never come close
+        self.assertLess(elapsed, 30.0)
+        self.assertEqual(state["experiments"]["E1-poison"]["status"], "error")
+        first_error = state["experiments"]["E1-poison"]["error"]
+        self.assertIn("lightrag-server is exited", first_error)
+        self.assertIn("no longer supported", first_error)
+        self.assertIn("Traceback", first_error)
+        self.assertNotIn("timeout waiting for", log)
+        self.assertTrue(any("ps -a --filter name=lightrag-server --format {{.State}}" in call for call in self.docker_calls()))
+
+        # the recovery step ran and put the original CHUNK_SIZE back before E2
+        self.assertIn("baseline recovery before the next experiment", log)
+        self.assertIn("baseline: env set to CHUNK_SIZE=1200", log)
+        self.assertIn("baseline recovery done", log)
+        self.assertEqual(state["experiments"]["E2-after"]["status"], "done")
+        self.assertEqual(state["status"], "complete")
+        # finalise put production .env back exactly as it was
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
+        # the container log leaked an API key; neither artifact may repeat it
+        state_text = (self.out / "state.json").read_text(encoding="utf-8")
+        for blob in (state_text, log):
+            self.assertNotIn("super-secret-value-do-not-log", blob)
+        self.assertIn("LIGHTRAG_API_KEY=<masked>", log)
+        self.assertIn("LIGHTRAG_API_KEY=<masked>", state_text)
+
+    def test_a_container_stuck_restarting_fails_after_two_polls(self):
+        (self.docker_dir / "always-restarting").write_text("", encoding="utf-8")
+        (self.docker_dir / "logs-lightrag-server").write_text(
+            "ERROR: ENTITY_TYPES environment variable is no longer supported\n", encoding="utf-8"
+        )
+        # /health answers only while the container is not restarting, like a real
+        # crash-loop: the guard must see `restarting` twice in a row
+        def health(_record):
+            state_file = self.docker_dir / "state-lightrag-server"
+            if state_file.exists() and "restarting" in state_file.read_text(encoding="utf-8"):
+                return 503, {"status": "not ready"}
+            return 200, {"status": "healthy"}
+
+        self.stub.routes[("GET", "/health")] = health
+        code, state, elapsed, log = self._run([
+            {"name": "E1", "env": {"MAX_ASYNC": "2"}, "reingest": False},
+            {"name": "E2", "env": {}, "reingest": False},
+        ])
+        self.assertLess(elapsed, 30.0)
+        self.assertEqual(code, 1)
+        self.assertEqual(state["experiments"]["E1"]["status"], "error")
+        self.assertIn("kept restarting", state["experiments"]["E1"]["error"])
+        self.assertIn("no longer supported", state["experiments"]["E1"]["error"])
+        # recovery cannot bring it back either, so the run stops as fatal
+        self.assertEqual(state["status"], "fatal")
+        self.assertIn("cannot restore the baseline lightrag-server", state["stop_reason"])
+        self.assertNotIn("E2", state["experiments"])
+
+    def test_when_the_baseline_cannot_be_recovered_the_run_is_fatal_but_finalise_still_runs(self):
+        (self.docker_dir / "always-exit").write_text("", encoding="utf-8")
+        (self.docker_dir / "logs-lightrag-server").write_text(CONTAINER_LOG_WITH_ERROR, encoding="utf-8")
+        code, state, elapsed, log = self._run([
+            {"name": "E1", "env": {"MAX_ASYNC": "2"}, "reingest": False},
+            {"name": "E2", "env": {}, "reingest": False},
+        ])
+        self.assertEqual(code, 1)
+        self.assertEqual(state["status"], "fatal")
+        self.assertIn("cannot restore the baseline lightrag-server", state["stop_reason"])
+        self.assertIn("no longer supported", state["stop_reason"])
+        self.assertNotIn("E2", state["experiments"])  # never started on a dead server
+        self.assertNotIn("super-secret-value-do-not-log", (self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertIn("LIGHTRAG_API_KEY=<masked>", state["stop_reason"])
+        # finalise still restored .env even though restoring the server failed
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
+        self.assertIn("FINALISE FAILED", log)
+
+
+class TestGatewayEnvExperiments(_E2EFixture, unittest.TestCase):
+    def _run(self, experiments: list[dict]) -> tuple[dict, str]:
+        path = Path(self.tmp.name) / "experiments.json"
+        path.write_text(json.dumps({"baseline_env": {}, "experiments": experiments}), encoding="utf-8")
+        config = ol.load_experiments(path)
+        loop = ol.Loop(
+            root=self.root, out=self.out, config=config, ops=_FastOps(), max_hours=1.0,
+            handle_signals=False, print_fn=lambda line: None,
+        )
+        self.assertEqual(loop.run(), 0)
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        return state, (self.out / "loop.log").read_text(encoding="utf-8")
+
+    def test_gateway_keys_are_written_recreated_verified_and_restored(self):
+        state, log = self._run([{
+            "name": "G1", "env": {"MAX_ASYNC": "2"},
+            "gateway_env": {"BRIDGE_TOP_K": "8", "CITATION_TOP_K": "20"}, "reingest": False,
+        }])
+        self.assertEqual(state["experiments"]["G1"]["status"], "done")
+        self.assertIn("G1: env set to BRIDGE_TOP_K=8, CITATION_TOP_K=20, MAX_ASYNC=2", log)
+        calls = self.docker_log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(
+            any("compose" in call and "up -d --no-deps gateway-api" in call for call in calls),
+            f"gateway-api was never recreated: {calls}",
+        )
+        # the keys are proven against the gateway container, not the LightRAG one
+        self.assertIn("rag-gateway-api: env verified for 2 key(s)", log)
+        self.assertIn("rag-gateway-api: up", log)
+        # finalise recreated the gateway too, and restored both env files
+        self.assertEqual(len([call for call in calls if "up -d --no-deps gateway-api" in call]), 2)
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
+        self.assertIn("rag-gateway-api: recreated", log)
+
+    def test_gateway_keys_are_verified_against_the_gateway_container(self):
+        (self.docker_dir / "exec-empty-gateway").write_text("", encoding="utf-8")
+        path = Path(self.tmp.name) / "experiments.json"
+        path.write_text(
+            json.dumps({"baseline_env": {}, "experiments": [
+                {"name": "G1", "env": {}, "gateway_env": {"BRIDGE_TOP_K": "8"}, "reingest": False},
+            ]}),
+            encoding="utf-8",
+        )
+        loop = ol.Loop(
+            root=self.root, out=self.out, config=ol.load_experiments(path), ops=_FastOps(), max_hours=1.0,
+            handle_signals=False, print_fn=lambda line: None,
+        )
+        loop.run()
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["experiments"]["G1"]["status"], "error")
+        self.assertIn("rag-gateway-api env not applied", state["experiments"]["G1"]["error"])
+        self.assertIn("BRIDGE_TOP_K: wanted 8 got None", state["experiments"]["G1"]["error"])
+
+    def test_a_gateway_failure_recovers_both_containers_before_the_next_experiment(self):
+        (self.docker_dir / "exec-empty-gateway").write_text("", encoding="utf-8")
+        state, log = self._run([
+            {"name": "G1-bad", "env": {}, "gateway_env": {"BRIDGE_TOP_K": "8"}, "reingest": False},
+            {"name": "E2-good", "env": {"MAX_ASYNC": "4"}, "reingest": False},
+        ])
+        self.assertEqual(state["experiments"]["G1-bad"]["status"], "error")
+        self.assertEqual(state["experiments"]["E2-good"]["status"], "done")
+        self.assertIn("baseline recovery done", log)
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), E2E_ENV)
 
 
 if __name__ == "__main__":
