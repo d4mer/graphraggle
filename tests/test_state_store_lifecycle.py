@@ -123,7 +123,7 @@ class TestTransitionTable(unittest.TestCase):
         self.assertTrue(state_store.is_legal_transition("quarantined", "validating"))
 
 
-# ── update_document_state / update_status guards ────────────────────────────
+# ── update_document_state guards ────────────────────────────────────────────
 
 class TestUpdateGuards(_RealStore):
     def test_illegal_edge_is_refused_and_the_row_is_untouched(self) -> None:
@@ -131,7 +131,9 @@ class TestUpdateGuards(_RealStore):
         before = _row()
 
         self.assertFalse(_run(state_store.update_document_state(PATH, status="failed", error_code="boom")))
-        self.assertFalse(_run(state_store.update_status(PATH, "processing")))
+        self.assertFalse(
+            _run(state_store.update_document_state(PATH, status="processing", query_ready=False))
+        )
 
         self.assertEqual(_row(), before)
 
@@ -146,7 +148,7 @@ class TestUpdateGuards(_RealStore):
         self.assertEqual(_row()["status"], "ingested")
         self.assertEqual(_row()["query_ready"], 1)
         # force reindex from an ingested row
-        self.assertTrue(_run(state_store.update_status(PATH, "pending")))
+        self.assertTrue(_run(state_store.update_document_state(PATH, status="pending", query_ready=False)))
         self.assertEqual(_row()["status"], "pending")
         self.assertEqual(_row()["query_ready"], 0)
 

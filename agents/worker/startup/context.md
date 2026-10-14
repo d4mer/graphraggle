@@ -1,23 +1,47 @@
 # Handoff — worker
 
-Last updated: 2026-10-14 (after **TODO #3 upload vs scan semantics** hand-back;
-TODO #4 `qitem-20261014082513-5cb9b9e6` is **pending, deliberately unclaimed** —
-it is blocked until the lead commits/pushes #3)
+Last updated: 2026-10-14 (after **lifecycle cleanup / TODO #2 deferred items**
+hand-back; queue: one new row just arrived, `qitem-20261014083709-86837b07`, not
+yet read)
 
 ## Current state
 
-Queue: `rig queue list --owned` → `[]` (both #3 rows handed back), `rig queue
-inbox-pending dev-worker@graphraggle` → the #4 row, left unclaimed on purpose.
-
-**BLOCKED / WAITING:** `qitem-20261014082513-5cb9b9e6` — "lifecycle cleanup
-(deferred items from TODO #2)". Its precondition is "do NOT start until TODO #3
-is committed": needs `git status --short` clean of tracked modifications AND
-`HEAD...origin/master` = `0 0`. Told the lead I am waiting. When it unblocks:
-claim it, then work items (CAS decision for `submit_file`'s post-HTTP writes,
-`increment_retry`/`handle_candidate` CAS, dead `update_status()`, magic
-`sha256='pending'`, unreachable `superseded`) in this same checkout, uncommitted.
+Queue: `qitem-20261014083709-86837b07` pending from the lead — read + claim it
+next. Everything else handed back.
 
 Latest item, **handed off uncommitted** (lead commits/pushes):
+`qitem-20261014082513-5cb9b9e6` — lifecycle cleanup. Diff: `app/state_store.py`
+**+58/−15**, `app/worker.py` **+28/−2**, `docs/decisions/0001-lifecycle-model.md`
+**+77/−1**, `tests/test_lifecycle_cleanup.py` **new 221 lines / 7 tests**,
+`tests/test_state_store_lifecycle.py` +5/−3, `tests/test_worker_dedupe.py` +5/−1.
+What changed: (1) `increment_retry(path, *, expect_track_id=, expect_status=)` —
+CAS'd retry counting, shared `_cas_clause()` helper (also used by
+`update_document_state`); worker's two call sites in `handle_candidate` pass the
+snapshot's track_id/status. (2) `submit_file`'s two post-submit **failure**
+write-backs carry `expect_status="accepted"`; the **successful** upsert is
+deliberately unguarded (comment in code: dropping it would strand a live track;
+its stale `warnings_json` overwrite is the known residual). (3) `update_status()`
+deleted (no app/ caller) — its two test uses moved to `update_document_state`.
+(4) `READ_DERIVED_STATUSES = frozenset({"superseded"})` + comment: nothing in
+app/ writes superseded, it is derived by `annotate_documents` /
+`derive_readiness`; behaviour unchanged. (5) ADR 0001 now documents the enforced
+table, the CAS rule, and what a refused write looks like in the log.
+**Test edit the lead must know about:** `tests/test_worker_dedupe.py`
+`_FakeStateStore.increment_retry(self, path, **kwargs)` — signature widened only;
+the fake ignores the CAS (assertions untouched), the real CAS is covered in the
+new file. Tests: bare env **`681 passed, 2 warnings, 6 subtests passed in 3.19s`**;
+six vars exported **`681 passed … 3.01s`**; pre-change control (`git stash push --
+app/worker.py app/state_store.py`) → **`4 failed, 677 passed`** — the 4 are in the
+new file (2 REPRODUCTION + the new-signature + the READ_DERIVED marker test);
+existing suite green pre-change too. pyflakes: only the 3 pre-existing `app/api.py`
+findings. App backups while testing: `/tmp/p39-fix/{worker,state_store}.py`.
+
+Earlier this session, both committed by the lead: TODO #3 (`b7423b2` — one
+duplicate rule + one skip rule; verdicts: item 1 real bug, item 2 real bug, item 3
+intended asymmetry, item 4 intended per ADR 0004; new finding = company-blind
+duplicate selection, which the lead will brief separately — do not fix it), TODO #2
+review follow-up and TODO #2 (`224cea9` lifecycle table + CAS), conftest env
+defaults (`6f523b7`).
 `qitem-20261014081856-2ec58157` — **TODO #3 upload vs source-doc ingestion
 semantics**. Files: `app/api.py` **+10/−3**, `app/worker.py` **+18/−5**, new
 `tests/test_upload_vs_scan_semantics.py` (287 lines, 7 tests). Fixes: (1) `/upload`
@@ -294,13 +318,13 @@ on an ERROR line.
 
 ## Next step
 
-**Waiting on the lead** to commit/push TODO #3, then claim
-`qitem-20261014082513-5cb9b9e6` (lifecycle cleanup). Verify the precondition
-first: `git status --short` shows no modified tracked files and
-`git fetch && git rev-list --left-right --count HEAD...origin/master` = `0 0`.
-Current test baseline after #3: **674 passed**. If instead a tweak to #3 is
-asked for, the change is uncommitted here (`app/api.py`, `app/worker.py`,
-`tests/test_upload_vs_scan_semantics.py`).
+Read + claim `qitem-20261014083709-86837b07` (`rig queue show <id> --full
+--json`). If a tweak to the lifecycle cleanup is asked for instead, it is
+uncommitted here (`app/state_store.py`, `app/worker.py`,
+`docs/decisions/0001-lifecycle-model.md`, `tests/test_lifecycle_cleanup.py`,
+`tests/test_worker_dedupe.py`, `tests/test_state_store_lifecycle.py`) — verify
+with `env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
+**681 passed**).
 On wake: `rig queue list
 --owned` and `rig queue inbox-pending dev-worker@graphraggle` (the second needs
 the destination session as an argument). Likely follow-ups: a new packet off the

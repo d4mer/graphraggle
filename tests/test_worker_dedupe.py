@@ -81,7 +81,11 @@ class _FakeStateStore:
     async def upsert_document(self, **kwargs) -> None:
         self.upserted.append(kwargs)
 
-    async def increment_retry(self, path: str) -> int:
+    async def increment_retry(self, path: str, **kwargs) -> int:
+        # Signature widened for expect_track_id / expect_status (lifecycle
+        # cleanup); the fake records the call and increments regardless - the
+        # compare-and-set itself is covered against the real state_store in
+        # tests/test_lifecycle_cleanup.py.
         self.retried.append(path)
         doc = self.docs.get(path)
         if not doc:

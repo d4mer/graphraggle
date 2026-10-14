@@ -92,6 +92,15 @@ STATUSES = frozenset({
     "superseded",
 })
 
+# `superseded` is never written as a stored status anywhere in app/: supersession
+# is derived at read time by annotate_documents(), which marks a row superseded
+# when another ACTIVE row names it in supersedes_document_id, and
+# derive_readiness() additionally tolerates a legacy row that carries the value.
+# It stays in STATUSES and in the table below so such a row is not wedged (it can
+# be re-validated or resubmitted) and so the code's vocabulary matches ADR 0001.
+# Anyone adding a writer has to say so here first.
+READ_DERIVED_STATUSES = frozenset({"superseded"})
+
 # source -> statuses it may move to. A status is always reachable from itself
 # (see is_legal_transition) so idempotent replays of the same event are no-ops
 # rather than illegal transitions. Read the denials, not the allowances:
@@ -165,6 +174,25 @@ def _row_identity(path: str, row: dict | None) -> str:
     if row is None:
         return f"path={path} no row"
     return f"path={path} status={row.get('status')} track_id={row.get('track_id')}"
+
+
+def _cas_clause(
+    *,
+    expect_track_id: object = UNSET,
+    expect_status: object = UNSET,
+) -> tuple[str, list[object]]:
+    """Compare-and-set fragment: only touch a row that still matches what the
+    caller read. ``track_id IS ?`` matches NULL, so a caller can require "no
+    track in flight". Empty fragment when nothing was expected."""
+    fragments: list[str] = []
+    params: list[object] = []
+    if expect_track_id is not UNSET:
+        fragments.append("track_id IS ?")
+        params.append(expect_track_id)
+    if expect_status is not UNSET:
+        fragments.append("status=?")
+        params.append(expect_status)
+    return (" AND ".join(fragments), params)
 
 
 def normalize_company(value: str | None) -> str | None:
@@ -482,12 +510,10 @@ async def update_document_state(
         guard_sql, guard_params = _status_transition_clause(status)
         where.append(guard_sql)
         where_params.extend(guard_params)
-    if expect_track_id is not UNSET:
-        where.append("track_id IS ?")
-        where_params.append(expect_track_id)
-    if expect_status is not UNSET:
-        where.append("status=?")
-        where_params.append(expect_status)
+    if expect_track_id is not UNSET or expect_status is not UNSET:
+        cas_sql, cas_params = _cas_clause(expect_track_id=expect_track_id, expect_status=expect_status)
+        where.append(cas_sql)
+        where_params.extend(cas_params)
 
     async with aiosqlite.connect(settings.state_db_path) as db:
         cur = await db.execute(
@@ -509,19 +535,36 @@ async def update_document_state(
         return True
 
 
-async def update_status(path: str, status: str, last_error: str | None = None) -> bool:
-    return await update_document_state(
-        path, status=status, last_error=last_error, query_ready=(status == "ingested")
-    )
+async def increment_retry(
+    path: str,
+    *,
+    expect_track_id: str | None | object = UNSET,
+    expect_status: str | object = UNSET,
+) -> int:
+    """``retry_count+1``, optionally compare-and-set on the row the caller read.
 
-
-async def increment_retry(path: str) -> int:
+    The worker decides to retry from a snapshot it read earlier. If the row has
+    moved to a different track_id or status since, the retry belongs to a
+    submission that no longer exists, so it must not be counted: the update then
+    matches no row, logs, and returns the count unchanged.
+    """
+    cas_sql, cas_params = _cas_clause(expect_track_id=expect_track_id, expect_status=expect_status)
+    where = "path=?" + (f" AND {cas_sql}" if cas_sql else "")
     async with aiosqlite.connect(settings.state_db_path) as db:
-        await db.execute(
-            "UPDATE documents SET retry_count=retry_count+1, updated_at=datetime('now') WHERE path=?",
-            (path,),
+        cur = await db.execute(
+            f"UPDATE documents SET retry_count=retry_count+1, updated_at=datetime('now') WHERE {where}",
+            [path, *cas_params],
         )
         await db.commit()
+        if cur.rowcount == 0:
+            row = await _fetch_row(db, path)
+            logger.warning(
+                "retry not counted for %s: expect_track_id=%s expect_status=%s, row now (%s)",
+                path,
+                expect_track_id if expect_track_id is not UNSET else "-",
+                expect_status if expect_status is not UNSET else "-",
+                _row_identity(path, row),
+            )
         cur = await db.execute("SELECT retry_count FROM documents WHERE path=?", (path,))
         row = await cur.fetchone()
         return row[0] if row else 0

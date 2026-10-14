@@ -555,8 +555,14 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
             if retryable
             else "Terminal LightRAG submit failure"
         )
+        # CAS: the failure verdict describes OUR attempt, which only stands while
+        # the row is still the "accepted" one this scan wrote. If the API (an
+        # operator reindex) moved the row in the meantime, that newer state wins
+        # and this write is dropped with a log line - otherwise the stale
+        # warnings_json copy here would erase the operator's reindex marker.
         await update_document_state(
             str(path),
+            expect_status="accepted",
             sha256=digest,
             status="failed",
             validation_state="warn" if verdict.verdict == "warn" else "accept",
@@ -587,8 +593,10 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
 
     track_id = resp.get("track_id") or None
     if not track_id:
+        # CAS for the same reason as the submit-failure write above.
         await update_document_state(
             str(path),
+            expect_status="accepted",
             sha256=digest,
             status="failed",
             validation_state="warn" if verdict.verdict == "warn" else "accept",
@@ -636,6 +644,12 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
             "track_poll_payload": None,
         }),
     )
+    # No CAS here on purpose: this is the write that records a live upstream
+    # track. Nothing else can know the track_id yet (it exists only in this
+    # local until this write), so no newer submission can be corrupted by it -
+    # and dropping it would strand a LightRAG track with no row pointing at it,
+    # which is worse than the stale-warning overwrite it does still carry
+    # (warnings_json is rewritten from this snapshot; see hand-back).
     await upsert_document(
         document_id=str(uuid.uuid4()),
         path=str(path),
@@ -1045,9 +1059,21 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
         if int(existing.get("retry_count") or 0) >= settings.ingest_max_retries:
             return
         if existing.get("track_id") and existing.get("error_code") == "track_status_transient":
-            await increment_retry(str(path))
+            # CAS: this retry counts only against the row this scan read. If a
+            # newer submission or an operator reindex moved it on (new track_id,
+            # different status), the retry belongs to a submission that no longer
+            # exists and must not burn one of ingest_max_retries.
+            await increment_retry(
+                str(path),
+                expect_track_id=existing.get("track_id"),
+                expect_status=existing.get("status"),
+            )
             return
-        await increment_retry(str(path))
+        await increment_retry(
+            str(path),
+            expect_track_id=existing.get("track_id"),
+            expect_status=existing.get("status"),
+        )
         existing = await get_document_by_path(str(path)) or existing
 
     retry_reason = None
