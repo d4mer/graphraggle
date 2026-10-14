@@ -1,8 +1,10 @@
-# Hermes brief (DRAFT, needs operator approval): upgrade Open WebUI 0.11.4 -> 0.12.0
+# Hermes brief: upgrade Open WebUI 0.11.4 -> 0.12.0 (canary first, cutover gated)
 
-**Status: DRAFT. Do not execute until the operator approves.** Production change,
-but only the `open-webui` container; gateway, LightRAG and the worker are not
-touched. No corpus or chat content is to be read at any point.
+**Status: APPROVED by the operator 2026-10-14 for steps 1-4 and 6 (pre-flight,
+backup, canary, go/no-go report). Step 5 (cutover) is NOT approved yet: stop
+after the canary report and wait for the operator's separate written go.**
+Production change, but only the `open-webui` container; gateway, LightRAG and the
+worker are not touched. No corpus or chat content is to be read at any point.
 
 ## Why / what changes
 Current: `ghcr.io/open-webui/open-webui:0.11.4` (2026-09-21), container
