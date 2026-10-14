@@ -1,7 +1,8 @@
-# Hermes brief (DRAFT, not sent): same-content second submit across companies
+# Hermes brief: same-content second submit across companies
 
-**Status: draft for operator approval. Do not send to Hermes until approved.**
-Writes two small synthetic documents to the production LightRAG store.
+**Status: APPROVED by the operator 2026-10-14 for sending to Hermes.**
+Writes two small synthetic documents to the production LightRAG store. Delete
+them afterwards (see Cleanup). Nothing else is authorised.
 
 ## Why
 The gateway currently marks a document as a duplicate of any active row with the
