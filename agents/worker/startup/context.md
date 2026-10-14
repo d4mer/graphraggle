@@ -1,14 +1,50 @@
 # Handoff — worker
 
-Last updated: 2026-10-14 (after **TODO #2 review follow-up** — `ingested ->
-rejected` made legal; queue empty; **standby**)
+Last updated: 2026-10-14 (after **TODO #3 upload vs scan semantics** hand-back;
+TODO #4 `qitem-20261014082513-5cb9b9e6` is **pending, deliberately unclaimed** —
+it is blocked until the lead commits/pushes #3)
 
 ## Current state
 
-Queue: `rig queue list --owned` → `[]`, `rig queue inbox-pending
-dev-worker@graphraggle` → `[]`. Nothing claimed, nothing owed. Standby.
+Queue: `rig queue list --owned` → `[]` (both #3 rows handed back), `rig queue
+inbox-pending dev-worker@graphraggle` → the #4 row, left unclaimed on purpose.
+
+**BLOCKED / WAITING:** `qitem-20261014082513-5cb9b9e6` — "lifecycle cleanup
+(deferred items from TODO #2)". Its precondition is "do NOT start until TODO #3
+is committed": needs `git status --short` clean of tracked modifications AND
+`HEAD...origin/master` = `0 0`. Told the lead I am waiting. When it unblocks:
+claim it, then work items (CAS decision for `submit_file`'s post-HTTP writes,
+`increment_retry`/`handle_candidate` CAS, dead `update_status()`, magic
+`sha256='pending'`, unreachable `superseded`) in this same checkout, uncommitted.
 
 Latest item, **handed off uncommitted** (lead commits/pushes):
+`qitem-20261014081856-2ec58157` — **TODO #3 upload vs source-doc ingestion
+semantics**. Files: `app/api.py` **+10/−3**, `app/worker.py` **+18/−5**, new
+`tests/test_upload_vs_scan_semantics.py` (287 lines, 7 tests). Fixes: (1) `/upload`
+now uses the worker's `pick_duplicate_candidate(await get_documents_by_sha256
+(sha), str(dest))` instead of `get_document_by_sha256` (newest row of ANY status,
+including `duplicate_content` ones) — response shape untouched, the API keeps its
+own 4-key `duplicate_of`; `app.api` now imports `app.worker` (same image for
+gateway+worker, and `pptx` is a lazy import inside `extract_pptx_text`, so no new
+dependency at API startup). (2) `should_skip_path` gained always-on rules for
+BOTH doors — suffix in `INGEST_SKIP_SUFFIXES = {".part"}` and `is_metadata_file`
+— and `scan_once` calls it **before** the unsupported-extension branch, so a scan
+landing in `/upload`'s `.<document_id>.part` window no longer writes a `rejected`
+row for a path that then vanishes. Verdicts: item 1 real bug (fixed), item 2 real
+bug (fixed, reproduces), item 3 intended asymmetry (door re-validates with the
+measured post-stream size; empty/large verdicts cannot differ; auto_split lands
+the same both doors → readiness `split_required`), item 4 intended per ADR 0004
+(path inference is defined for `source_docs/` only) — noted, not changed. New
+finding reported, not fixed: duplicate selection is **company-blind in both
+doors**, so a companyB upload can be marked `duplicate_content` of a companyA row
+and never submitted. Tests: bare env **`674 passed, 2 warnings, 6 subtests passed
+in 2.94s`** (baseline 667, +7); pre-change control (`git stash push -- app/api.py
+app/worker.py`) → **`3 failed, 4 passed`**, exactly the 3 REPRODUCTION tests.
+pyflakes: only 3 pre-existing `app/api.py` findings (`compute_adaptive_hops`
+unused, `has_weak_answer_signal` redefinition, `weak_reason` unused) — present on
+HEAD too, left alone. My app copies while testing: `/tmp/p38-fix/{api,worker}.py`.
+
+Previous item (TODO #2 review follow-up, since committed as `224cea9`):
 `qitem-20261014074257-239bc5fb` — TODO #2 review follow-up. `LEGAL_TRANSITIONS`
 now allows **`ingested -> rejected`** (a file that changed on disk and no longer
 validates really is rejected); `ingested -> processing` / `ingested -> failed`
@@ -258,17 +294,14 @@ on an ERROR line.
 
 ## Next step
 
-Idle/standby; nothing in the queue as of this wake. If the lead asks for another
-tweak to TODO #2, the change is **uncommitted in the shared checkout** (branch
-`master`: `app/state_store.py`, `app/worker.py`,
-`tests/test_state_store_lifecycle.py`) — verify with
-`env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
-**667 passed**). Still the lead's call, deliberately not fixed: CAS on
-`submit_file()`'s post-HTTP writes (I argue not needed — see above),
-compare-and-set `increment_retry()` + `handle_candidate()` writes (two worker
-processes could double-burn retries), the dead `update_status()` in app/, and a
-docs entry for the transition table (ADR 0001 untouched). Likely also: a loop run
-against probe sets v2.1 / v3. On wake: `rig queue list
+**Waiting on the lead** to commit/push TODO #3, then claim
+`qitem-20261014082513-5cb9b9e6` (lifecycle cleanup). Verify the precondition
+first: `git status --short` shows no modified tracked files and
+`git fetch && git rev-list --left-right --count HEAD...origin/master` = `0 0`.
+Current test baseline after #3: **674 passed**. If instead a tweak to #3 is
+asked for, the change is uncommitted here (`app/api.py`, `app/worker.py`,
+`tests/test_upload_vs_scan_semantics.py`).
+On wake: `rig queue list
 --owned` and `rig queue inbox-pending dev-worker@graphraggle` (the second needs
 the destination session as an argument). Likely follow-ups: a new packet off the
 Hermes brief series in `docs/briefs/` (`hermes-widen-corpus.md`,

@@ -49,8 +49,8 @@ from .rerank import rerank_citations, truncate_citations
 from .state_store import (
     build_company_attribution,
     derive_readiness,
-    get_document_by_sha256,
     get_documents_by_paths,
+    get_documents_by_sha256,
     get_summary,
     init_db,
     list_documents,
@@ -60,6 +60,7 @@ from .state_store import (
     upsert_document,
 )
 from .validation import validate_upload
+from .worker import pick_duplicate_candidate
 
 app = FastAPI(title="RAG Gateway", version="0.1.0")
 
@@ -1110,11 +1111,17 @@ async def upload(file: UploadFile = File(...), company: str | None = Form(defaul
 
     temp_dest.replace(dest)
 
-    duplicate_doc = await get_document_by_sha256(sha256)
+    # One duplicate rule for both doors: the same active-candidate ranking the
+    # worker applies at scan time (ACTIVE statuses only, never a row that is
+    # itself flagged duplicate_content, deterministic order). The old
+    # get_document_by_sha256 lookup took the newest row of ANY status, so an
+    # upload could be called a duplicate of a rejected, superseded or already-
+    # duplicate row - and the worker would then decide differently seconds later.
+    duplicate_doc = pick_duplicate_candidate(await get_documents_by_sha256(sha256), str(dest))
     duplicate_of = None
     warnings_json = None
 
-    if duplicate_doc and duplicate_doc.get("path") != str(dest):
+    if duplicate_doc:
         duplicate_of = {
             "document_id": duplicate_doc.get("document_id"),
             "path": duplicate_doc.get("path"),

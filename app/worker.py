@@ -45,6 +45,10 @@ METADATA_FILE_BASENAMES = frozenset({
     "desktop.ini",
 })
 METADATA_FILE_PREFIXES = ("._",)
+# Suffixes that are never ingestion input whichever door they arrive through.
+# /upload stages the stream inside UPLOADS_DIR as ".<document_id>.part" and only
+# renames it into place once the body is complete.
+INGEST_SKIP_SUFFIXES = {".part"}
 ACTIVE_DUPLICATE_STATUSES = {"accepted", "submitted", "processing", "ingested"}
 NON_RETRYABLE_FAILURE_CODES = {
     "decode_failed",
@@ -96,17 +100,22 @@ def is_metadata_file(path: Path) -> bool:
 
 
 def should_skip_path(path: Path, root: Path, source_type: str) -> bool:
+    # Always-on rules, for both doors. An in-flight upload temp file has no
+    # supported suffix, so a scan landing mid-stream used to write a `rejected`
+    # row (unsupported_extension) for a path that then vanished on rename.
+    # Metadata sidecars are junk whatever the door; validate_upload already
+    # rejects them at the upload door, this stops the scanner inventing a row.
+    if path.suffix.lower() in INGEST_SKIP_SUFFIXES:
+        return True
+    if is_metadata_file(path):
+        return True
     if source_type != "filesystem":
         return False
     try:
         relative_parts = path.relative_to(root).parts
     except ValueError:
         return False
-    if any(part in LIGHTRAG_INTERNAL_DIRS for part in relative_parts):
-        return True
-    if is_metadata_file(path):
-        return True
-    return False
+    return any(part in LIGHTRAG_INTERNAL_DIRS for part in relative_parts)
 
 
 def infer_company_from_path(path: Path, root: Path, source_type: str) -> tuple[str | None, str, str]:
@@ -1073,6 +1082,10 @@ async def scan_once() -> None:
             continue
         for path in base.rglob("*"):
             if not path.is_file():
+                continue
+            # Before the unsupported-extension branch: a staged upload temp file
+            # must produce no row at all, not a `rejected` one.
+            if should_skip_path(path, base, source_type):
                 continue
             company, company_source, company_source_detail = infer_company_from_path(path, base, source_type)
             if path.suffix.lower() not in SUPPORTED:
