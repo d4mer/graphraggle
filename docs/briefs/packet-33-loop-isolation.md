@@ -1,0 +1,18 @@
+# Packet 33 - overnight_loop: failure isolation, fail-fast start, ENTITY_TYPES refusal, gateway-env experiments
+
+Evidence from tonight (real run): E3 set ENTITY_TYPES; LightRAG v1.5.7 REFUSES TO START with it ("ERROR: ENTITY_TYPES environment variable is no longer supported ... use addon_params entity_types_guidance or the prompt template").
+The driver waited 5 min for /health, marked E3 error, then started E4 without restoring the baseline env, so E4 sat 10 more minutes on the dead server and also errored. Nothing in the driver noticed the container had exited.
+
+Do, in scripts/overnight_loop.py and tests/test_overnight_loop.py only (worktree: `git worktree add ../graphraggle-p33 -b packet-33-isolation master`):
+1. Remove ENTITY_TYPES from ENV_WHITELIST and add it to NEVER_CHANGE_EXACT with the message "ENTITY_TYPES is not supported by LightRAG v1.5.7 (server refuses to start)". An experiments.json that uses it is refused at load with that message.
+2. Failure isolation: whenever an experiment ends in error (any step), BEFORE the next experiment starts: rewrite .env to baseline (original + baseline_env), recreate every service the run has touched (lightrag-server, and gateway-api if it was touched), wait healthy. If that does not become healthy within 5 min -> stop the whole run as fatal (status "fatal", reason includes the container's last ERROR lines, see 3) and let finalise run. Also do the same baseline-restore step at the START of every experiment that follows an errored one.
+3. Fail fast: while waiting for a container to become healthy, also poll `docker ps -a --filter name=<container> --format {{.State}}`; if the state is exited/dead, or restarting twice in a row, raise a StepError immediately that contains up to 5 lines from `docker logs --tail 40 <container>` that contain ERROR or Traceback or "no longer supported", each cut to 300 chars and with any `KEY=`/`TOKEN=`/`SECRET=`/`PASSWORD=` value masked as `<masked>`. Never log env values.
+4. Gateway-env experiments: an experiment may have `"gateway_env": {...}` next to `"env"`. New allow-list GATEWAY_ENV_WHITELIST = {BRIDGE_TOP_K, BRIDGE_CHUNK_TOP_K, BRIDGE_MAX_ENTITY_TOKENS, BRIDGE_MAX_RELATION_TOKENS, BRIDGE_MAX_TOTAL_TOKENS,
+   BRIDGE_ENABLE_RERANK, GATEWAY_CHUNK_TOP_K, CITATION_TOP_K}; anything else refused. These keys live in the same <root>/.env (the gateway reads it via env_file). After applying, recreate with
+   `docker compose -f <root>/compose.yml up -d --no-deps gateway-api` (service name gateway-api, container rag-gateway-api), wait until `docker ps` shows rag-gateway-api running AND `GET http://127.0.0.1:8020/` returns any HTTP response
+   (even 404), verify with `docker exec rag-gateway-api env` that each changed key has the new value. Experiments with gateway_env/env that need no re-ingest use "reingest": false (probes only). The same revert-to-baseline-and-recreate
+   logic (finalise and item 2) must cover gateway-api. Gateway env keys count toward changed_keys.
+5. Tests (real-path stub style as in packet 30; fake `docker` script on PATH): (a) experiment whose container "exits" with an ERROR line -> that experiment errors fast (seconds, not 5 min), the next experiment starts on a restored healthy baseline and succeeds, final env identical to original;
+   (b) baseline recovery impossible -> run stops fatal with masked error lines in the log; (c) ENTITY_TYPES refused at load; (d) gateway_env experiment: env written, gateway-api recreated, verified, restored in finalise; non-whitelisted gateway key refused;
+   (e) log/state never contain secret values. Full suite must pass.
+Report back: commit hash, test count, ambiguities you resolved.
