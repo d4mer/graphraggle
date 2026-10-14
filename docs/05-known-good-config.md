@@ -22,7 +22,7 @@ Runtime is **Docker** (`docker compose`) — **not podman**. **(changed 2026-10-
 |---|---|---|
 | `rag-gateway-api` | `local/rag-gateway:p24` (image `4629dcab0bea`) | built from commit `c89b293` |
 | `lightrag-server` | `ghcr.io/hkuds/lightrag:v1.5.7` | **(changed 2026-10-09)** — the repo `compose.yml` was reconciled to this tag on **2026-10-11** (packet-26) |
-| `open-webui` | `ghcr.io/open-webui/open-webui:0.11.4` | pinned tag, not `main` |
+| `open-webui` | `ghcr.io/open-webui/open-webui:0.12.0` | **(changed 2026-10-14)** canary on a data copy, then cutover; DB migrated (6 revisions), **downgrade unsupported**, rollback = restore the backup tarball. Pinned tag, not `main` |
 | `rag-chromadb` | `chromadb/chroma:latest` | |
 | `rag-ingest-worker` | image `d9d9ce2307a2` | **an old build from before packet-18.** The worker dedupe hardening (`2f74255`) is in the repo but is **not yet deployed** to this container |
 

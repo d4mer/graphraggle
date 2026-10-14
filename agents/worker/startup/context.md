@@ -1,9 +1,30 @@
 # Handoff — worker
 
-Last updated: 2026-10-14 (company-aware dedupe **built behind a dark flag and
-handed back, uncommitted**)
+Last updated: 2026-10-14 (Open WebUI 0.12.0 pin handed back, uncommitted; nothing
+else owned)
 
 ## Current state
+
+`qitem-20261014135220-06657d8a` — pin Open WebUI 0.12.0. **Uncommitted:**
+`compose.yml` (image tag `0.11.4` → `0.12.0`), `docs/05-known-good-config.md`
+(production runtime table row + changed-date note), `docs/08-change-log.md`
+(forward pointer on the 2026-10-11 ports/images item + new dated Production
+Releases entry). Suite: bare-env **`698 passed, 2 warnings, 6 subtests passed in
+3.52s`**; `tests/test_compose_config.py` alone **`12 passed`**. Briefs under
+`docs/briefs/` left alone (historical records). I annotated rather than rewrote
+the dated 2026-10-11 item — flagged in the hand-back.
+
+**Dedupe follow-up context (lead already documented it at `13d17ba`):** the live
+probe answered the upstream question — LightRAG v1.5.7 dedupes by content hash
+globally; an identical-bytes second submit returns 200 with a new track that
+becomes a `dup-*` **FAILED** placeholder (0 chunks, never PROCESSED). So the
+cross-company guard I built is effectively dead code (its PROCESSED-without-our-path
+branch never fires); the real harm if `COMPANY_AWARE_DEDUPE` is ever enabled is
+`lightrag_processing_failed` + junk `dup-*` rows upstream. Flag stays do-not-enable;
+real fix = query-time attribution (the lead's own item).
+
+Previous item (company-aware dedupe behind `COMPANY_AWARE_DEDUPE`, default off) is
+committed by the lead; see `docs/05-known-good-config.md` § Settings Shipped Dark.
 
 `qitem-20261014085257-ed1c3f7a` — company-aware duplicate selection, rulings
 followed. **Uncommitted** in this checkout on `master` (base `7b664f1`):
@@ -400,12 +421,11 @@ on an ERROR line.
 ## Next step
 
 On wake: `rig queue list --owned` and `rig queue inbox-pending
-dev-worker@graphraggle`. If this item comes back for tweaks, the change is
-uncommitted here (`app/config.py`, `app/worker.py`, `app/api.py`,
-`tests/test_company_aware_dedupe.py`); verify with
+dev-worker@graphraggle`. If the Open WebUI pin comes back for tweaks it is
+uncommitted here (`compose.yml`, `docs/05-known-good-config.md`,
+`docs/08-change-log.md`); verify with
 `env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
-**698 passed**). Control scripts: `/tmp/control_company_dedupe.py` (before/after
-both bugs), `/tmp/probe_dedupe_company.py` (original investigation).
+**698 passed**).
 
 Likely follow-ups: a new packet off the
 Hermes brief series in `docs/briefs/` (`hermes-widen-corpus.md`,

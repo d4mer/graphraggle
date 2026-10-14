@@ -58,7 +58,9 @@ Production was fixed so Office/PDF files ingest on LightRAG v1.5.7; the repo
    leaves the bind mount stale — restart `lightrag-server` after doing it.**
 5. **Ports/images now in `compose.yml`:** LightRAG `v1.5.7` on host `9621` (was
    `v1.4.15` / `9622`), gateway host `8020` (was `8000`), Open WebUI `0.11.4` on host
-   `3010` (was `main` / `3000`).
+   `3010` (was `main` / `3000`). *(Open WebUI has since moved: `compose.yml` pins
+   `0.12.0` from **2026-10-14** — see the release entry below; the `0.11.4` above is
+   what that 2026-10-11 cutover recorded.)*
 6. **Secrets.** Open WebUI's HyperQwen key is parameterised:
    `OPENAI_API_KEYS: "${OPENWEBUI_OPENAI_API_KEYS:-}"`. Set **`OPENWEBUI_OPENAI_API_KEYS`**
    in the host `.env`; no key value ever goes in the repo. There is no `.env.example`.
@@ -83,6 +85,7 @@ All deploys are on the Thinkpad (`~/rag-project`, Docker). Rollback is always
 5. **2026-10-09 — reboot drill:** all 20 containers on the host came back by themselves ~1 min after boot with 0 restarts; the Hermes agent seat does not come back and must be relaunched (see `11-first-5-minutes-after-reboot.md`).
 6. **2026-10-09 — backup/restore drill:** SQLite online-backup API for `state/ingest.db` + quiescent copy of `lightrag_store/` (218 MB, 3 s) + sha256 manifest; restore verified (0 manifest mismatches, 272 documents, 12 store files equal). Backups in `~/rag-project/backups/`.
 7. **2026-10-09 — rc1 quality baseline** (36 probes × 3 draws, automatic scoring): single-fact 1.00, multi-fact 0.83, follow-up 0.89, cross-document 0.56, unanswerable-refusal 0.67; 0 empty answers; median latency 178 s.
+8. **2026-10-14 — Open WebUI `0.11.4` → `0.12.0`** deployed on the Thinkpad: canary on a data copy, then cutover. DB migrated (6 revisions), **downgrade unsupported**; rollback = restore the backup tarball. Bridge contract unchanged (task short-circuit verified). `compose.yml` and `05-known-good-config.md` now pin `0.12.0` so the next deploy does not downgrade production.
 
 ### Pending
 
