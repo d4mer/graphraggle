@@ -184,12 +184,24 @@ Gateway defaults that are **in force without being written in `.env`**:
    Set `true` to let a company-scoped document through when the only SHA match
    belongs to another company (or is unscoped). Company comparison is strip-only,
    no case folding, exactly as query scoping does it.
-   **Do not enable before the live probe**: what LightRAG v1.5.7 does with a second
-   submit of identical bytes is not established offline
-   (`docs/briefs/hermes-company-dedupe-probe.md`). Rows released by the flag carry a
-   guard: `poll_track` accepts `PROCESSED` as `ingested` only if the track returns
-   our path, else `failed` / `cross_company_not_indexed`. Existing cross-company
-   `duplicate_content` rows self-heal on the next scan; no reindex is needed.
+   **Do NOT enable.** The live probe (2026-10-14; full report on the Thinkpad at
+   `~/rag-project/docs/ops/runs/company-dedupe-probe.md`, run reports are not
+   versioned) showed LightRAG v1.5.7 dedupes by
+   content hash globally: an identical-bytes second submit under another filename
+   returns HTTP 200 with a new track, but creates a `dup-*` FAILED placeholder
+   (0 chunks, never PROCESSED) and does not index the content again. With this
+   flag on, a company-B upload of company-A's bytes would end as a visible
+   `failed` row and every retry would add another junk `dup-*` row upstream. It
+   does not make the document queryable by company B. The correct fix is
+   attribution at query time (one indexed copy serving every company that owns
+   identical bytes), tracked as its own item.
+   The probe also showed that submitting **different** bytes under an already-used
+   `file_source` returns a synchronous **HTTP 409** ("Document storage already
+   contains ... Delete the existing record before re-inserting"). The worker sends
+   `file_source=<full path>` and never deletes upstream documents, so editing a
+   source file in place is expected to hit this 409 and stay stuck as
+   `submit_terminal_failed` until an operator reindex (inferred from the probe and
+   the code, not yet reproduced end to end).
 
 ## oMLX Behaviour Notes (measured 2026-10-09)
 
