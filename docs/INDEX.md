@@ -14,6 +14,7 @@ Use this file as the main navigation page for the GraphRAG documentation set.
 2. `07-openwebui-guide.md`
 3. `09-operator-cheat-sheet.md`
 4. `12-large-pdf-ingestion.md`
+5. `13-getting-the-best-answers.md`: how to ask, check and tune questions
 
 ## Operations
 
