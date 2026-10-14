@@ -1,15 +1,96 @@
 # Handoff — worker
 
-Last updated: 2026-10-14 (after **lifecycle cleanup / TODO #2 deferred items**
-hand-back; queue: one new row just arrived, `qitem-20261014083709-86837b07`, not
-yet read)
+Last updated: 2026-10-14 (company-aware dedupe **built behind a dark flag and
+handed back, uncommitted**)
 
 ## Current state
 
-Queue: `qitem-20261014083709-86837b07` pending from the lead — read + claim it
-next. Everything else handed back.
+`qitem-20261014085257-ed1c3f7a` — company-aware duplicate selection, rulings
+followed. **Uncommitted** in this checkout on `master` (base `7b664f1`):
+`app/config.py` **+10**, `app/worker.py` **+157/−3**, `app/api.py` **+3/−1**, new
+`tests/test_company_aware_dedupe.py` (**314 lines / 17 tests**).
+- `COMPANY_AWARE_DEDUPE` (default **false** = byte-identical to today).
+- `pick_duplicate_candidate(documents, current_path, *, company=None)`: when the
+  flag is on, a candidate may suppress only if the new doc is unscoped or the
+  candidate is the same company; `normalize_company(a) == normalize_company(b)`,
+  **no case folding** (comment says both sides must change together).
+  Call sites: `app/api.py` `/upload` passes `normalized_company`;
+  `app/worker.py` passes the row's stored company.
+- Marker + guard: `cross_company_guard_updates()` writes
+  `cross_company_guard=verify_file_path_on_process` (+ matched path/company) only
+  for rows the flag released past another company's SHA match; `poll_track`'
+  PROCESSED branch calls `cross_company_guard_mismatch()` — marked rows need a
+  `documents[].file_path` matching the submitted path (exact, or basename for
+  `/documents/upload`) or they land on `error_code=cross_company_not_indexed`,
+  `query_ready=False`. Unmarked rows are untouched.
+- Tests: bare-env **698 passed, 2 warnings, 6 subtests passed** (also with
+  `COMPANY_AWARE_DEDUPE=true` across the whole suite → no existing test encoded
+  company-blind suppression). Behavioural BEFORE/AFTER control:
+  `/tmp/control_company_dedupe.py`; 409 probe + self-heal probe run inline (see
+  hand-back note). pyflakes: only the 3 pre-existing `app/api.py` findings.
+- Backups while testing: `/tmp/p40-fix/{config,worker,api}.py`.
 
-Latest item, **handed off uncommitted** (lead commits/pushes):
+**409 finding (reported, not changed):** a 409 from `/documents/text` or
+`/documents/upload` today → `failed` / `error_stage=submit` /
+`error_code=submit_terminal_failed`, `retryable=False`, and because
+`submit_terminal_failed` is in `NON_RETRYABLE_FAILURE_CODES` every later scan
+returns before retry bookkeeping (`retry_count` stays 0) → the row is stuck at
+`failed` until an operator reindex; `error_detail` is only `str(exc)`
+(`Client error '409 Conflict' for url`) so the body that names the filename
+conflict is lost.
+
+**Undocumented setting (flag, don't fix unasked):** there is no `.env.example` or
+settings reference doc; env vars live in per-packet briefs under `docs/briefs/`.
+`COMPANY_AWARE_DEDUPE` is currently documented only in the code comment + the
+lead's brief — ask whether an ops doc line is wanted.
+
+Previous items all committed by the lead: `f3ca463` lifecycle cleanup,
+`b7423b2` TODO #3, `224cea9` TODO #2, `6f523b7` conftest.
+
+**Earlier round, superseded by the build above — `qitem-20261014083709-86837b07`
+(company-aware duplicate selection), investigation-only, NO code changed.**
+Findings (all
+measured with `/tmp/probe_dedupe_company.py` — real `state_store` + real
+`worker.handle_candidate`, network mocked to raise):
+- Duplicate selection is company-blind by signature: `pick_duplicate_candidate(
+  documents, current_path)` at `app/worker.py:269`, two call sites only
+  (`app/api.py:1120` `/upload`, `app/worker.py:988` scan). `app/validation.py`
+  takes `duplicate_of` from the caller — it decides nothing itself.
+- B-upload of A's bytes → row stays `accepted` / `error_code=duplicate_content` /
+  `query_ready=0`, **0 upstream submits after 3 scans**. Citation attribution is
+  path-based (`enrich_citation` matches LightRAG `file_path` → gateway row →
+  copies its company; `scope_query_citations` `app/api.py:851` keeps only
+  `document.company == requested_company`), so B can never cite it.
+- **Upstream same-content second submit = unknowable offline** (thin transport
+  client, no `lightrag` in `.venv`, no recorded submit response in `docs/`, and
+  **no repo doc says the doc id is content-derived** — the lead's premise is
+  unverified). From our code: case-1 indexes B → fixed; case-2 no `track_id` →
+  `failed`/`submit_missing_track_id` after `ingest_max_retries` (default 3,
+  `worker.py:1059` stops — no infinite loop); **case-3 PROCESSED without B's
+  `file_path` in chunks → we write `ingested`/`query_ready=True` while B-scoped
+  queries return nothing = strictly worse than today**. Hence the stop.
+- Recommendation sent: (a) company-aware picker **+** guard — when a track reports
+  PROCESSED require a `track_status documents[].file_path` matching the submitted
+  path (shape recorded in `docs/briefs/packet-32-loop-shapes.md:12`), else write a
+  visible error (e.g. `upstream_indexed_elsewhere`) instead of `ingested`. Plus a
+  2-call live probe (same tiny file twice via `/upload`, company A then company B,
+  then GET both `track_status`).
+- Stuck rows self-heal under (a), **no Hermes reindex**: `app/worker.py:995`
+  `orphaned_duplicate` clears the flag, resets `retry_count=0`, submits with
+  `retry_reason=duplicate_original_removed` (measured with only the picker
+  monkeypatched).
+- **Brief premise corrected:** `normalize_company` only `strip()`s — no case
+  folding — and query scoping compares the RAW stored company with `==` against a
+  stripped request (`api.py:851` vs `:1270`), so "Acme Corp" vs "acme corp" do NOT
+  agree today. Ruling needed: mirror scoping exactly (my default) or fold case in
+  BOTH the picker and `scope_query_citations` (query-time change → its own item).
+
+**The three decisions the lead owed — all ruled (brief `7b664f1`):** ship picker +
+guard **dark** behind `COMPANY_AWARE_DEDUPE` (default false); **no case folding**
+(mirror `scope_query_citations`); the live probe is the operator/Hermes' job, not
+mine.
+
+Previous item, **committed by the lead at `f3ca463`**:
 `qitem-20261014082513-5cb9b9e6` — lifecycle cleanup. Diff: `app/state_store.py`
 **+58/−15**, `app/worker.py` **+28/−2**, `docs/decisions/0001-lifecycle-model.md`
 **+77/−1**, `tests/test_lifecycle_cleanup.py` **new 221 lines / 7 tests**,
@@ -318,16 +399,15 @@ on an ERROR line.
 
 ## Next step
 
-Read + claim `qitem-20261014083709-86837b07` (`rig queue show <id> --full
---json`). If a tweak to the lifecycle cleanup is asked for instead, it is
-uncommitted here (`app/state_store.py`, `app/worker.py`,
-`docs/decisions/0001-lifecycle-model.md`, `tests/test_lifecycle_cleanup.py`,
-`tests/test_worker_dedupe.py`, `tests/test_state_store_lifecycle.py`) — verify
-with `env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
-**681 passed**).
-On wake: `rig queue list
---owned` and `rig queue inbox-pending dev-worker@graphraggle` (the second needs
-the destination session as an argument). Likely follow-ups: a new packet off the
+On wake: `rig queue list --owned` and `rig queue inbox-pending
+dev-worker@graphraggle`. If this item comes back for tweaks, the change is
+uncommitted here (`app/config.py`, `app/worker.py`, `app/api.py`,
+`tests/test_company_aware_dedupe.py`); verify with
+`env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
+**698 passed**). Control scripts: `/tmp/control_company_dedupe.py` (before/after
+both bugs), `/tmp/probe_dedupe_company.py` (original investigation).
+
+Likely follow-ups: a new packet off the
 Hermes brief series in `docs/briefs/` (`hermes-widen-corpus.md`,
 `hermes-failure-analysis-v2.md` on `release-rc1-docs`), packet-36 tweaks (work in
 `../graphraggle-p36` — though it is already merged, so a tweak now wants a fresh

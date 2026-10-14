@@ -266,7 +266,39 @@ def build_duplicate_reference(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def pick_duplicate_candidate(documents: list[dict[str, Any]], current_path: str) -> dict[str, Any] | None:
+def pick_duplicate_candidate(
+    documents: list[dict[str, Any]],
+    current_path: str,
+    *,
+    company: str | None = None,
+) -> dict[str, Any] | None:
+    """Pick the active row whose SHA-256 matches, or None if nothing suppresses it.
+
+    Company scoping is applied only when ``COMPANY_AWARE_DEDUPE`` is on; with it
+    off the result is exactly what it always was, whatever ``company`` says. When
+    it is on, a candidate may suppress the new document only if the new document
+    is unscoped (``company`` NULL - unscoped queries see every company's
+    citations, so the content is still reachable) or the candidate belongs to the
+    same company. A scoped new document is never suppressed by another company's
+    row or by an unscoped row: its citations would be attributed to that other
+    row by path (``enrich_citation`` / ``scope_query_citations`` in api.py), so
+    suppressing it lost the document silently.
+
+    The comparison is ``normalize_company(a) == normalize_company(b)`` - strip
+    only, deliberately NO case folding, mirroring ``scope_query_citations``,
+    which compares the raw stored company against a stripped request. "Acme Corp"
+    and "acme corp" are different companies everywhere in this stack. If that
+    ever changes it must change in both places in the same commit: folding case
+    only here would submit documents whose citations are then filtered out at
+    query time.
+    """
+    if settings.company_aware_dedupe:
+        new_company = normalize_company(company)
+        if new_company is not None:
+            documents = [
+                doc for doc in documents
+                if normalize_company(doc.get("company")) == new_company
+            ]
     rank = {"ingested": 0, "processing": 1, "submitted": 2, "accepted": 3}
     candidates = [
         doc
@@ -291,6 +323,62 @@ def pick_duplicate_candidate(documents: list[dict[str, Any]], current_path: str)
     duplicate_of["match_paths"] = sorted(str(doc.get("path", "")) for doc in candidates)
     duplicate_of["selection_basis"] = "sha256_status_updated_at_path"
     return duplicate_of
+
+
+def cross_company_guard_updates(match: dict[str, Any] | None) -> dict[str, Any]:
+    """worker_updates for the cross-company marker.
+
+    Set when ``COMPANY_AWARE_DEDUPE`` let a document through that the company-blind
+    picker would have suppressed (same SHA, different company). It is the guard's
+    blast radius: only those rows are checked in ``poll_track``. Pass None to
+    clear it.
+    """
+    if match is None:
+        return {
+            "cross_company_guard": None,
+            "cross_company_duplicate_path": None,
+            "cross_company_duplicate_company": None,
+        }
+    return {
+        "cross_company_guard": "verify_file_path_on_process",
+        "cross_company_duplicate_path": match.get("path"),
+        "cross_company_duplicate_company": match.get("company"),
+    }
+
+
+def cross_company_guard_mismatch(
+    raw: str | None,
+    submitted_path: str,
+    docs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """For marked rows only: did upstream actually index OUR path?
+
+    Returns None when there is no marker (every unmarked row keeps today's path
+    through ``poll_track`` untouched) or when a returned ``documents[].file_path``
+    matches what we submitted. Otherwise returns the evidence for a visible
+    failure. A same-content second submit may be deduplicated upstream while the
+    track still reports PROCESSED; that would otherwise mark our row
+    ``ingested``/``query_ready`` while no chunk carries our path, i.e. a healthy
+    row that can never be cited. ``file_path`` is compared exactly, and by
+    basename as a fallback because ``/documents/upload`` tags the uploaded
+    filename rather than the path we handed it.
+    """
+    worker = parse_warning_metadata(raw).get("worker")
+    if not isinstance(worker, dict) or worker.get("cross_company_guard") != "verify_file_path_on_process":
+        return None
+    submitted = Path(submitted_path)
+    returned = sorted(
+        str(doc.get("file_path")) for doc in docs if isinstance(doc.get("file_path"), str)
+    )
+    for value in returned:
+        if value == str(submitted) or Path(value).name == submitted.name:
+            return None
+    return {
+        "expected_path": str(submitted),
+        "returned_paths": returned,
+        "suppressed_by_path": worker.get("cross_company_duplicate_path"),
+        "suppressed_by_company": worker.get("cross_company_duplicate_company"),
+    }
 
 
 def stale_track_worker_updates(track_id: str, reason: str) -> dict[str, Any]:
@@ -335,6 +423,9 @@ async def mark_duplicate_candidate(path: Path, digest: str, duplicate_of: dict[s
             "duplicate_match_paths": duplicate_of.get("match_paths"),
             "duplicate_status": duplicate_of.get("status"),
             "last_submitted_track_id": None,
+            "cross_company_guard": None,
+            "cross_company_duplicate_path": None,
+            "cross_company_duplicate_company": None,
             "stale_track_id": None,
             "stale_track_marker": None,
             "stale_track_reason": None,
@@ -772,6 +863,51 @@ async def poll_track(doc: dict[str, Any]) -> None:
                 ),
             )
         elif "PROCESSED" in statuses:
+            # Cross-company guard. Only rows that COMPANY_AWARE_DEDUPE released
+            # past a SHA match in another company are checked; every other row
+            # takes exactly the path it takes today. A deduplicated second submit
+            # can report PROCESSED without ever tagging a chunk with our path, so
+            # writing ingested/query_ready there would replace a visible
+            # duplicate_content row with a healthy row that can never be cited.
+            mismatch = cross_company_guard_mismatch(warnings_json, str(doc["path"]), docs)
+            if mismatch is not None:
+                await update_document_state(
+                    doc["path"],
+                    expect_track_id=track_id,
+                    expect_status=doc.get("status"),
+                    status="failed",
+                    error_stage="track_poll",
+                    error_code="cross_company_not_indexed",
+                    error_message=(
+                        "LightRAG reported the track processed but no indexed "
+                        "document carries this path; the content is indexed under "
+                        "another company's document"
+                    ),
+                    error_detail=json.dumps(mismatch, sort_keys=True),
+                    last_error="cross-company content not indexed under this path",
+                    query_ready=False,
+                    ingested_at=None,
+                    warnings_json=merge_warning_metadata(
+                        warnings_json,
+                        worker_updates={
+                            "last_polled_track_id": track_id,
+                            "last_track_status": "PROCESSED",
+                            "cross_company_guard": "path_mismatch",
+                            "failure_class": "terminal",
+                            "retryable": False,
+                            "stale_track_id": None,
+                            "stale_track_marker": None,
+                            "stale_track_reason": None,
+                            "track_id_policy": None,
+                            "track_poll_payload": "cross_company_path_mismatch",
+                        },
+                    ),
+                )
+                warn(
+                    f"Track {track_id} processed without our path for {doc['path']}: "
+                    f"indexed under {mismatch['suppressed_by_path']}"
+                )
+                return
             await update_document_state(
                 doc["path"],
                 expect_track_id=track_id,
@@ -790,6 +926,9 @@ async def poll_track(doc: dict[str, Any]) -> None:
                     worker_updates={
                         "last_polled_track_id": track_id,
                         "last_track_status": "PROCESSED",
+                        "cross_company_guard": None,
+                        "cross_company_duplicate_path": None,
+                        "cross_company_duplicate_company": None,
                         "stale_track_id": None,
                         "stale_track_marker": None,
                         "stale_track_reason": None,
@@ -985,7 +1124,22 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
         status = existing.get("status")
         reindex_requested = is_reindex_requested(existing)
 
-    duplicate_of = pick_duplicate_candidate(await get_documents_by_sha256(digest), str(path))
+    sha_matches = await get_documents_by_sha256(digest)
+    duplicate_of = pick_duplicate_candidate(
+        sha_matches, str(path), company=(existing or {}).get("company")
+    )
+    # The marker is what the company-blind picker WOULD have suppressed us by.
+    # Only rows COMPANY_AWARE_DEDUPE released past another company's SHA match
+    # carry it, and poll_track's file_path check runs for those rows and no
+    # others - so the guard cannot touch ordinary ingestion.
+    cross_company_match: dict[str, Any] | None = None
+    if settings.company_aware_dedupe and duplicate_of is None:
+        blind_match = pick_duplicate_candidate(sha_matches, str(path))
+        if blind_match is not None:
+            cross_company_match = {
+                "path": blind_match.get("path"),
+                "company": blind_match.get("company"),
+            }
     if duplicate_of is not None:
         if duplicate_row:
             return
@@ -1096,7 +1250,7 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
         ingested_at=None,
         warnings_json=merge_warning_metadata(
             existing.get("warnings_json"),
-            worker_updates=cleared_reindex_updates(),
+            worker_updates=cleared_reindex_updates(cross_company_guard_updates(cross_company_match)),
         ),
     )
     await submit_file(path, source_type, digest, retry_reason=retry_reason)

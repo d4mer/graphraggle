@@ -21,6 +21,16 @@ class Settings(BaseSettings):
     ingest_max_retries: int = Field(default=3, alias="INGEST_MAX_RETRIES")
     request_timeout_seconds: int = Field(default=300, alias="REQUEST_TIMEOUT_SECONDS")
 
+    # Company-aware duplicate selection. Default false = shipped behaviour is
+    # byte-identical to the company-blind picker: SHA matches suppress a new
+    # document whichever company owns them. Set true to let a company-scoped
+    # document through when the only SHA match belongs to another company (that
+    # company can never cite it, so the upload was silently lost). Kept dark
+    # because what LightRAG does with a second submit of identical bytes is not
+    # established offline; the operator enables it after the live probe. The
+    # poll_track file_path guard only ever runs for rows this flag marked.
+    company_aware_dedupe: bool = Field(default=False, alias="COMPANY_AWARE_DEDUPE")
+
     # packet-27: the worker extracts .pptx itself (python-pptx) into structured
     # text and submits it through /documents/text, because LightRAG's built-in
     # pptx extractor drops tables, grouped shapes, speaker notes and slide

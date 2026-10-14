@@ -175,6 +175,22 @@ Gateway defaults that are **in force without being written in `.env`**:
 3. `BRIDGE_REWRITE_SEED_LL` off (GRAG-41 seed not deployed)
 4. `BRIDGE_TASK_SHORTCIRCUIT` on (GRAG-12)
 
+## Settings Shipped Dark (default off, operator decision to enable)
+
+1. `COMPANY_AWARE_DEDUPE=false` (default). The duplicate rule is company-blind: a
+   document whose SHA-256 matches any active row is skipped as `duplicate_content`,
+   even when that row belongs to another company, so a company-scoped upload of
+   identical bytes is silently never submitted and can never be cited by its owner.
+   Set `true` to let a company-scoped document through when the only SHA match
+   belongs to another company (or is unscoped). Company comparison is strip-only,
+   no case folding, exactly as query scoping does it.
+   **Do not enable before the live probe**: what LightRAG v1.5.7 does with a second
+   submit of identical bytes is not established offline
+   (`docs/briefs/hermes-company-dedupe-probe.md`). Rows released by the flag carry a
+   guard: `poll_track` accepts `PROCESSED` as `ingested` only if the track returns
+   our path, else `failed` / `cross_company_not_indexed`. Existing cross-company
+   `duplicate_content` rows self-heal on the next scan; no reindex is needed.
+
 ## oMLX Behaviour Notes (measured 2026-10-09)
 
 1. The `tps` oMLX reports for **non-streaming** requests includes prefill, so it is

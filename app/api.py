@@ -1117,7 +1117,9 @@ async def upload(file: UploadFile = File(...), company: str | None = Form(defaul
     # get_document_by_sha256 lookup took the newest row of ANY status, so an
     # upload could be called a duplicate of a rejected, superseded or already-
     # duplicate row - and the worker would then decide differently seconds later.
-    duplicate_doc = pick_duplicate_candidate(await get_documents_by_sha256(sha256), str(dest))
+    duplicate_doc = pick_duplicate_candidate(
+        await get_documents_by_sha256(sha256), str(dest), company=normalized_company
+    )
     duplicate_of = None
     warnings_json = None
 

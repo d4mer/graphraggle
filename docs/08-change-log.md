@@ -89,3 +89,4 @@ All deploys are on the Thinkpad (`~/rag-project`, Docker). Rollback is always
 1. `rag-ingest-worker` is still running image `d9d9ce2307a2`, an old build from before packet-18. The worker dedupe hardening (`2f74255`) is in the repo but **not deployed** to that container.
 2. ~~The repo `compose.yml` still pins `ghcr.io/hkuds/lightrag:v1.4.15` and maps LightRAG on host port `9622`.~~ **Resolved 2026-10-11 (packet-26):** `compose.yml` now pins `v1.5.7`, maps `9621:9621`, gives LightRAG its own `INPUT_DIR`/`--input-dir`, and is covered by `tests/test_compose_config.py`.
 3. `BRIDGE_REWRITE_SEED_LL` (GRAG-41 seed) is off and undeployed.
+4. Repo changes not yet deployed (worker image is still pre-packet-18): TODO #2 lifecycle table and compare-and-set write-backs, TODO #3 upload/scan semantics, `COMPANY_AWARE_DEDUPE` (default off, see `05-known-good-config.md`), `tests/conftest.py`. Deploy is an operator decision.
