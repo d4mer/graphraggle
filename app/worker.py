@@ -655,6 +655,17 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
 
 
 async def poll_track(doc: dict[str, Any]) -> None:
+    """Apply one LightRAG track poll to the row.
+
+    ``doc`` is the snapshot the scan read before this HTTP call, so the row may
+    have moved on by the time the result arrives. Every write-back here is
+    compare-and-set on the track_id and status that snapshot carried: if the
+    document was resubmitted meanwhile (new track_id) a result for the old
+    track matches no row and is dropped with a log line, instead of overwriting
+    the new submission with a stale verdict or ``track_id=None``. The same guard
+    makes a replayed stale event a no-op rather than a second downgrade, and it
+    does not touch retry bookkeeping.
+    """
     track_id = doc.get("track_id")
     if not track_id:
         return
@@ -666,6 +677,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         if not docs:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="failed",
                 error_stage="track_poll",
                 error_code="stale_track_id",
@@ -684,6 +697,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         if not statuses:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="failed",
                 error_stage="track_poll",
                 error_code="track_status_transient",
@@ -710,6 +725,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         if "FAILED" in statuses:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="failed",
                 error_stage="track_poll",
                 error_code="lightrag_processing_failed",
@@ -734,6 +751,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         elif "PROCESSED" in statuses:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="ingested",
                 error_stage=None,
                 error_code=None,
@@ -759,6 +778,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         else:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="processing",
                 error_stage=None,
                 error_code=None,
@@ -780,6 +801,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         if status_code == 404:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="failed",
                 error_stage="track_poll",
                 error_code="stale_track_id",
@@ -797,6 +820,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         elif is_transient_exception(exc):
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="failed",
                 error_stage="track_poll",
                 error_code="track_status_transient",
@@ -821,6 +846,8 @@ async def poll_track(doc: dict[str, Any]) -> None:
         else:
             await update_document_state(
                 doc["path"],
+                expect_track_id=track_id,
+                expect_status=doc.get("status"),
                 status="failed",
                 error_stage="track_poll",
                 error_code="track_status_failed",

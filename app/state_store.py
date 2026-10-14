@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import aiosqlite
+import logging
 from pathlib import Path
 from .config import settings
 
+
+logger = logging.getLogger("gateway.state_store")
 
 ACTIVE_SUPERSEDING_STATUSES = {"accepted", "submitted", "processing", "ingested"}
 COMPANY_SOURCE_EXPLICIT = "explicit"
@@ -68,6 +71,100 @@ MIGRATIONS: dict[str, str] = {
 }
 
 UNSET = object()
+
+
+# ── Lifecycle transitions ───────────────────────────────────────────────────
+# The nine statuses of ADR 0001 (docs/decisions/0001-lifecycle-model.md). This
+# table is the single definition of which status edges a row may travel; the
+# writer functions below enforce it, so a slow poll, a retry or a re-scan can no
+# longer downgrade a row silently. Illegal writes are dropped with a log line -
+# never raised - because every caller here is a background loop or an API
+# request that must keep going.
+STATUSES = frozenset({
+    "pending",
+    "validating",
+    "accepted",
+    "submitted",
+    "processing",
+    "ingested",
+    "failed",
+    "rejected",
+    "superseded",
+})
+
+# source -> statuses it may move to. A status is always reachable from itself
+# (see is_legal_transition) so idempotent replays of the same event are no-ops
+# rather than illegal transitions. Read the denials, not the allowances:
+#   ingested   can go back to work (force-reindex, content change, supersede) and
+#              can be rejected when the content on disk no longer validates, but
+#              it is never downgraded in place to processing or failed. The late
+#              write-back that used to do that is stopped by the poll
+#              compare-and-set (worker.poll_track's expect_track_id/expect_status),
+#              not by this table: every failed write in the pipeline is either a
+#              CAS'd poll (which can only land on submitted/processing/failed
+#              rows), a submit_file write onto the row the scan had just set to
+#              "accepted", or scan_once's exception handler - and that one is
+#              refused on purpose, so a queryable row stays queryable and the
+#              error is logged instead.
+#   rejected / superseded must be re-validated (pending/validating/accepted/
+#              submitted) before they can be processing or ingested again.
+#   ingested is only reachable from a status that has an upstream track: a row
+#              that never went upstream cannot become query-ready.
+LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"validating", "accepted", "submitted", "processing", "failed", "rejected", "superseded"}),
+    "validating": frozenset({"pending", "accepted", "submitted", "processing", "failed", "rejected", "superseded"}),
+    "accepted": frozenset({"pending", "validating", "submitted", "processing", "failed", "rejected", "superseded"}),
+    "submitted": frozenset({"pending", "validating", "accepted", "processing", "ingested", "failed", "rejected", "superseded"}),
+    "processing": frozenset({"pending", "validating", "accepted", "submitted", "ingested", "failed", "rejected", "superseded"}),
+    "ingested": frozenset({"pending", "validating", "accepted", "submitted", "rejected", "superseded"}),
+    "failed": frozenset({"pending", "validating", "accepted", "submitted", "processing", "ingested", "rejected", "superseded"}),
+    "rejected": frozenset({"pending", "validating", "accepted", "submitted", "superseded"}),
+    "superseded": frozenset({"pending", "validating", "accepted", "submitted"}),
+}
+
+
+def is_legal_transition(from_status: str | None, to_status: str) -> bool:
+    """True when a row in ``from_status`` may be written to ``to_status``.
+
+    ``from_status`` of None means "the row does not exist yet" (an insert).
+    An unknown ``from_status`` in an existing row is allowed out - a value this
+    build does not know about should not wedge the pipeline - but an unknown
+    ``to_status`` is never allowed: that is a typo, not a lifecycle state.
+    """
+    if to_status not in STATUSES:
+        return False
+    if from_status is None or from_status == to_status:
+        return True
+    targets = LEGAL_TRANSITIONS.get(str(from_status))
+    if targets is None:
+        return True
+    return to_status in targets
+
+
+def legal_sources_for(to_status: str) -> list[str]:
+    """Existing-row statuses that may legally be written to ``to_status``."""
+    return sorted(status for status in STATUSES if is_legal_transition(status, to_status))
+
+
+def _status_transition_clause(to_status: str) -> tuple[str, list[object]]:
+    """SQL guard applied to an existing row when ``to_status`` is written.
+
+    The ``status NOT IN (<all statuses>)`` half lets a row whose status this
+    build does not recognise be written through, matching is_legal_transition.
+    """
+    sources = legal_sources_for(to_status)
+    known = sorted(STATUSES)
+    return (
+        f"(status IN ({', '.join('?' for _ in sources)})"
+        f" OR status NOT IN ({', '.join('?' for _ in known)}))",
+        [*sources, *known],
+    )
+
+
+def _row_identity(path: str, row: dict | None) -> str:
+    if row is None:
+        return f"path={path} no row"
+    return f"path={path} status={row.get('status')} track_id={row.get('track_id')}"
 
 
 def normalize_company(value: str | None) -> str | None:
@@ -183,10 +280,22 @@ async def upsert_document(
     warnings_json: str | None = None,
     company_source: str = COMPANY_SOURCE_UNSCOPED,
     company_source_detail: str | None = None,
-) -> None:
+) -> bool:
+    """Insert a row, or update it on a path conflict. Returns True if written.
+
+    The conflict update is guarded by the lifecycle table: a re-scan or a
+    re-submit can no longer overwrite a row along an illegal edge, so an
+    ingested row is never knocked back to failed/processing by a late or
+    unrelated write (it may still be rejected when its content no longer
+    validates). A refused overwrite is a no-op plus a log line.
+    """
+    if status not in STATUSES:
+        logger.warning("refusing upsert for %s: unknown status %r", path, status)
+        return False
+    guard_sql, guard_params = _status_transition_clause(status)
     async with aiosqlite.connect(settings.state_db_path) as db:
-        await db.execute(
-            '''
+        cur = await db.execute(
+            f'''
             INSERT INTO documents (
               document_id, path, source_type, company, company_source, company_source_detail,
               filename, original_filename, sha256, status,
@@ -223,8 +332,9 @@ async def upsert_document(
               ingested_at=excluded.ingested_at,
               warnings_json=excluded.warnings_json,
               updated_at=datetime('now')
+            WHERE {guard_sql}
             ''',
-            (
+            [
                 document_id,
                 path,
                 source_type,
@@ -252,9 +362,28 @@ async def upsert_document(
                 supersedes_document_id,
                 ingested_at,
                 warnings_json,
-            ),
+                *guard_params,
+            ],
         )
         await db.commit()
+        if cur.rowcount == 0:
+            existing = await _fetch_row(db, path)
+            logger.warning(
+                "upsert of %s as %s ignored: illegal transition from the row as it is now (%s)",
+                path,
+                status,
+                _row_identity(path, existing),
+            )
+            return False
+        return True
+
+
+async def _fetch_row(db: aiosqlite.Connection, path: str) -> dict | None:
+    """Read one row for a log line; only used after a write was refused."""
+    db.row_factory = aiosqlite.Row
+    cur = await db.execute("SELECT status, track_id FROM documents WHERE path=?", (path,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def update_document_state(
@@ -284,7 +413,24 @@ async def update_document_state(
     warnings_json: str | object = UNSET,
     original_filename: str | object = UNSET,
     retry_count: int | object = UNSET,
-) -> None:
+    expect_track_id: str | None | object = UNSET,
+    expect_status: str | object = UNSET,
+) -> bool:
+    """Apply the given columns to the row for ``path``. Returns True if written.
+
+    Two guards decide whether the write lands:
+
+    1. Lifecycle. When a ``status`` is written, the row's *current* status must
+       be a legal source for it (LEGAL_TRANSITIONS). The check is part of the
+       UPDATE's WHERE clause, so it is atomic with the write - the row cannot
+       change between the check and the update.
+    2. Compare-and-set. ``expect_track_id`` / ``expect_status`` restrict the
+       update to a row that still matches what the caller read. A poll result
+       for a track that has since been replaced matches no row and is dropped,
+       rather than overwriting the new submission.
+
+    A refused write is a no-op plus a log line; callers keep going.
+    """
     assignments: list[str] = []
     values: list[object] = []
     updates = {
@@ -324,16 +470,49 @@ async def update_document_state(
         else:
             assignments.append("ingested_at=datetime('now')")
     if not assignments:
-        return
+        return True
     assignments.append("updated_at=datetime('now')")
-    values.append(path)
+
+    where = ["path=?"]
+    where_params: list[object] = [path]
+    if status is not UNSET:
+        if status not in STATUSES:
+            logger.warning("refusing status=%r for %s: not a lifecycle status", status, path)
+            return False
+        guard_sql, guard_params = _status_transition_clause(status)
+        where.append(guard_sql)
+        where_params.extend(guard_params)
+    if expect_track_id is not UNSET:
+        where.append("track_id IS ?")
+        where_params.append(expect_track_id)
+    if expect_status is not UNSET:
+        where.append("status=?")
+        where_params.append(expect_status)
+
     async with aiosqlite.connect(settings.state_db_path) as db:
-        await db.execute(f"UPDATE documents SET {', '.join(assignments)} WHERE path=?", values)
+        cur = await db.execute(
+            f"UPDATE documents SET {', '.join(assignments)} WHERE {' AND '.join(where)}",
+            [*values, *where_params],
+        )
         await db.commit()
+        if cur.rowcount == 0:
+            row = await _fetch_row(db, path)
+            logger.warning(
+                "write for %s ignored: status=%s expect_track_id=%s expect_status=%s, row now (%s)",
+                path,
+                status if status is not UNSET else "-",
+                expect_track_id if expect_track_id is not UNSET else "-",
+                expect_status if expect_status is not UNSET else "-",
+                _row_identity(path, row),
+            )
+            return False
+        return True
 
 
-async def update_status(path: str, status: str, last_error: str | None = None) -> None:
-    await update_document_state(path, status=status, last_error=last_error, query_ready=(status == "ingested"))
+async def update_status(path: str, status: str, last_error: str | None = None) -> bool:
+    return await update_document_state(
+        path, status=status, last_error=last_error, query_ready=(status == "ingested")
+    )
 
 
 async def increment_retry(path: str) -> int:

@@ -1,30 +1,86 @@
 # Handoff — worker
 
-Last updated: 2026-10-13 (after **conftest env-defaults** handoff; queue empty;
-**standby**)
+Last updated: 2026-10-14 (after **TODO #2 review follow-up** — `ingested ->
+rejected` made legal; queue empty; **standby**)
 
 ## Current state
 
 Queue: `rig queue list --owned` → `[]`, `rig queue inbox-pending
 dev-worker@graphraggle` → `[]`. Nothing claimed, nothing owed. Standby.
 
-Latest item, **handed off uncommitted** (lead commits):
-`qitem-20261013201632-9e4c7ab1` — **`tests/conftest.py` env defaults** (brief:
+Latest item, **handed off uncommitted** (lead commits/pushes):
+`qitem-20261014074257-239bc5fb` — TODO #2 review follow-up. `LEGAL_TRANSITIONS`
+now allows **`ingested -> rejected`** (a file that changed on disk and no longer
+validates really is rejected); `ingested -> processing` / `ingested -> failed`
+stay denied, and the table comment now says why: the late-write protection is the
+**poll CAS**, not the table. Evidence test
+`test_submit_file_never_writes_onto_an_ingested_row` patches `worker.submit_file`
+and shows the row is **`accepted`** (written moments earlier by the same scan's
+`content_changed -> validating -> accepted` chain) when submit_file's reject/
+failure writes land — so those are `accepted -> rejected/failed`, never
+`ingested -> ...`. **The regression as described did not reproduce** on my
+previous diff: the end-to-end test settles `rejected` with the new sha,
+query_ready 0, unchanged on a second scan, on both versions. The two tests that
+DO fail pre-fix are the table test and the store-level `ingested -> rejected`
+write (which logged `write for /docs/a.txt ignored: status=rejected ... row now
+(status=ingested ...)`). My CAS answer to the lead: not needed on submit_file's
+post-HTTP writes now — same sequential scan owns the row, API reindex is the only
+concurrent writer and lands on legal edges, and CAS without a pre-submit
+reservation would strand live upstream tracks.
+**Baseline is now 667 passed** (25 tests in
+`tests/test_state_store_lifecycle.py`, 462 lines). Files: `app/state_store.py`
+**+189/−11**, `app/worker.py` **+27/0**, new test file. Backups: `/tmp/p37-fix/
+{state_store.py,state_store_v2.py,worker.py}`.
+
+Earlier item, same work, reviewed OK by the lead: `qitem-20261014072738-31fd9e17`
+— **SQLite status transitions + stale track_id CAS** (TODO near-term #2; base
+`origin/master` `e387de4`; done **in the shared checkout
+`/home/maverick/work/graphraggle` on branch `master`**, left uncommitted — three
+files, do not lose them to a branch switch):
+- `app/state_store.py` **+180/−11** — `STATUSES` (the 9 ADR-0001 statuses) +
+  `LEGAL_TRANSITIONS` + `is_legal_transition()` / `legal_sources_for()` /
+  `_status_transition_clause()`. Enforcement lives in the SQL `WHERE` (atomic,
+  no read-then-write): `update_document_state` refuses an illegal status edge and
+  any unknown status value; `upsert_document`'s `ON CONFLICT DO UPDATE` grew a
+  `WHERE` guard. New optional kwargs `expect_track_id=` / `expect_status=` are a
+  compare-and-set (`track_id IS ?` covers NULL). `upsert_document`,
+  `update_document_state` and `update_status` now return **bool** (True =
+  written); a refused write logs a `gateway.state_store` warning carrying the
+  row's current status/track_id.
+- `app/worker.py` **+27/0** — all **8** `poll_track` write-backs carry
+  `expect_track_id=track_id, expect_status=doc.get("status")` (+ docstring).
+- `tests/test_state_store_lifecycle.py` **new, 353 lines, 22 tests** — real
+  state_store against a temp SQLite file, worker `client` mocked: late poll for a
+  replaced track ignored; illegal edges refused (ingested→failed/rejected/
+  processing, rejected|superseded→processing/ingested, never-upstream→ingested);
+  unknown status refused; stale replay = logged no-op with `updated_at`
+  unchanged; re-scan of an unchanged ingested file stays ingested and never
+  submits.
+
+Tests: **`667 passed, 2 warnings, 6 subtests passed in 2.88s`** bare env
+(`env -i PATH=/usr/bin:/bin HOME=$HOME .venv/bin/python -m pytest tests/ -q`);
+**`667 passed, … 2.94s`** with the six vars exported (master baseline 642, +25
+new). New file alone `25 passed in 0.19s`. Pre-fix control (TODO #2: `git
+checkout -- app/state_store.py app/worker.py`, new tests only) → **`20 failed,
+2 passed`**; the 2 that also pass pre-fix are the deliberate no-regression guards
+(`test_matching_poll_still_applies`,
+`test_unchanged_ingested_file_stays_ingested_and_is_not_resubmitted`). pyflakes
+clean. No existing test encoded an illegal transition — none edited. Pre-fix
+backups of my change: `/tmp/p37-fix/{state_store,worker}.py`.
+
+Previous item, now **merged** as `6f523b7`: `qitem-20261013201632-9e4c7ab1` —
+**`tests/conftest.py` env defaults** (brief:
 `agents/lead/briefs/conftest-env-defaults.md`). One new file, 58 lines, in the
-**shared checkout** (`release-rc1-docs` @ `cf4a2e9`), **left uncommitted on
-purpose** — if it ever goes missing, recreate it: module-scoped
+**shared checkout** (`release-rc1-docs` @ `cf4a2e9`): module-scoped
 `tempfile.TemporaryDirectory(prefix="graphraggle-pytest-")`, then
 `os.environ.setdefault` for `RAG_API_KEY=test-rag-key`,
 `LIGHTRAG_INTERNAL_API_KEY=test-internal-key`,
 `LIGHTRAG_BASE_URL=http://example:9621`, and `SOURCE_DOCS_DIR` /
 `UPLOADS_DIR` / `STATE_DB_PATH` under that temp dir (`source_docs/`, `uploads/`
-subdirs pre-created). Results: clean env **467 passed, 2 warnings in 0.99s**;
-six vars exported **467 passed, 2 warnings in 0.58s**; `env -i` **467 passed**;
-negative control (conftest removed) **4 collection errors** —
-test_keywords/test_observability/test_ollama_bridge/test_rewrite. Also checked on
-a **detached** `/tmp` worktree at master `4d341d7` (now removed): **642 passed, 2
-warnings, 6 subtests passed** clean-env, same 4 errors without it — so it lands
-safely on either branch, and **master's baseline is 642, not 467** (467 = the
+subdirs pre-created). Results then: clean env **467 passed** on
+`release-rc1-docs`; negative control (conftest removed) **4 collection errors** —
+test_keywords/test_observability/test_ollama_bridge/test_rewrite; and on master
+**642 passed** clean-env (**master's baseline is 642, not 467** — 467 was the
 `release-rc1-docs` tree). pyflakes clean.
 
 Live git facts re-derived this wake (trust these over older notes): **master head
@@ -202,9 +258,17 @@ on an ERROR line.
 
 ## Next step
 
-Idle/standby; nothing in the queue as of this wake. If the lead asks for a tweak
-to the conftest, it lives uncommitted in the **shared checkout**
-(`tests/conftest.py`), not in a worktree — don't lose it to a branch switch. On wake: `rig queue list
+Idle/standby; nothing in the queue as of this wake. If the lead asks for another
+tweak to TODO #2, the change is **uncommitted in the shared checkout** (branch
+`master`: `app/state_store.py`, `app/worker.py`,
+`tests/test_state_store_lifecycle.py`) — verify with
+`env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
+**667 passed**). Still the lead's call, deliberately not fixed: CAS on
+`submit_file()`'s post-HTTP writes (I argue not needed — see above),
+compare-and-set `increment_retry()` + `handle_candidate()` writes (two worker
+processes could double-burn retries), the dead `update_status()` in app/, and a
+docs entry for the transition table (ADR 0001 untouched). Likely also: a loop run
+against probe sets v2.1 / v3. On wake: `rig queue list
 --owned` and `rig queue inbox-pending dev-worker@graphraggle` (the second needs
 the destination session as an argument). Likely follow-ups: a new packet off the
 Hermes brief series in `docs/briefs/` (`hermes-widen-corpus.md`,
