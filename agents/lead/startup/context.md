@@ -1,6 +1,6 @@
 # Handoff - lead
 
-Last updated: 2026-10-13 (accuracy target met on the 6-transcript Solvay corpus; widening scope next)
+Last updated: 2026-10-14 (accuracy target met on the 6-transcript Solvay corpus; widening scope next; repo realigned to master)
 
 ## Goal
 Run GraphRAG rc-1 in production for the Solvay corpus (GSK data wiped 2026-10-12, backup on deltahome ~/backups/graphraggle-20261012; backups live ONLY there). Lead delegates code to
@@ -25,6 +25,13 @@ one exception: dev-worker may read SOURCE transcripts in /home/maverick/work/sol
 1. Widen scope: restart worker, deploy pptx extractor (packet-27 merged 1f90c0e; image rebuild with python-pptx via Hermes, with rollback), ingest staged pdf/docx/pptx (+ remaining 2 transcripts), then dev-worker authors probes for the spec docs, Hermes re-runs the loop.
 2. Re-check accuracy on the wider corpus (new held-out); watch sigma availability (contention with dev-worker and outage risk).
 3. Housekeeping: OpenWebUI key rotation, real .docx e2e check, GRAG-42 oMLX memory policy, leftover GSK-quoting files on Thinkpad (probe/, docs/ops/runs) and OpenWebUI chat history (operator has not asked to wipe), Hermes->lead messaging broken (use summary files).
+
+## Repo hygiene (HARD RULE, set by operator 2026-10-14 after an off-master divergence)
+- Lead works ONLY on `master`, in /home/maverick/work/graphraggle. No long-lived side branches for lead work; packet branches/worktrees are the worker's and are deleted after merge.
+- First action of every session and before writing any brief: `git fetch && git rev-list --left-right --count HEAD...origin/master` must read `0 0` on branch master. If not, fix that first; never trust this handoff over the live repo.
+- Worker briefs name the base: branch from current `origin/master`, never from a stale branch.
+- Never leave work product untracked: briefs and handoffs are committed to master the same day. `git status` should show only rig scaffolding (.openrig/, rig.yaml, AGENTS.md, CLAUDE.md, agents/*/agent.yaml, agents/*/guidance/).
+- Commit and push only after the full suite passes (bare `.venv/bin/python -m pytest tests/ -q`; tests/conftest.py supplies env defaults).
 
 ## Access notes
 understory: curl POST http://192.168.1.185:3800/mcp (JSON-RPC, tools/call memory_add / memory_query), one request at a time, long timeouts; note path /projects/graphraggle-status-2026-10-12.md.
