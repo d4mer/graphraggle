@@ -36,6 +36,13 @@ container's masked ERROR lines in the message. Readiness waits also poll
 ``docker ps -a --filter name=<container> --format {{.State}}``, so a container that
 exited or keeps restarting fails in seconds instead of minutes.
 
+An experiment may also carry ``"transcript_prep": true`` to run every corpus file
+through ``app.transcript_prep`` (contextual chunk headers + speaker-turn
+normalisation) before posting it to ``/documents/text``. The loop bypasses the
+worker, so without this key an experiment cannot measure what the
+``TRANSCRIPT_PREP_ENABLED`` worker would send. Default false: file text is posted
+unchanged, exactly as before.
+
 An experiment may also carry ``"gateway_env": {...}`` with the gateway knobs
 (BRIDGE_*, GATEWAY_CHUNK_TOP_K, CITATION_TOP_K). They live in the same .env, are
 verified against the rag-gateway-api container, and that service is recreated and
@@ -49,9 +56,12 @@ Outputs, all under --out:
     env.original   the untouched copy of <root>/.env (chmod 600)
     <name>/answers.jsonl, verdicts.jsonl, summary.json
 
-Stdlib only (urllib, json, subprocess, argparse, time, pathlib, re). Every side
-effect goes through the Ops class so the tests can replace it with a fake: no
-network, no docker, no sleeping in tests.
+Stdlib only (urllib, json, subprocess, argparse, time, pathlib, re) plus one
+first-party import: ``app.transcript_prep``, the same transcript preprocessor the
+ingest worker uses, so an experiment measures exactly what production would send.
+That module is itself stdlib-only and reads no settings. Every side effect goes
+through the Ops class so the tests can replace it with a fake: no network, no
+docker, no sleeping in tests.
 """
 
 from __future__ import annotations
@@ -70,6 +80,14 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+# Make the repo's own package importable when this script is started by absolute
+# path from anywhere (the loop is run as scripts/overnight_loop.py).
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from app.transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
 
 # ── Configuration surface ───────────────────────────────────────────────────
 
@@ -334,6 +352,10 @@ def load_experiments(path: Path) -> dict[str, Any]:
             "env": {str(k): str(v) for k, v in env.items()},
             "gateway_env": {str(k): str(v) for k, v in gateway_env.items()},
             "reingest": bool(entry.get("reingest", False)),
+            # Experiment-level transcript preparation (see app/transcript_prep.py).
+            # Default false, so an experiments.json written before this key exists
+            # behaves exactly as before.
+            "transcript_prep": bool(entry.get("transcript_prep", False)),
             "probe_concurrency": concurrency,
         })
     return {
@@ -1323,9 +1345,24 @@ class Loop:
             raise StepError(f"{CORPUS_FILE} must be a non-empty JSON list of file paths")
         return [Path(str(entry)) for entry in raw]
 
-    def _insert_one(self, path: Path) -> float:
+    def _insert_one(self, path: Path, *, transcript_prep: bool = False) -> float:
         started = self.ops.now()
         text = self.ops.read_text(path)
+        if transcript_prep:
+            # Experiment-level key "transcript_prep": true. Same function the
+            # worker calls; the default cadence is the shipped default, and text
+            # that is not transcript-shaped comes back untouched.
+            prepared = prepare_transcript(
+                text, filename=path.name, header_every_tokens=DEFAULT_HEADER_EVERY_TOKENS
+            )
+            if prepared.applied:
+                self.log(
+                    f"transcript_prep {path.name}: {prepared.headers_inserted} headers, "
+                    f"{prepared.turns} turns, {len(prepared.speakers)} speakers"
+                )
+                text = prepared.text
+            else:
+                self.log(f"transcript_prep {path.name}: skipped ({prepared.reason})")
         status, body = self.ops.http_json(
             "POST",
             f"{LIGHTRAG_URL}/documents/text",
@@ -1360,7 +1397,12 @@ class Loop:
         self._clear_lightrag()
         seconds_per_doc: list[float] = []
         for path in self._corpus_paths():
-            seconds = self._attempt(lambda p=path: self._insert_one(p), what=f"insert {path.name}", attempts=2)
+            prep = bool(experiment.get("transcript_prep"))
+            seconds = self._attempt(
+                lambda p=path, q=prep: self._insert_one(p, transcript_prep=q),
+                what=f"insert {path.name}",
+                attempts=2,
+            )
             seconds_per_doc.append(seconds)
             self.log(f"{experiment['name']}: inserted {path.name} in {seconds}s")
         self.state["corpus_built_by"] = experiment["name"]

@@ -42,6 +42,24 @@ class Settings(BaseSettings):
     # Extracted text is capped before submission; the cap leaves a marker line.
     worker_pptx_max_chars: int = Field(default=2_000_000, alias="WORKER_PPTX_MAX_CHARS")
 
+    # Contextual chunk headers + speaker-turn normalisation for transcript-shaped
+    # text, applied to the /documents/text payload before LightRAG ever sees it
+    # (app/transcript_prep.py). LightRAG cuts fixed-size token chunks, so a
+    # transcript's later chunks lose the meeting's title, date and turn structure;
+    # this puts a one-line context header every ~N tokens into the TEXT itself.
+    # Default false: the submitted payload is byte-for-byte what it is today.
+    # The dedupe content hash is always computed on the ORIGINAL file bytes, never
+    # on prepared text, so preparation can never change a document's identity.
+    transcript_prep_enabled: bool = Field(default=False, alias="TRANSCRIPT_PREP_ENABLED")
+    # Rough token distance between context headers. Production LightRAG runs at its
+    # default 1200-token chunks (100 overlap), so 200 puts several headers inside
+    # every chunk LightRAG produces. Tokens are approximated by
+    # app/transcript_prep.py (~4 chars/token) because tiktoken lives in LightRAG's
+    # image, not this venv; the 6x margin below the chunk size absorbs the error.
+    transcript_prep_header_every_tokens: int = Field(
+        default=200, alias="TRANSCRIPT_PREP_HEADER_EVERY_TOKENS"
+    )
+
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
     rerank_binding_api_key: Optional[str] = Field(default=None, alias="RERANK_BINDING_API_KEY")

@@ -67,6 +67,7 @@ class FakeOps(ol.Ops):
         self.commands: list[list[str]] = []
         self.env_snapshots: list[str] = []
         self.http_calls: list[tuple[str, str]] = []
+        self.payloads_seen: list[tuple[str, Any]] = []
         self.headers_seen: list[tuple[str, dict]] = []
         self.delete_status = 200
         self.container_states: dict[str, str] = {}
@@ -123,6 +124,7 @@ class FakeOps(ol.Ops):
 
     def http_json(self, method, url, *, headers=None, payload=None, timeout=30.0):
         self.http_calls.append((method, url))
+        self.payloads_seen.append((url, payload))
         self.headers_seen.append((url, dict(headers or {})))
         self.clock += self.advance_per_call
         if url.endswith("/documents") and method == "DELETE" and self.delete_status != 200:
@@ -2435,6 +2437,48 @@ class TestJudgeRubricV2(unittest.TestCase):
         self.assertIn("EVEN IF the answer names real entities or mentions nearby facts", sent)
         self.assertIn("hallucinated ONLY if the answer asserts a specific value", sent)
         self.assertEqual(ops.sent["max_tokens"], ol.JUDGE_MAX_TOKENS)
+
+
+class TestTranscriptPrepExperimentKey(_Case):
+    """Experiment-level ``"transcript_prep": true`` in the loop's inserts.
+
+    The loop posts text straight to ``/documents/text`` and bypasses the worker,
+    so it must be able to apply the same pre-processing production would. Default
+    (no key) sends the file text unchanged.
+    """
+
+    TRANSCRIPT = """Alice Chen  0:12
+We should ship the bridge change behind a flag.
+Bob Nguyen  0:31
+Agreed, but the rollback path needs a test first.
+Alice Chen  0:48
+I will write it tonight; the plan is to cut on Friday.
+Bob Nguyen  1:02
+Friday works, the freeze starts that night.
+"""
+
+    def _posted_texts(self, experiment: dict) -> list[str]:
+        (self.root / "doc1.txt").write_text(self.TRANSCRIPT, encoding="utf-8")
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        self.make_loop(config).run()
+        return [
+            (payload or {}).get("text", "")
+            for url, payload in self.ops.payloads_seen
+            if url.endswith("/documents/text")
+        ]
+
+    def test_without_the_key_the_file_text_is_posted_unchanged(self):
+        posted = self._posted_texts({"name": "E1", "env": {}, "reingest": True})
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0], self.TRANSCRIPT)
+
+    def test_key_on_posts_headered_turn_text(self):
+        posted = self._posted_texts({"name": "E1", "env": {}, "reingest": True,
+                                     "transcript_prep": True})
+        self.assertEqual(len(posted), 1)
+        self.assertIn("[Meeting: doc1 | ", posted[0])
+        self.assertIn("Alice Chen: We should ship the bridge change behind a flag.", posted[0])
+        self.assertIn("Bob Nguyen: Friday works, the freeze starts that night.", posted[0])
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from .state_store import (
     upsert_document,
     update_document_state,
 )
+from .transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
 from .validation import validate_file
 
 SUPPORTED = {".txt", ".md", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json", ".html", ".htm"}
@@ -167,6 +168,42 @@ def normalize_text_submission_payload(text: str) -> str:
     normalized = re.sub(r"(?:^|\n)(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*", "\n", normalized)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized.strip()
+
+
+def prepare_transcript_payload(path: Path, text: str) -> tuple[str, dict[str, Any]]:
+    """Optional transcript preparation, behind ``TRANSCRIPT_PREP_ENABLED``.
+
+    Returns the payload to submit and the worker metadata to record on the row, so
+    a later reindex can tell a prepared document from an unprepared one. Detection
+    is conservative inside :mod:`app.transcript_prep`: text that is not
+    transcript-shaped comes back byte-identical with ``detected=False``. The
+    content hash used for dedupe is never taken from this text - it is computed
+    from the file bytes before this call.
+    """
+    if not settings.transcript_prep_enabled:
+        return text, {}
+    result = prepare_transcript(
+        text,
+        filename=path.name,
+        header_every_tokens=int(
+            settings.transcript_prep_header_every_tokens or DEFAULT_HEADER_EVERY_TOKENS
+        ),
+    )
+    if result.applied:
+        return result.text, {
+            "transcript_prep": "applied",
+            "transcript_prep_headers": result.headers_inserted,
+            "transcript_prep_turns": result.turns,
+            "transcript_prep_speakers": list(result.speakers),
+            "transcript_prep_reason": None,
+        }
+    return text, {
+        "transcript_prep": "skipped",
+        "transcript_prep_headers": None,
+        "transcript_prep_turns": None,
+        "transcript_prep_speakers": None,
+        "transcript_prep_reason": result.reason,
+    }
 
 
 def uses_pptx_extract(path: Path) -> bool:
@@ -523,10 +560,12 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
 
     detected_encoding = None
     text_payload = None
+    prep_updates: dict[str, Any] = {}
     if path.suffix.lower() in TEXT_EXTENSIONS:
         try:
             text_payload, detected_encoding = read_text_with_fallbacks(path)
             text_payload = normalize_text_submission_payload(text_payload)
+            text_payload, prep_updates = prepare_transcript_payload(path, text_payload)
         except Exception as exc:
             await update_document_state(
                 str(path),
@@ -626,6 +665,11 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
                 "submission_blocked": None,
             }),
         )
+
+    if prep_updates:
+        # Recorded before the HTTP call so both the success upsert and the failure
+        # write-backs carry it: "was this document submitted prepared?"
+        warnings_json = merge_warning_metadata(warnings_json, worker_updates=prep_updates)
 
     try:
         if text_payload is not None:
