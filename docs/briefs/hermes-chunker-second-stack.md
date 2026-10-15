@@ -1,9 +1,10 @@
 # Hermes brief: second stack + chunker arms P1 and C2 (branch `chunking`)
 
-**Status: DRAFT. Not approved.** On approval the operator will name which part is
-approved: Part A (build the second stack and a dry run) and/or each arm of Part B
-separately. Each arm is about 8 to 9 hours of sigma time. Approval prompts appear only in
-your tmux pane. Report to `~/rag-project/docs/ops/runs/chunker-second-stack.md` (files,
+**Status: APPROVED by the operator on 2026-10-15 for Part A ONLY (build the second
+stack, verify it, dry run; no ingest, no sigma load beyond health checks). Part B (the
+arms) is NOT approved: each arm needs its own written go.** Each arm is about 8 to 9
+hours of sigma time. Approval prompts appear only in your tmux pane; the operator will be
+at the terminal. Report to `~/rag-project/docs/ops/runs/chunker-second-stack.md` (files,
 not `rig send`).
 
 ## Goal
