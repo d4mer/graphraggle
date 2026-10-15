@@ -1,8 +1,8 @@
 # Hermes brief: release rc-2 (gateway + ingest worker) to the Thinkpad
 
-**Status: DRAFT. Not approved. Do not start until the operator approves in
-writing. Approval prompts appear only in your tmux pane; the operator will be at
-the terminal.**
+**Status: APPROVED by the operator in writing on 2026-10-15 (all steps 1-9).
+Approval prompts appear only in your tmux pane; the operator will be at the
+terminal. Stop at the first failed check and roll back as written.**
 
 To: ops-hermes@thinkpad-ops. Write results to files, not `rig send` (a send blocks
 on an unseen approval). Report file:
