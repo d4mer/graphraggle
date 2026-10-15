@@ -1,54 +1,65 @@
-# Hermes brief: chunker experiments on a copy of the loop corpus (branch `chunking`)
+# Hermes brief: chunker experiments (branch `chunking`)
 
-**Status: DRAFT. Not approved.** Experiment A (no code): does a different LightRAG chunker
-beat fixed-token on the v2 probe set? Plus a content-free shape report the worker needs.
-Production is NOT changed: the loop driver backs up `.env`, applies experiment env, and
-restores baseline at the end (as in the overnight runs). Operator must be at the terminal
-for approval prompts. Results to `~/rag-project/docs/ops/runs/chunker-experiments.md`.
+**Status: APPROVED by the operator on 2026-10-15 for steps 0 and 1 only (read-only).
+Step 2 (the experiment runs) is NOT approved by this brief: it re-ingests and WIPES the
+LightRAG store, so it needs its own written go, a protected window and a verified
+backup (see "Why step 2 is gated").** Production is not changed by steps 0 and 1.
+Operator is at the terminal for approval prompts. Results go to
+`~/rag-project/docs/ops/runs/chunker-experiments.md` (files, not `rig send`).
+
+## Context
+rc-2 is released (gateway and worker on `local/rag-gateway:rc2`). Chunking work lives on
+branch `chunking`; the worker has built a flag-gated transcript pre-processor
+(`TRANSCRIPT_PREP_ENABLED`, default off) there. Two questions: (A) does another LightRAG
+chunker beat fixed-token on the v2 probes, (B) does the pre-processor help. This brief
+gets the facts needed to design the experiments without changing anything.
 
 ## Hard rules
-- Do not run this while `rc-2` release steps are in progress (shared LightRAG and `.env`).
-  Release brief: `docs/briefs/hermes-release-rc2.md`. Release goes first.
-- Production query path will be unavailable or degraded while the loop re-ingests the loop
-  corpus into LightRAG. The operator must approve a window. Say how long.
-- The worker (rag-ingest-worker) must be stopped for the loop (the driver refuses
-  otherwise). Report if any document is processing first; wait for it.
-- Do not read or copy corpus content out. Counts, shapes, scores and judgment only.
+- Read-only. No `.env` edit, no container restart, no store change, no ingest.
+- Do not read or copy corpus content out. Counts, shapes, regex-like patterns and
+  distributions only. File names are masked (letters replaced) in anything you report.
+- The worker is running; do not stop it. Do not run the loop driver.
 
-## Step 0: shape report (no LightRAG change)
-For the transcripts in the loop corpus (and the 6 source transcripts), write a content-free
-report: speaker-label pattern(s) (as regex-like shapes, e.g. `<Name>  <m:ss>`), timestamp
-pattern, line/turn counts, turn-length percentiles in tokens, share of turns under 10
-tokens, whether any file is VTT/SRT, file-name pattern shape (do the names carry a date or a
-title? show the shape with letters masked). This goes to the worker for fixtures.
+## Step 0: content-free shape report of the transcripts
+For the transcripts in the loop corpus and the 6 source transcripts (and, separately,
+for the 10 documents currently in `source_docs/`, by extension): speaker-label pattern(s)
+as shapes (e.g. `<Name>  <m:ss>`, `<Name>: `), timestamp pattern, line and turn counts,
+turn-length percentiles (p10/p50/p90/max) in approximate tokens, share of turns under
+10 tokens, whether any file is VTT/SRT/Q-and-A style, whether labels carry roles or
+emails, and the file-name shape with letters masked (do names carry a date or a title?).
+This is the input for the worker's fixtures.
 
-## Step 1: discover chunker settings (do not guess)
-LightRAG 1.5.7 ships fixed-token, recursive-character, paragraph-semantic and semantic-
-vector chunkers. From the LightRAG image's own docs/`env.example`/source (read-only,
-inside the container), report the exact environment variable names and allowed values that
-select the chunker and tune it (size/overlap/threshold), and which ones need an embedding
-call per sentence. Add the missing whitelist entries to the loop driver's
-`ENV_WHITELIST` is the WORKER's job; just report names and values.
+## Step 1: discover the chunker settings (do not guess)
+LightRAG 1.5.7 ships fixed-token, recursive-character, paragraph-semantic and
+semantic-vector chunkers. From the LightRAG image's own `env.example`, docs or source
+(read inside the container, read-only) report: the exact environment variable names and
+allowed values that select the chunker and tune it (size, overlap, similarity threshold),
+which ones call the embedding model per sentence, and the current effective values in
+production (names and values of non-secret chunk settings only). Say which of those
+names are NOT in the loop driver's `ENV_WHITELIST` (`scripts/overnight_loop.py`); the
+lead will have the worker add them.
 
-## Step 2: experiments (after approval of the names from step 1)
-Create `docs/ops/loop/experiments-chunker.json` is the worker's file; Hermes runs whatever
-the lead hands over. Planned arms, all re-ingest the same 6 transcripts, same v2 probes
-(40 dev / 40 held-out), gleaning off (current production), rerank on:
-- **C0 baseline** fixed-token (current): this is the v2 baseline. If a v2 baseline run on
-  rc-2 settings already exists, use it and say which run.
-- **C1 recursive** chunker.
-- **C2 semantic-vector** chunker.
-- **C3 paragraph-semantic** only if C1/C2 show a signal; transcripts have no headings.
-Report per arm: dev %, held-out %, hallucination %, refusal %, median query s, ingest
-minutes, chunk counts per document (counts), failures by category if any answer changed.
+## Why step 2 is gated (read this before asking for it)
+`scripts/overnight_loop.py` clears the LightRAG store before each re-ingest, so running
+it against production **replaces the whole corpus with the 3 to 6 loop transcripts**.
+Step 2 would therefore need all of: a quiescent verified copy of `lightrag_store/`
+(as in the 2026-10-09 backup drill, with sha256 manifest and a proven restore), the
+worker stopped, a window the operator names, and a restore at the end. Alternatively a
+second LightRAG instance on another port and store; Hermes should say in the report
+whether that is feasible on this host (memory, disk, oMLX capacity) without touching
+production. Do not do either until the lead sends a separate go.
 
-## Decision rule
-An arm is adopted only if held-out accuracy is higher than C0 on the v2 set by at least
-3 questions, with hallucination not higher and refusals not lower. Otherwise keep
-fixed-token and say so. Remember 1 held-out question = 2.5 points on 40.
+## Step 2 (NOT approved): the arms, for planning only
+All arms use the same 6 transcripts, the v2 probes (40 dev / 40 held-out), gleaning off,
+rerank on:
+- C0 baseline fixed-token, current. Reuse an existing v2 baseline run if one exists and
+  say which.
+- C1 recursive chunker. C2 semantic-vector chunker. C3 paragraph-semantic only if C1/C2
+  show a signal.
+- P1 transcript pre-processor on (`"transcript_prep": true`), fixed-token chunker.
+Adopt an arm only if held-out accuracy beats C0 by at least 3 questions (1 question =
+2.5 points) with hallucination not higher and refusals not lower.
 
-## Rollback
-The driver restores the baseline `.env` at the end. Hermes confirms: LightRAG healthy,
-`.env` equals the pre-run backup (sha256), store contents restored (re-ingest of the
-production corpus is NOT part of this brief: if the loop wiped the store, say so and stop;
-the operator decides how to repopulate).
+## Report
+Step 0 and 1 results, whether a second LightRAG instance is feasible, and an estimate of
+the minutes per arm (ingest plus probes) so the operator can choose a window.
