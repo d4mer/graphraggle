@@ -12,7 +12,19 @@
     "breakpoint_threshold_amount and buffer_size. sentence_split_regex is env-only and is",
     "rejected in a request. LightRAG answers an unknown key, a bool-as-int or a numeric",
     "string with a synchronous 422; the loop refuses the same shapes before starting an arm.",
-    "Docs: docs/ops/runs/chunker-experiments.md, app/transcript_prep.py."
+    "Docs: docs/ops/runs/chunker-experiments.md, app/transcript_prep.py.",
+    "Second-stack run (flags only, no secrets; run from the repo root):",
+    "  scripts/overnight_loop.py --root ~/rag-project --experiments docs/ops/loop/experiments-chunking.json",
+    "  --out ~/rag-project/loop-chunking --max-hours 11",
+    "  --lightrag-url http://127.0.0.1:9631 --gateway-url http://127.0.0.1:8030",
+    "  --lightrag-container stack2-lightrag-server --gateway-container stack2-rag-gateway-api",
+    "  --gateway-service gateway-api --lightrag-service lightrag-server --worker-container none",
+    "  --compose-file ~/rag-project/compose.stack2.yml --compose-project stack2",
+    "  --env-file ~/rag-project/stack2.env",
+    "Never run this file against production without --allow-production; it wipes the store.",
+    "--worker-container none is only valid for a stack with no ingest worker: against the",
+    "production LightRAG the loop refuses it, because that guard is what stops a clear",
+    "underneath a running rag-ingest-worker."
   ],
   "baseline_env": {},
   "experiments": [

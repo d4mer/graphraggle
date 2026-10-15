@@ -52,8 +52,13 @@ request body is byte-identical to what was posted before the key existed. Omitti
 ``chunking`` entirely keeps LightRAG's fixed-token default.
 
 Where the run goes is now explicit: ``--lightrag-url``, ``--gateway-url``,
-``--lightrag-container``, ``--gateway-container``, ``--gateway-service`` and
-``--env-file``. Leaving them out points at production exactly as before. Because a
+``--lightrag-container``, ``--gateway-container``, ``--gateway-service``,
+``--env-file``, ``--worker-container``, ``--compose-file`` and ``--compose-project``.
+The worker guard checks the container you name, and ``none`` skips it for a stack with
+no ingest worker (refused when the target is production, because that guard is what
+protects the production store). Every ``docker compose`` call uses ``--compose-file``
+and ``-p --compose-project``, so a second stack in its own compose project is the one
+that gets recreated. Leaving them out points at production exactly as before. Because a
 reingest clears the LightRAG store it points at, a run on the production LightRAG
 with any ``"reingest": true`` experiment now stops before the first request with
 "this would wipe the production store" unless ``--allow-production`` is given. That
@@ -307,6 +312,12 @@ def chunking_param_problems(strategy: str, params: dict[str, Any]) -> list[str]:
     return problems
 
 
+# --worker-container accepts this to mean "this stack has no ingest worker", which
+# skips the guard. Never valid against the production store: the guard is what stops
+# the loop clearing LightRAG while an ingest worker is writing into it.
+WORKER_GUARD_NONE = "none"
+
+
 def _normalise_url(raw: str) -> str:
     return str(raw).strip().rstrip("/").lower()
 
@@ -330,6 +341,10 @@ class Target:
     gateway_container: str | None = None
     gateway_service: str | None = None
     env_file: str | None = None  # None -> <root>/.env, as always
+    lightrag_service: str | None = None  # compose service; None -> the container name
+    worker_container: str | None = None  # or WORKER_GUARD_NONE to skip the guard
+    compose_file: str | None = None  # None -> <root>/compose.yml, resolved per call
+    compose_project: str | None = None  # -p NAME, for a stack in its own project
 
     def __post_init__(self) -> None:
         for name, constant in (
@@ -338,12 +353,16 @@ class Target:
             ("lightrag_container", CONTAINER),
             ("gateway_container", GATEWAY_CONTAINER),
             ("gateway_service", GATEWAY_SERVICE),
+            ("worker_container", WORKER_CONTAINER),
         ):
             if getattr(self, name) is None:
                 object.__setattr__(self, name, constant)
 
     def is_production_lightrag(self) -> bool:
         return _normalise_url(self.lightrag_url) == _normalise_url(PRODUCTION_LIGHTRAG_URL)
+
+    def guard_skipped(self) -> bool:
+        return str(self.worker_container).strip().lower() == WORKER_GUARD_NONE
 
 
 def production_wipe_refusal(target: Target, config: dict[str, Any]) -> str | None:
@@ -363,6 +382,20 @@ def production_wipe_refusal(target: Target, config: dict[str, Any]) -> str | Non
         f"LightRAG ({PRODUCTION_LIGHTRAG_URL}) and the experiments file requests "
         "reingest: true, which deletes every document before re-inserting. Point "
         "--lightrag-url at a second stack, or pass --allow-production if you mean it."
+    )
+
+
+def worker_guard_refusal(target: Target) -> str | None:
+    """Refuse a run that switches off the worker guard while pointing at production."""
+    if not target.guard_skipped():
+        return None
+    if not target.is_production_lightrag():
+        return None
+    return (
+        f"--worker-container {WORKER_GUARD_NONE} switches off the guard that stops this driver "
+        f"clearing a LightRAG store while {WORKER_CONTAINER} writes into it, and this run points "
+        "at the production LightRAG. Use it only with --lightrag-url pointed at a second stack "
+        "that has no ingest worker."
     )
 
 DEV_PROBE_FILE = "probe/solvay-dev-v1.jsonl"
@@ -1349,11 +1382,16 @@ class Loop:
         return set_values
 
     def _compose(self, *args: str) -> tuple[int, str, str]:
-        return self.ops.run(
-            ["docker", "compose", "-f", str(self.root / "compose.yml"), *args],
-            cwd=self.root,
-            timeout=300,
-        )
+        """Every docker compose call honours --compose-file and --compose-project.
+
+        A second stack lives in its own compose project; without -p these calls would
+        recreate the production services by name.
+        """
+        argv = ["docker", "compose", "-f", self.t.compose_file or str(self.root / "compose.yml")]
+        if self.t.compose_project:
+            argv += ["-p", self.t.compose_project]
+        argv.extend(args)
+        return self.ops.run(argv, cwd=self.root, timeout=300)
 
     def _restart_service(self, service: str, container: str) -> None:
         code, out, err = self._compose("up", "-d", "--no-deps", service)
@@ -1362,7 +1400,11 @@ class Loop:
         self.log(f"{container}: recreated")
 
     def _restart_server(self) -> None:
-        self._restart_service(self.t.lightrag_container, self.t.lightrag_container)
+        # Today the compose service and the container share a name; a second stack in
+        # its own project may keep the service name and rename only the container, so
+        # the service is its own knob and falls back to the container name.
+        service = self.t.lightrag_service or self.t.lightrag_container
+        self._restart_service(service, self.t.lightrag_container)
 
     def _restart_gateway(self) -> None:
         self._restart_service(self.t.gateway_service, self.t.gateway_container)
@@ -1511,7 +1553,7 @@ class Loop:
 
     # ── step 3: reingest ───────────────────────────────────────────────────
 
-    def _worker_running(self) -> bool:
+    def _worker_running(self, container: str) -> bool:
         code, out, _err = self.ops.run(
             ["docker", "ps", "--format", "{{.Names}}"],
             cwd=self.root,
@@ -1519,15 +1561,23 @@ class Loop:
         )
         if code != 0:
             raise StepError(f"docker ps failed rc={code}")
-        return any(WORKER_CONTAINER in line for line in out.splitlines())
+        return any(container in line for line in out.splitlines())
 
     def _guard_worker(self) -> None:
-        if self._worker_running():
+        # The guard protects the store this run clears, so it has to watch the worker
+        # of THAT stack. "none" skips it - allowed only for a stack with no worker,
+        # and refused before the run starts when the target is production.
+        if self.t.guard_skipped():
+            self.log("worker guard skipped (--worker-container none): no ingest worker on this stack")
+            return
+        container = self.t.worker_container
+        if self._worker_running(container):
             raise FatalRun(
-                f"{WORKER_CONTAINER} is running; refusing to clear LightRAG under it. "
-                "Stop the worker yourself and rerun with --resume."
+                f"{container} is running; refusing to clear LightRAG under it. Stop the worker "
+                "yourself and rerun, or pass --worker-container with this stack's worker "
+                "(or none, if this stack has no worker)."
             )
-        self.log("worker is stopped; safe to clear LightRAG")
+        self.log(f"{container} is stopped; safe to clear LightRAG")
 
     def _api_key(self) -> str:
         """LightRAG's API key, or "" when the stack runs open access.
@@ -2365,6 +2415,16 @@ def main(argv: list[str] | None = None) -> int:
                        help=f"compose service name used to recreate the gateway (default: {GATEWAY_SERVICE})")
     parser.add_argument("--env-file", default=None,
                        help=".env file to rewrite (default: <root>/.env, as always)")
+    parser.add_argument("--lightrag-service", default=None,
+                       help="compose service name used to recreate LightRAG (default: the "
+                            "--lightrag-container name, as today)")
+    parser.add_argument("--worker-container", default=None,
+                       help=f"container the worker guard checks (default: {WORKER_CONTAINER}; "
+                            f"{WORKER_GUARD_NONE} skips the guard, only for a stack with no worker)")
+    parser.add_argument("--compose-file", default=None,
+                       help="compose file for every docker compose call (default: <root>/compose.yml)")
+    parser.add_argument("--compose-project", default=None,
+                       help="compose project name (-p) when the stack lives in its own project")
     parser.add_argument(
         "--allow-production",
         action="store_true",
@@ -2384,6 +2444,10 @@ def main(argv: list[str] | None = None) -> int:
         gateway_container=arguments.gateway_container,
         gateway_service=arguments.gateway_service,
         env_file=arguments.env_file,
+        lightrag_service=arguments.lightrag_service,
+        worker_container=arguments.worker_container,
+        compose_file=arguments.compose_file,
+        compose_project=arguments.compose_project,
     )
 
     if arguments.rejudge:
@@ -2410,6 +2474,11 @@ def main(argv: list[str] | None = None) -> int:
     # The store this run clears is the store it points at. A run that lands on the
     # production LightRAG and requests reingest wipes production, so it now needs
     # an explicit --allow-production. Checked before any request or docker call.
+    guard_refusal = worker_guard_refusal(target)
+    if guard_refusal:
+        print(f"refusing to run: {guard_refusal}", file=sys.stderr)
+        return 3
+
     refusal = production_wipe_refusal(target, config)
     if refusal:
         if arguments.allow_production:
@@ -2436,8 +2505,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     # file names only, never their contents
     loop.log(f"probe files: dev={dev_probe} heldout={heldout_probe}")
+    compose_shown = target.compose_file or str(root_path / "compose.yml")
+    if target.compose_project:
+        compose_shown += f" -p {target.compose_project}"
     loop.log(f"target: lightrag={target.lightrag_url} gateway={target.gateway_url} "
              f"containers={target.lightrag_container},{target.gateway_container} "
+             f"worker={target.worker_container} compose={compose_shown} "
              f"env={target.env_file or (root_path / '.env')}")
     for line in build_plan_lines(config):
         loop.log(line)

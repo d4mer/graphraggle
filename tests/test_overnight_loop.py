@@ -23,6 +23,7 @@ import time
 import unittest
 import urllib.error
 from contextlib import redirect_stdout
+from typing import Any
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -75,6 +76,8 @@ class FakeOps(ol.Ops):
         self.container_states: dict[str, str] = {}
         self.logs: dict[str, str] = {}
         self.worker_running = False
+        self.names: list[str] | None = None   # scripted `docker ps --format {{.Names}}`
+        self.env_file: Path | None = None     # the .env THIS stack reads (--env-file)
         self.fail_compose_calls: set[int] = set()
         self.raise_on_exec = False
         self.judge_garbage = 0
@@ -88,12 +91,16 @@ class FakeOps(ol.Ops):
     def sleep(self, seconds: float) -> None:
         self.clock += max(0.0, seconds)
 
+    def _current_env_text(self) -> str:
+        # The stack under test may read a different .env than <root>/.env.
+        return (self.env_file or self.root / ".env").read_text(encoding="utf-8")
+
     def run(self, argv, *, cwd=None, timeout=180.0):
         argv = list(argv)
         self.commands.append(argv)
         if argv[:2] == ["docker", "compose"]:
             self.compose_index += 1
-            self.env_snapshots.append((self.root / ".env").read_text(encoding="utf-8"))
+            self.env_snapshots.append(self._current_env_text())
             if self.compose_index in self.fail_compose_calls:
                 return 1, "", "compose exploded"
             return 0, "", ""
@@ -108,14 +115,14 @@ class FakeOps(ol.Ops):
                             raw = argv[index + 1]
                 name = raw.removeprefix("name=")
                 return 0, self.container_states.get(name or ol.CONTAINER, "running") + "\n", ""
-            names = ["lightrag-server", "rag-gateway-api"]
+            names = list(self.names) if self.names is not None else ["lightrag-server", "rag-gateway-api"]
             if self.worker_running:
                 names.append("rag-ingest-worker")
             return 0, "".join(name + "\n" for name in names), ""
         if argv[:2] == ["docker", "exec"]:
             if self.raise_on_exec:
                 raise RuntimeError("docker exec blew up")
-            text = (self.root / ".env").read_text(encoding="utf-8")
+            text = self._current_env_text()
             values = []
             for line in text.splitlines():
                 match = ol._ENV_LINE.match(line.strip())
@@ -2608,6 +2615,17 @@ class TestChunkingExperimentKey(_Case):
         self.assertTrue(by_name["P2-prep-plus-semantic"]["transcript_prep"])
         self.assertTrue(all(experiment["reingest"] for experiment in config["experiments"]))
 
+    def test_the_readme_carries_the_second_stack_command_and_the_wipe_warning(self):
+        path = Path(__file__).resolve().parent.parent / "docs" / "ops" / "loop" / "experiments-chunking.json"
+        readme = "\n".join(json.loads(path.read_text(encoding="utf-8"))["_readme"])
+        self.assertIn("Never run this file against production without --allow-production; "
+                      "it wipes the store.", readme)
+        for flag in ("--experiments", "--lightrag-url", "--gateway-url", "--lightrag-container",
+                     "--gateway-container", "--gateway-service", "--lightrag-service",
+                     "--worker-container", "--compose-file", "--compose-project", "--env-file"):
+            self.assertIn(flag, readme, f"the run line does not mention {flag}")
+        self.assertNotIn("KEY=", readme, "no secrets in the run line")
+
 
 # ── second-stack targeting and the production-wipe gate ─────────────────────
 
@@ -2801,6 +2819,190 @@ class TestLoopLogsUseDocPositions(_Case):
         self.assertIn("transcript_prep doc 2/3:", log)
         self.assertNotIn("doc2.txt", log)
         self.assertNotIn("doc1.txt", log)
+
+
+
+
+class TestWorkerGuardTargetsTheStack(_Case):
+    """The worker guard checks the container of the stack being cleared."""
+
+    def _second(self) -> ol.Target:
+        # Built per test, not at import: a pre-change Target must fail the tests that
+        # use it, not the whole module at collection time.
+        return ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                         lightrag_container="stack2-lightrag", gateway_container="stack2-gateway",
+                         worker_container="stack2-worker",
+                         compose_file="compose.stack2.yml", compose_project="stack2")
+
+    def _reingest_config(self) -> dict:
+        return self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": True}]})
+
+    def _run(self, target: ol.Target) -> list[str]:
+        """Run one reingest experiment; return the URLs it was asked to hit."""
+        ol.Loop(root=self.root, out=self.out, config=self._reingest_config(), ops=self.ops,
+                max_hours=11.0, handle_signals=False, print_fn=lambda line: None,
+                target=target).run()
+        return [url for _method, url in self.ops.http_calls]
+
+    def test_production_worker_still_blocks_a_production_reingest(self):
+        self.ops.worker_running = True
+        urls = self._run(ol.Target())
+        self.assertFalse([url for url in urls if url.endswith("/documents")],
+                         "the store must not even be cleared under a running worker")
+        self.assertFalse([url for url in urls if url.endswith("/documents/text")])
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn(f"{ol.WORKER_CONTAINER} is running", log)
+
+    def test_a_second_stack_is_not_blocked_by_the_production_worker(self):
+        self.ops.worker_running = True          # production rag-ingest-worker is up
+        urls = self._run(self._second())
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents", urls)
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents/text", urls,
+                      "the production worker must not gate a second stack")
+
+    def test_the_guard_waits_on_the_named_worker_of_that_stack(self):
+        # stack2-worker is the one that matters; the production worker is irrelevant.
+        self.ops.names = ["stack2-lightrag", "stack2-gateway", "stack2-worker"]
+        urls = self._run(self._second())
+        self.assertFalse([url for url in urls if url.endswith("/documents/text")],
+                         "stack2's own worker was running")
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("stack2-worker is running", log)
+
+    def test_none_skips_the_guard_for_a_stack_without_a_worker(self):
+        self.ops.worker_running = True
+        urls = self._run(ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                                   worker_container=ol.WORKER_GUARD_NONE))
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents/text", urls)
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("worker guard skipped", log)
+
+    def test_none_is_refused_when_the_target_is_production(self):
+        target = ol.Target(worker_container=ol.WORKER_GUARD_NONE)
+        message = ol.worker_guard_refusal(target)
+        self.assertIsNotNone(message)
+        self.assertIn("--worker-container none", message)
+        self.assertIsNone(ol.worker_guard_refusal(ol.Target(lightrag_url=SECOND_LIGHTRAG,
+                                                            worker_container=ol.WORKER_GUARD_NONE)))
+        self.assertIsNone(ol.worker_guard_refusal(ol.Target()))
+
+    def test_main_refuses_none_against_production_before_any_request(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), patch.object(ol, "Ops", _ExplodingOps), \
+                patch.object(ol, "DryRunOps", _ExplodingOps):
+            code = ol.main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                            "--out", str(self.out), "--worker-container", "none"])
+        self.assertEqual(code, 3)
+        self.assertIn("--worker-container none", buffer.getvalue())
+
+
+class TestComposeFileAndProject(_Case):
+    """--compose-file / --compose-project reach every docker compose call."""
+
+    def test_default_argv_is_unchanged(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": False}]})
+        self.make_loop(config).run()
+        ups = [command for command in self.ops.commands
+               if command[:2] == ["docker", "compose"] and "up" in command]
+        self.assertTrue(ups)
+        for command in ups:
+            self.assertEqual(command[:4], ["docker", "compose", "-f", str(self.root / "compose.yml")])
+            self.assertNotIn("-p", command)
+
+    def test_second_stack_gets_its_own_file_and_project(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "gateway_env": {"BRIDGE_TOP_K": "30"},
+             "reingest": False}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="stack2-lightrag", gateway_container="stack2-gateway",
+                           compose_file=str(self.root / "compose.stack2.yml"),
+                           compose_project="stack2")
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                       handle_signals=False, print_fn=lambda line: None, target=target)
+        loop.run()
+        recreated = [command for command in self.ops.commands
+                     if command[:2] == ["docker", "compose"] and command[-4:] == ["up", "-d", "--no-deps", "gateway-api"]]
+        self.assertTrue(recreated)
+        for command in recreated:
+            self.assertEqual(
+                command,
+                ["docker", "compose", "-f", str(self.root / "compose.stack2.yml"),
+                 "-p", "stack2", "up", "-d", "--no-deps", "gateway-api"])
+
+    def test_service_names_come_from_the_target_not_the_container(self):
+        """A second project may keep compose service names while renaming containers."""
+        self.ops.names = ["stack2-lightrag", "stack2-gateway"]
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "gateway_env": {"BRIDGE_TOP_K": "30"},
+             "reingest": False}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="stack2-lightrag", lightrag_service="lightrag-server",
+                           gateway_container="stack2-gateway", gateway_service="gateway-api")
+        ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                handle_signals=False, print_fn=lambda line: None, target=target).run()
+        recreated = [command[-1] for command in self.ops.commands
+                     if command[:2] == ["docker", "compose"] and command[-4:-1] == ["up", "-d", "--no-deps"]]
+        self.assertIn("lightrag-server", recreated)
+        self.assertIn("gateway-api", recreated)
+        self.assertNotIn("stack2-lightrag", recreated, "the container name is not the service name")
+
+    def test_main_passes_the_flags_through(self):
+        (self.root / "stack2.env").write_text(ENV_TEXT, encoding="utf-8")
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [
+                {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": True}]}), encoding="utf-8")
+        with patch.object(ol, "Ops", lambda: self.ops):
+            code = ol.main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                            "--out", str(self.out), "--lightrag-url", SECOND_LIGHTRAG,
+                            "--worker-container", "none",
+                            "--compose-file", str(self.root / "compose.stack2.yml"),
+                            "--compose-project", "stack2",
+                            "--env-file", str(self.root / "stack2.env")])
+        self.assertEqual(code, 0)
+        joined = [" ".join(command) for command in self.ops.commands
+                  if command[:2] == ["docker", "compose"]]
+        self.assertTrue(joined)
+        self.assertTrue(all("compose.stack2.yml" in line and "-p stack2" in line for line in joined),
+                        joined)
+
+
+class TestNoProductionNamesOnATargetRun(_Case):
+    """A non-default target must never touch a production name, path or URL."""
+
+    def test_no_production_container_path_or_url_is_used(self):
+        stack_env = self.root / "stack2.env"
+        stack_env.write_text(ENV_TEXT, encoding="utf-8")
+        self.ops.env_file = stack_env
+        self.ops.names = ["stack2-lightrag", "stack2-gateway"]
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "gateway_env": {"BRIDGE_TOP_K": "30"},
+             "reingest": True}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="stack2-lightrag", gateway_container="stack2-gateway",
+                           worker_container="none",
+                           compose_file=str(self.root / "compose.stack2.yml"),
+                           compose_project="stack2", env_file=str(self.root / "stack2.env"))
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                       handle_signals=False, print_fn=lambda line: None, target=target)
+        loop.run()
+        commands = [" ".join(command) for command in self.ops.commands]
+        urls = [url for _method, url in self.ops.http_calls]
+        for production in ("lightrag-server", "rag-gateway-api", "rag-ingest-worker",
+                           ol.PRODUCTION_LIGHTRAG_URL, ol.PRODUCTION_GATEWAY_URL):
+            self.assertFalse([c for c in commands if production in c],
+                             f"a docker command mentioned {production}")
+            self.assertFalse([u for u in urls if production in u], f"a request went to {production}")
+        # The .env it rewrote is the one it was given, and production's stayed put.
+        self.assertTrue([snap for snap in self.ops.env_snapshots if "MAX_GLEANING=0" in snap],
+                        "the target .env was never written")
+        self.assertEqual(stack_env.read_text(encoding="utf-8"), ENV_TEXT, "restored to baseline")
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), ENV_TEXT,
+                         "production .env must not be touched by a second-stack run")
 
 
 
