@@ -43,6 +43,27 @@ worker, so without this key an experiment cannot measure what the
 ``TRANSCRIPT_PREP_ENABLED`` worker would send. Default false: file text is posted
 unchanged, exactly as before.
 
+An experiment may also carry ``"chunking": {"strategy": ..., "params": {...}}``, the
+per-request chunker LightRAG 1.5.7 accepts on ``/documents/text``. Strategies and
+param keys are checked structurally at startup (LightRAG itself answers an unknown
+key, a bool-as-int or a numeric string with a synchronous 422), and whatever passes
+is forwarded untouched - this driver never invents a param name. Default absent: the
+request body is byte-identical to what was posted before the key existed. Omitting
+``chunking`` entirely keeps LightRAG's fixed-token default.
+
+Where the run goes is now explicit: ``--lightrag-url``, ``--gateway-url``,
+``--lightrag-container``, ``--gateway-container``, ``--gateway-service`` and
+``--env-file``. Leaving them out points at production exactly as before. Because a
+reingest clears the LightRAG store it points at, a run on the production LightRAG
+with any ``"reingest": true`` experiment now stops before the first request with
+"this would wipe the production store" unless ``--allow-production`` is given. That
+applies to the defaults too, so an existing runbook that reingests production must
+pass ``--allow-production`` explicitly. ``--dry-run`` is exempt (it issues no
+requests) and prints the same text as a warning.
+
+Corpus files are logged by position (``doc 3/6``), never by name: transcript file
+names are themselves sensitive.
+
 An experiment may also carry ``"gateway_env": {...}`` with the gateway knobs
 (BRIDGE_*, GATEWAY_CHUNK_TOP_K, CITATION_TOP_K). They live in the same .env, are
 verified against the rag-gateway-api container, and that service is recreated and
@@ -78,6 +99,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -169,6 +191,179 @@ CONTAINER = "lightrag-server"
 GATEWAY_SERVICE = "gateway-api"
 GATEWAY_CONTAINER = "rag-gateway-api"
 WORKER_CONTAINER = "rag-ingest-worker"
+
+# The constants above ARE the production target. They are kept as defaults so an
+# untouched invocation behaves exactly as it always did; --lightrag-url and
+# friends exist so a run can point at a second stack instead.
+PRODUCTION_LIGHTRAG_URL = LIGHTRAG_URL
+PRODUCTION_GATEWAY_URL = GATEWAY_URL
+
+# LightRAG 1.5.7 accepts a per-request chunker on POST /documents/text. The
+# strategy names and the per-strategy param keys below come from Hermes reading
+# the 1.5.7 image: LightRAG is strict - an unknown key, a bool passed where an int
+# is wanted, or a number passed as a string all give a synchronous HTTP 422.
+# Checking the same shape here turns a typo into a message at startup instead of a
+# lost 3-hour ingest arm.
+CHUNKING_STRATEGIES = frozenset({
+    "fixed_token", "recursive_character", "semantic_vector",
+    "paragraph_semantic", "custom",
+})
+
+# Which param keys each strategy accepts. Keys are optional; a wrong type or an
+# unknown key is refused. "custom" is LightRAG's escape hatch and its param names
+# are not in Hermes' report, so they are not restricted here - a typo in a custom
+# arm still gets LightRAG's 422.
+CHUNKING_PARAM_KEYS: dict[str, frozenset[str]] = {
+    "fixed_token": frozenset({
+        "chunk_token_size", "chunk_overlap_token_size",
+        "split_by_character", "split_by_character_only",
+    }),
+    "recursive_character": frozenset({
+        "chunk_token_size", "chunk_overlap_token_size", "separators",
+    }),
+    "paragraph_semantic": frozenset({
+        "chunk_token_size", "chunk_overlap_token_size", "drop_references",
+    }),
+    "semantic_vector": frozenset({
+        "chunk_token_size", "breakpoint_threshold_type",
+        "breakpoint_threshold_amount", "buffer_size",
+    }),
+    "custom": frozenset(),
+}
+
+# Env-only on 1.5.7: sending it in a request is a 422, so refuse it by name here.
+CHUNKING_ENV_ONLY_KEYS = frozenset({"sentence_split_regex"})
+
+BREAKPOINT_TYPES = frozenset({"percentile", "standard_deviation", "interquartile", "gradient"})
+MAX_SEPARATORS = 64
+MAX_SEPARATOR_CHARS = 256
+
+
+def _is_int(value: Any) -> bool:
+    # bool is a subclass of int in Python, and LightRAG rejects a bool where it
+    # wants an int, so exclude it explicitly.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def chunking_param_problems(strategy: str, params: dict[str, Any]) -> list[str]:
+    """Structural check of a chunking params object. Returns problems; never raises.
+
+    Types are checked the way LightRAG checks them - a numeric string is a
+    problem, not something to coerce - and nothing is rewritten: whatever passes
+    is forwarded to the request untouched. Separator CONTENT (escaped, not a
+    regex) stays LightRAG's check: a legitimate separator may contain brackets, so
+    guessing at it here would refuse valid arms.
+    """
+    problems: list[str] = []
+    allowed = CHUNKING_PARAM_KEYS.get(strategy)
+    for key in params:
+        if str(key) in CHUNKING_ENV_ONLY_KEYS:
+            problems.append(f"{key} is env-only on LightRAG 1.5.7 and is rejected (422) in a request")
+        elif allowed is not None and str(key) not in allowed:
+            listed = ", ".join(sorted(allowed)) if allowed else "none documented for this strategy"
+            problems.append(f"{key} is not a {strategy} param (accepted: {listed})")
+    if "chunk_token_size" in params and not _is_int(params["chunk_token_size"]):
+        problems.append("chunk_token_size must be an integer >= 1")
+    if "chunk_overlap_token_size" in params:
+        overlap = params["chunk_overlap_token_size"]
+        if strategy == "semantic_vector":
+            problems.append("chunk_overlap_token_size is not accepted by semantic_vector (422)")
+        elif not _is_int(overlap) or overlap < 0:
+            problems.append("chunk_overlap_token_size must be an integer >= 0")
+        elif _is_int(params.get("chunk_token_size")) and overlap >= params["chunk_token_size"]:
+            problems.append("chunk_overlap_token_size must be smaller than chunk_token_size")
+    if "split_by_character" in params and not isinstance(params["split_by_character"], str):
+        problems.append("split_by_character must be a string")
+    for key in ("split_by_character_only", "drop_references"):
+        if key in params and not isinstance(params[key], bool):
+            problems.append(f"{key} must be a boolean, not an int or a string")
+    if "separators" in params:
+        separators = params["separators"]
+        if not isinstance(separators, list):
+            problems.append("separators must be a list of strings")
+        else:
+            if len(separators) > MAX_SEPARATORS:
+                problems.append(f"separators accepts at most {MAX_SEPARATORS} entries")
+            if any(not isinstance(item, str) for item in separators):
+                problems.append("every separator must be a string")
+            if any(isinstance(item, str) and len(item) > MAX_SEPARATOR_CHARS for item in separators):
+                problems.append(f"every separator must be at most {MAX_SEPARATOR_CHARS} characters")
+    if strategy == "semantic_vector":
+        kind = params.get("breakpoint_threshold_type")
+        if kind is not None and (not isinstance(kind, str) or kind not in BREAKPOINT_TYPES):
+            problems.append("breakpoint_threshold_type must be one of " + ", ".join(sorted(BREAKPOINT_TYPES)))
+        amount = params.get("breakpoint_threshold_amount")
+        if amount is not None:
+            if not _is_number(amount) or amount <= 0:
+                problems.append("breakpoint_threshold_amount must be a number > 0")
+            elif kind in ("percentile", "gradient") and amount > 100:
+                problems.append(f"breakpoint_threshold_amount must be within (0, 100] when the type is {kind}")
+        if "buffer_size" in params and (not _is_int(params["buffer_size"]) or params["buffer_size"] < 1):
+            problems.append("buffer_size must be an integer >= 1")
+    return problems
+
+
+def _normalise_url(raw: str) -> str:
+    return str(raw).strip().rstrip("/").lower()
+
+
+@dataclass(frozen=True)
+class Target:
+    """What a run points at: two URLs, two containers, one .env.
+
+    Unset fields resolve to the module constants (LIGHTRAG_URL, GATEWAY_URL,
+    CONTAINER, ...), the values this driver hardcoded before the flags existed, so
+    an untouched invocation goes to exactly the same stack it always did. They
+    resolve at construction rather than at class-definition time, because those
+    globals are the seam tests use to point the driver at a local stub: a default
+    frozen at import would silently keep the production URL and a test would then
+    talk to a real stack.
+    """
+
+    lightrag_url: str | None = None
+    gateway_url: str | None = None
+    lightrag_container: str | None = None
+    gateway_container: str | None = None
+    gateway_service: str | None = None
+    env_file: str | None = None  # None -> <root>/.env, as always
+
+    def __post_init__(self) -> None:
+        for name, constant in (
+            ("lightrag_url", LIGHTRAG_URL),
+            ("gateway_url", GATEWAY_URL),
+            ("lightrag_container", CONTAINER),
+            ("gateway_container", GATEWAY_CONTAINER),
+            ("gateway_service", GATEWAY_SERVICE),
+        ):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, constant)
+
+    def is_production_lightrag(self) -> bool:
+        return _normalise_url(self.lightrag_url) == _normalise_url(PRODUCTION_LIGHTRAG_URL)
+
+
+def production_wipe_refusal(target: Target, config: dict[str, Any]) -> str | None:
+    """Return a refusal message when this run would wipe the production store.
+
+    The driver clears the LightRAG store it points at before re-ingesting, so a
+    run that defaults to the production URL and contains any ``"reingest":
+    true"` experiment is a wipe of production. It now needs --allow-production
+    explicitly. --dry-run is checked by the caller: it issues no requests.
+    """
+    if not target.is_production_lightrag():
+        return None
+    if not any(bool(exp.get("reingest")) for exp in config.get("experiments", [])):
+        return None
+    return (
+        f"this would wipe the production store: --lightrag-url is the production "
+        f"LightRAG ({PRODUCTION_LIGHTRAG_URL}) and the experiments file requests "
+        "reingest: true, which deletes every document before re-inserting. Point "
+        "--lightrag-url at a second stack, or pass --allow-production if you mean it."
+    )
 
 DEV_PROBE_FILE = "probe/solvay-dev-v1.jsonl"
 HELDOUT_PROBE_FILE = "probe/solvay-heldout-v1.jsonl"
@@ -347,6 +542,29 @@ def load_experiments(path: Path) -> dict[str, Any]:
         concurrency = int(entry.get("probe_concurrency", 1) or 1)
         if concurrency < 1:
             raise LoopConfigError(f"experiment {name}: probe_concurrency must be >= 1")
+        # Experiment-level per-request chunker (LightRAG 1.5.7). Validated only
+        # structurally: strategy must be a known name, params must be an object.
+        # Key names inside params belong to LightRAG and are never touched here.
+        chunking: dict[str, Any] | None = None
+        if entry.get("chunking") is not None:
+            raw_chunking = entry["chunking"]
+            if not isinstance(raw_chunking, dict):
+                raise LoopConfigError(f"experiment {name}: chunking must be an object")
+            strategy = raw_chunking.get("strategy")
+            if not isinstance(strategy, str) or strategy not in CHUNKING_STRATEGIES:
+                raise LoopConfigError(
+                    f"experiment {name}: chunking.strategy must be one of "
+                    + ", ".join(sorted(CHUNKING_STRATEGIES))
+                )
+            params = raw_chunking.get("params", {})
+            if not isinstance(params, dict):
+                raise LoopConfigError(f"experiment {name}: chunking.params must be an object")
+            problems = chunking_param_problems(strategy, params)
+            if problems:
+                raise LoopConfigError(
+                    f"experiment {name}: chunking.params for {strategy}: " + "; ".join(problems)
+                )
+            chunking = {"strategy": strategy, "params": params}
         experiments.append({
             "name": name,
             "env": {str(k): str(v) for k, v in env.items()},
@@ -356,6 +574,9 @@ def load_experiments(path: Path) -> dict[str, Any]:
             # Default false, so an experiments.json written before this key exists
             # behaves exactly as before.
             "transcript_prep": bool(entry.get("transcript_prep", False)),
+            # Experiment-level chunker override; None means the request body is
+            # byte-identical to what this driver posted before the key existed.
+            "chunking": chunking,
             "probe_concurrency": concurrency,
         })
     return {
@@ -949,6 +1170,7 @@ class Loop:
         retry_errors: bool = False,
         dev_probe_file: str = DEV_PROBE_FILE,
         heldout_probe_file: str = HELDOUT_PROBE_FILE,
+        target: Target | None = None,
         handle_signals: bool = True,
         print_fn: Callable[[str], None] | None = None,
     ) -> None:
@@ -962,10 +1184,13 @@ class Loop:
         self.retry_errors = retry_errors
         self.dev_probe_file = dev_probe_file
         self.heldout_probe_file = heldout_probe_file
+        # Every URL and container name used below comes from this object; the
+        # defaults are the constants this driver hardcoded before the flags.
+        self.t = target or Target()
         self.handle_signals = handle_signals
         self.print_fn = print_fn or (lambda line: print(line, flush=True))
 
-        self.real_env_path = self.root / ".env"
+        self.real_env_path = Path(self.t.env_file).expanduser() if self.t.env_file else self.root / ".env"
         # --dry-run never rewrites the production .env: it writes a shadow copy.
         self.env_path = (self.out / "dryrun.env") if dry_run else self.real_env_path
         self.env_original_path = self.out / "env.original"
@@ -1137,10 +1362,10 @@ class Loop:
         self.log(f"{container}: recreated")
 
     def _restart_server(self) -> None:
-        self._restart_service(CONTAINER, CONTAINER)
+        self._restart_service(self.t.lightrag_container, self.t.lightrag_container)
 
     def _restart_gateway(self) -> None:
-        self._restart_service(GATEWAY_SERVICE, GATEWAY_CONTAINER)
+        self._restart_service(self.t.gateway_service, self.t.gateway_container)
 
     def _container_state(self, container: str) -> str:
         """docker ps -a state for one container: running, exited, restarting, ..."""
@@ -1194,44 +1419,44 @@ class Loop:
 
     def _health(self) -> tuple[bool, Any]:
         try:
-            status, body = self.ops.http_json("GET", f"{LIGHTRAG_URL}/health", timeout=15)
+            status, body = self.ops.http_json("GET", f"{self.t.lightrag_url}/health", timeout=15)
         except Exception as exc:
             return False, str(exc)
         return status == 200 and str(body.get("status", "")).lower() == "healthy", body
 
     def _wait_healthy(self) -> None:
         self._wait_until(
-            self._liveness_guard(CONTAINER, self._health),
+            self._liveness_guard(self.t.lightrag_container, self._health),
             timeout=HEALTH_TIMEOUT,
             interval=10,
-            what=f"{CONTAINER} health",
+            what=f"{self.t.lightrag_container} health",
         )
-        self.log(f"{CONTAINER}: healthy")
+        self.log(f"{self.t.lightrag_container}: healthy")
 
     def _gateway_running(self) -> bool:
         code, out, _err = self.ops.run(["docker", "ps", "--format", "{{.Names}}"], cwd=self.root, timeout=60)
         if code != 0:
             return False
-        return any(GATEWAY_CONTAINER in line for line in out.splitlines())
+        return any(self.t.gateway_container in line for line in out.splitlines())
 
     def _gateway_up(self) -> tuple[bool, Any]:
         """The gateway is up once it answers on any path, even a 404."""
         if not self._gateway_running():
-            return False, f"{GATEWAY_CONTAINER} is not in docker ps"
+            return False, f"{self.t.gateway_container} is not in docker ps"
         try:
-            status, body = self.ops.http_json("GET", f"{GATEWAY_URL}/", timeout=15)
+            status, body = self.ops.http_json("GET", f"{self.t.gateway_url}/", timeout=15)
         except Exception as exc:
             return False, str(exc)
         return True, {"status": status}
 
     def _wait_gateway_up(self) -> None:
         self._wait_until(
-            self._liveness_guard(GATEWAY_CONTAINER, self._gateway_up),
+            self._liveness_guard(self.t.gateway_container, self._gateway_up),
             timeout=HEALTH_TIMEOUT,
             interval=5,
-            what=f"{GATEWAY_CONTAINER} readiness",
+            what=f"{self.t.gateway_container} readiness",
         )
-        self.log(f"{GATEWAY_CONTAINER}: up")
+        self.log(f"{self.t.gateway_container}: up")
 
     def _sigma_up(self) -> tuple[bool, Any]:
         try:
@@ -1246,7 +1471,7 @@ class Loop:
         """Wait out a down LightRAG, gateway or sigma judge for up to 10 minutes."""
         self._wait_until(self._health, timeout=SERVICE_DOWN_WAIT, interval=15, what="LightRAG /health")
         if self.gateway_touched:
-            self._wait_until(self._gateway_up, timeout=SERVICE_DOWN_WAIT, interval=15, what=f"{GATEWAY_CONTAINER}")
+            self._wait_until(self._gateway_up, timeout=SERVICE_DOWN_WAIT, interval=15, what=f"{self.t.gateway_container}")
         self._wait_until(self._sigma_up, timeout=SERVICE_DOWN_WAIT, interval=15, what="judge service (sigma)")
 
     def _container_env(self, container: str) -> dict[str, str]:
@@ -1266,9 +1491,9 @@ class Loop:
             return
         # Which service reads a key decides which container proves it: the gateway
         # allow-list is disjoint from LightRAG's, and both read the same .env.
-        groups = {CONTAINER: {}, GATEWAY_CONTAINER: {}}
+        groups = {self.t.lightrag_container: {}, self.t.gateway_container: {}}
         for key, value in set_values.items():
-            container = GATEWAY_CONTAINER if key in GATEWAY_ENV_WHITELIST else CONTAINER
+            container = self.t.gateway_container if key in GATEWAY_ENV_WHITELIST else self.t.lightrag_container
             groups[container][key] = value
         checked = 0
         for container, values in groups.items():
@@ -1320,13 +1545,13 @@ class Loop:
 
     def _clear_lightrag(self) -> None:
         headers = self._lightrag_headers()
-        status, body = self.ops.http_json("DELETE", f"{LIGHTRAG_URL}/documents", headers=headers, timeout=120)
+        status, body = self.ops.http_json("DELETE", f"{self.t.lightrag_url}/documents", headers=headers, timeout=120)
         if status >= 400:
             raise StepError(f"DELETE /documents returned {status}")
         self.log("LightRAG clear requested")
 
         def counts_zero() -> tuple[bool, Any]:
-            code, payload = self.ops.http_json("GET", f"{LIGHTRAG_URL}/documents/status_counts", headers=headers, timeout=30)
+            code, payload = self.ops.http_json("GET", f"{self.t.lightrag_url}/documents/status_counts", headers=headers, timeout=30)
             if code != 200:
                 return False, payload
             return status_counts_are_zero(payload), payload
@@ -1345,7 +1570,14 @@ class Loop:
             raise StepError(f"{CORPUS_FILE} must be a non-empty JSON list of file paths")
         return [Path(str(entry)) for entry in raw]
 
-    def _insert_one(self, path: Path, *, transcript_prep: bool = False) -> float:
+    def _insert_one(
+        self,
+        path: Path,
+        *,
+        transcript_prep: bool = False,
+        chunking: dict[str, Any] | None = None,
+        doc_label: str = "doc",
+    ) -> float:
         started = self.ops.now()
         text = self.ops.read_text(path)
         if transcript_prep:
@@ -1357,17 +1589,24 @@ class Loop:
             )
             if prepared.applied:
                 self.log(
-                    f"transcript_prep {path.name}: {prepared.headers_inserted} headers, "
+                    f"transcript_prep {doc_label}: {prepared.headers_inserted} headers, "
                     f"{prepared.turns} turns, {len(prepared.speakers)} speakers"
                 )
                 text = prepared.text
             else:
-                self.log(f"transcript_prep {path.name}: skipped ({prepared.reason})")
+                self.log(f"transcript_prep {doc_label}: skipped ({prepared.reason})")
+        payload: dict[str, Any] = {"text": text, "file_source": str(path)}
+        if chunking:
+            # Experiment-level key "chunking": a per-request chunker for LightRAG
+            # 1.5.7. params is forwarded exactly as the experiments file wrote it;
+            # its key names belong to LightRAG and are never invented here. With
+            # no key, this body is byte-identical to what was posted before.
+            payload["chunking"] = chunking
         status, body = self.ops.http_json(
             "POST",
-            f"{LIGHTRAG_URL}/documents/text",
+            f"{self.t.lightrag_url}/documents/text",
             headers=self._lightrag_headers(),
-            payload={"text": text, "file_source": str(path)},
+            payload=payload,
             timeout=120,
         )
         if status >= 400:
@@ -1377,34 +1616,41 @@ class Loop:
             raise RuntimeError("POST /documents/text returned no track_id")
 
         def processed() -> tuple[bool, Any]:
-            code, payload = self.ops.http_json(
-                "GET", f"{LIGHTRAG_URL}/documents/track_status/{track_id}",
+            code, payload_status = self.ops.http_json(
+                "GET", f"{self.t.lightrag_url}/documents/track_status/{track_id}",
                 headers=self._lightrag_headers(), timeout=30,
             )
             if code != 200:
-                return False, payload
-            documents = payload.get("documents") or []
+                return False, payload_status
+            documents = payload_status.get("documents") or []
             statuses = [str(doc.get("status", "")).lower() for doc in documents]
             if any(state == "failed" for state in statuses):
                 raise RuntimeError(f"track {track_id} reported failed")
-            return bool(statuses) and all(state == "processed" for state in statuses), payload
+            return bool(statuses) and all(state == "processed" for state in statuses), payload_status
 
-        self._wait_until(processed, timeout=DOC_TIMEOUT, interval=30, what=f"{path.name} to process")
+        self._wait_until(processed, timeout=DOC_TIMEOUT, interval=30, what=f"{doc_label} to process")
         return round(self.ops.now() - started, 1)
 
     def _reingest(self, experiment: dict[str, Any]) -> None:
         self._guard_worker()
         self._clear_lightrag()
         seconds_per_doc: list[float] = []
-        for path in self._corpus_paths():
-            prep = bool(experiment.get("transcript_prep"))
+        prep = bool(experiment.get("transcript_prep"))
+        chunking = experiment.get("chunking")
+        paths = self._corpus_paths()
+        total = len(paths)
+        for index, path in enumerate(paths, 1):
+            # Positions, never file names: the loop log must not carry corpus
+            # paths (the operator's transcript names are themselves sensitive).
+            doc_label = f"doc {index}/{total}"
             seconds = self._attempt(
-                lambda p=path, q=prep: self._insert_one(p, transcript_prep=q),
-                what=f"insert {path.name}",
+                lambda p=path, q=prep, c=chunking, d=doc_label:
+                self._insert_one(p, transcript_prep=q, chunking=c, doc_label=d),
+                what=f"insert {doc_label}",
                 attempts=2,
             )
             seconds_per_doc.append(seconds)
-            self.log(f"{experiment['name']}: inserted {path.name} in {seconds}s")
+            self.log(f"{experiment['name']}: inserted {doc_label} in {seconds}s")
         self.state["corpus_built_by"] = experiment["name"]
         self.state.setdefault("results", {}).setdefault(experiment["name"], {})["seconds_per_doc"] = seconds_per_doc
         self.save_state()
@@ -1438,7 +1684,7 @@ class Loop:
         messages.append({"role": "user", "content": str(item.get("question") or "")})
         payload = {"model": "lightrag:latest", "stream": False, "messages": messages}
         started = self.ops.now()
-        status, body = self.ops.http_json("POST", f"{GATEWAY_URL}/api/chat", payload=payload, timeout=PROBE_TIMEOUT)
+        status, body = self.ops.http_json("POST", f"{self.t.gateway_url}/api/chat", payload=payload, timeout=PROBE_TIMEOUT)
         latency = round(self.ops.now() - started, 2)
         if status >= 400:
             raise RuntimeError(f"/api/chat returned HTTP {status}")
@@ -1651,8 +1897,8 @@ class Loop:
             self._wait_healthy()
         except StepError as exc:
             raise UnrecoverableRun(
-                f"cannot restore the baseline {CONTAINER}: {exc}; "
-                f"{self._container_error_lines(CONTAINER)}"
+                f"cannot restore the baseline {self.t.lightrag_container}: {exc}; "
+                f"{self._container_error_lines(self.t.lightrag_container)}"
             ) from exc
         if self.gateway_touched:
             try:
@@ -1660,8 +1906,8 @@ class Loop:
                 self._wait_gateway_up()
             except StepError as exc:
                 raise UnrecoverableRun(
-                    f"cannot restore the baseline {GATEWAY_CONTAINER}: {exc}; "
-                    f"{self._container_error_lines(GATEWAY_CONTAINER)}"
+                    f"cannot restore the baseline {self.t.gateway_container}: {exc}; "
+                    f"{self._container_error_lines(self.t.gateway_container)}"
                 ) from exc
         self.log("baseline recovery done; the next experiment starts from the baseline config")
 
@@ -2067,6 +2313,8 @@ def build_plan_lines(config: dict[str, Any]) -> list[str]:
         lines.append(
             f"  {index}. {experiment['name']}: env[{env}]{gateway_part} "
             f"reingest={experiment['reingest']} probe_concurrency={experiment['probe_concurrency']}"
+            + (f" chunking={experiment['chunking']['strategy']}" if experiment.get("chunking") else "")
+            + (" transcript_prep" if experiment.get("transcript_prep") else "")
         )
     return lines
 
@@ -2103,11 +2351,40 @@ def main(argv: list[str] | None = None) -> int:
         default=HELDOUT_PROBE_FILE,
         help=f"held-out probe JSONL, resolved the same way (default: {HELDOUT_PROBE_FILE})",
     )
+    # Target selection. Unset means the module constant, i.e. the same stack this
+    # driver pointed at before these flags existed.
+    parser.add_argument("--lightrag-url", default=None,
+                       help=f"LightRAG base URL (default: the production {LIGHTRAG_URL})")
+    parser.add_argument("--gateway-url", default=None,
+                       help=f"gateway base URL (default: the production {GATEWAY_URL})")
+    parser.add_argument("--lightrag-container", default=None,
+                       help=f"LightRAG container name for docker ps/logs/exec (default: {CONTAINER})")
+    parser.add_argument("--gateway-container", default=None,
+                       help=f"gateway container name (default: {GATEWAY_CONTAINER})")
+    parser.add_argument("--gateway-service", default=None,
+                       help=f"compose service name used to recreate the gateway (default: {GATEWAY_SERVICE})")
+    parser.add_argument("--env-file", default=None,
+                       help=".env file to rewrite (default: <root>/.env, as always)")
+    parser.add_argument(
+        "--allow-production",
+        action="store_true",
+        help="required when the run points at the production LightRAG AND the experiments file "
+             "requests reingest: true, because that deletes every document in that store before "
+             "re-inserting it",
+    )
     arguments = parser.parse_args(argv)
 
     root_path = Path(arguments.root).expanduser()
     dev_probe = resolve_probe_path(arguments.dev_probes)
     heldout_probe = resolve_probe_path(arguments.heldout_probes)
+    target = Target(
+        lightrag_url=arguments.lightrag_url,
+        gateway_url=arguments.gateway_url,
+        lightrag_container=arguments.lightrag_container,
+        gateway_container=arguments.gateway_container,
+        gateway_service=arguments.gateway_service,
+        env_file=arguments.env_file,
+    )
 
     if arguments.rejudge:
         return rejudge(
@@ -2130,6 +2407,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"refusing to run: {label} file not found: {root_path / spec}", file=sys.stderr)
             return 3
 
+    # The store this run clears is the store it points at. A run that lands on the
+    # production LightRAG and requests reingest wipes production, so it now needs
+    # an explicit --allow-production. Checked before any request or docker call.
+    refusal = production_wipe_refusal(target, config)
+    if refusal:
+        if arguments.allow_production:
+            print(f"WARNING: production reingest approved by --allow-production ({refusal})", file=sys.stderr)
+        elif arguments.dry_run:
+            print(f"WARNING (dry run only, no request is made): {refusal}", file=sys.stderr)
+        else:
+            print(f"refusing to run: {refusal}", file=sys.stderr)
+            return 3
+
     ops: Ops = DryRunOps() if arguments.dry_run else Ops()
     loop = Loop(
         root=Path(arguments.root).expanduser(),
@@ -2142,9 +2432,13 @@ def main(argv: list[str] | None = None) -> int:
         retry_errors=arguments.retry_errors,
         dev_probe_file=dev_probe,
         heldout_probe_file=heldout_probe,
+        target=target,
     )
     # file names only, never their contents
     loop.log(f"probe files: dev={dev_probe} heldout={heldout_probe}")
+    loop.log(f"target: lightrag={target.lightrag_url} gateway={target.gateway_url} "
+             f"containers={target.lightrag_container},{target.gateway_container} "
+             f"env={target.env_file or (root_path / '.env')}")
     for line in build_plan_lines(config):
         loop.log(line)
     if arguments.dry_run:

@@ -12,14 +12,19 @@ self-describing and aligned to speaker turns, without touching LightRAG.
 Contract
 --------
 1. Conservative detection. A document is only touched when it really looks like
-   a transcript (speaker-label lines or subtitle cues). When unsure, the input is
-   returned unchanged with ``detected=False``. Specs, policies and notes are
-   never altered.
-2. Words are never changed, only placed. Turns become ``Speaker: text`` blocks,
-   consecutive lines of one speaker are merged, and lines that carry no words at
-   all (timestamps, subtitle cues, separators) are dropped. Original word order
-   and wording are preserved exactly - no summarising, no spelling fixes, no
-   normalising of garbled speech-to-text.
+   a transcript (speaker-label lines or subtitle cues). Three label shapes are
+   recognised: ``Name: text`` / ``Name 0:12`` / ``[00:01:02] Name:`` (colon
+   family) and ``(Label) text`` (the parenthesised family). When unsure, the
+   input is returned unchanged with ``detected=False``. Specs, policies and notes
+   are never altered, and prose parentheses (``(see above)``, ``(1)``,
+   ``(laughter)``) are not mistaken for speakers.
+2. Words are never changed, only placed. A turn keeps the label style the
+   document already uses - ``(Ana) text`` stays ``(Ana) text``, ``Alice: text``
+   stays ``Alice: text`` - consecutive lines of one speaker are merged (a
+   label-less continuation line belongs to the previous turn), and lines that
+   carry no words at all (timestamps, subtitle cues, separators) are dropped.
+   Original word order and wording are preserved exactly - no summarising, no
+   spelling fixes, no normalising of garbled speech-to-text.
 3. A one-line context header is re-inserted before every block of roughly
    ``header_every_tokens`` tokens, e.g.
    ``[Meeting: design review | Date: 2026-10-09 | Speakers: Alice Chen, Bob | Part 2/5]``.
@@ -65,6 +70,13 @@ _NAME = r"[^\W\d_][\w'’.\-]*(?:[ \t]+[^\W\d_][\w'’.\-]*){0,2}"
 _TS = r"\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?"
 _OPT_TS = rf"(?:\(?{_TS}\)?)?"
 
+# "(Ana) text" / "(Speaker 1) text" / "(Dr Smith) text" - the shape every real
+# transcript in this corpus uses. The label may carry a trailing number.
+_PAREN_TURN = re.compile(r"^\((?P<name>[^()\n]{1,40})\)[ \t]*(?P<body>.*)$")
+_PAREN_LABEL = re.compile(
+    r"[^\W\d_][\w'’.\-]*(?:[ \t]+(?:[0-9]{1,3}|[^\W\d_][\w'’.\-]*)){0,3}"
+)
+
 # Speaker label shapes, tried in order.
 _TURN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # "[00:01:02] Alice: text" / "[00:01:02] - Alice: text"
@@ -105,6 +117,30 @@ _NON_SPEAKER_LABELS = frozenset({
     " ingredients", "ingredients", "directions", "instructions", "materials",
 })
 
+# A turn label in parentheses that is a stage direction or a prose
+# parenthetical, not a speaker. Counted as content, never as a speaker label.
+_NON_SPEAKER_PARENS = frozenset({
+    "inaudible", "unintelligible", "unclear", "silence", "pause", "laughter",
+    "applause", "crosstalk", "overlap", "background noise", "noise", "music",
+    "off mic", "on mic", "unknown", "unknown speaker", "speaker unknown",
+    "see above", "see below", "above", "below", "optional", "continued",
+    "continues", "cont", "footnote", "ibid", "sic", "emphasis", "original",
+    "translation", "trans", "approx", "circa", "n a", "na", "example",
+    "quote", "quotation", "excerpt", "end", "to be continued", "note",
+    "notes", "warning", "figure", "table", "chapter", "section", "version",
+    "date", "time", "source", "reference", "references",
+})
+
+# Nouns that, followed by a number, are a cross-reference rather than a speaker.
+_CROSSREF_NOUNS = frozenset({
+    "fig", "figure", "figs", "figures", "table", "tables", "tab", "chart",
+    "image", "images", "photo", "chapter", "chapters", "section", "sections",
+    "sec", "appendix", "page", "pages", "line", "lines", "verse", "verses",
+    "note", "notes", "footnote", "footnotes", "example", "examples", "ex",
+    "equation", "equations", "eq", "step", "steps", "rule", "rules", "item",
+    "items", "point", "points", "part", "parts", "paragraph", "paragraphs",
+})
+
 # A date in the file name, ISO-ish. Only the name is read - never the content.
 _DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})"),
@@ -112,8 +148,11 @@ _DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?P<date>\d{8})(?=[ _.\-]|$)"),
 )
 
+# Matches a header this module inserted. "Meeting:" is optional: a file named
+# "transcript.txt" yields no title, and every field can be absent, so the one
+# field that is always there is the part counter.
 _HEADER_RE = re.compile(
-    r"^\[Meeting:[^\n]*?\| Part \d+/\d+\]\s*$"
+    r"^\[(?:[^\]\[]*\| )*Part \d+/\d+\]\s*$"
 )
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -149,7 +188,7 @@ class _Turn:
 
 
 def estimate_tokens(text: str) -> int:
-    """Over-count of LightRAG's cl100k tokens (see module docstring)."""
+    """Approximation of LightRAG's cl100k token count (see module docstring)."""
     if not text:
         return 0
     by_chars = int(len(text) / CHARS_PER_TOKEN) + 1
@@ -175,8 +214,46 @@ def _clean_name(raw: str) -> str | None:
     return name
 
 
-def _parse_turn(line: str) -> tuple[str | None, str] | None:
-    """Return ``(speaker, body)`` when the line starts a speaker turn."""
+def _clean_paren_label(raw: str) -> str | None:
+    """Validate a ``(Label)`` prefix. Prose parentheses must not become speakers."""
+    label = " ".join(raw.strip().split())
+    if not label or len(label) > 40:
+        return None
+    lowered = label.lower()
+    if lowered in _NON_SPEAKER_LABELS or lowered in _NON_SPEAKER_PARENS:
+        return None
+    # "(a) item one", "(1) first", "(i) ": an enumeration, not a name.
+    if len(label) < 2:
+        return None
+    if not re.match(r"[^\W\d_]", label):
+        return None
+    # A sentence, a path, a question or a cross-reference is not a speaker.
+    if any(char in label for char in ("?", ":", ";", ",", "/", "//", "!", "…")):
+        return None
+    if "." in label and not re.fullmatch(r"[^\W\d_][\w'’]?\.", label):
+        return None  # "(e.g. …)" or "(fig. 3)"; allow only an initial like "(J.)"
+    if not _PAREN_LABEL.fullmatch(label):
+        return None
+    # "(Fig 3)", "(Table 2)", "(Note 1)": a numbered cross-reference, which prose
+    # repeats often enough to look like a recurring speaker.
+    crossref = re.fullmatch(r"([^()\s]+)(?:[ \t]+([0-9]{1,3}))?", label)
+    if crossref and crossref.group(2) and crossref.group(1).lower() in _CROSSREF_NOUNS:
+        return None
+    return label
+
+
+def _parse_turn(line: str) -> tuple[str, str, str] | None:
+    """Return ``(speaker, body, style)`` when the line starts a speaker turn.
+
+    ``style`` is ``"paren"`` for ``(Ana) text`` and ``"colon"`` for the
+    ``Ana: text`` family. The style is remembered so a document is written back
+    in the shape it arrived in.
+    """
+    match = _PAREN_TURN.match(line.rstrip())
+    if match:
+        name = _clean_paren_label(match.group("name"))
+        if name is not None:
+            return name, (match.group("body") or "").strip(), "paren"
     for pattern in _TURN_PATTERNS:
         match = pattern.match(line.rstrip())
         if not match:
@@ -185,7 +262,7 @@ def _parse_turn(line: str) -> tuple[str | None, str] | None:
         if name is None:
             continue
         body = (match.group("body") or "").strip()
-        return name, body
+        return name, body, "colon"
     return None
 
 
@@ -210,7 +287,9 @@ def _metadata_from_name(filename: str | None) -> tuple[str | None, str | None]:
             break
     words = [word for word in re.split(r"[ _.\-]+", stem) if word]
     drop = {"transcript", "transcripto", "recording", "meeting", "call", "minutes"}
-    title_words = [word for word in words if word.lower() not in drop] or words
+    # A name that is only generic words ("transcript", "meeting-2026-10-09") gives
+    # no title: there is nothing to say, and inventing one would be a lie.
+    title_words = [word for word in words if word.lower() not in drop]
     title = " ".join(title_words).strip() or None
     return title, date
 
@@ -241,30 +320,59 @@ def _split_long_turn(turn: _Turn, budget_tokens: int) -> list[_Turn]:
 
     A turn that long is going to be cut mid-sentence by LightRAG anyway, so
     letting it stand unsplit means the chunks inside it carry no context at all.
-    Splitting happens at sentence terminators only, and only when the turn alone
-    already blows the budget twice over - short turns are never broken. Every
-    piece keeps the real speaker's label, so a chunk cut inside a monologue still
-    says who is talking. Word order is preserved exactly; a turn with no sentence
-    terminators cannot be split and is left whole (a coverage gap, not a break).
+    Splitting prefers sentence terminators, and only when the turn alone already
+    blows the budget twice over - short turns are never broken. When there is no
+    terminator to use - the degenerate speech-to-text shape: one 7,000-token run
+    with no punctuation - it falls back to packing whole words up to the budget,
+    which breaks at whitespace and never inside a word, because words come from a
+    whitespace split. A terminator-bounded piece that is itself oversized is packed
+    the same way, so a header-free stretch cannot survive either path. Every piece
+    keeps the real speaker's label, so a chunk cut inside a monologue still says
+    who is talking. Word order is preserved exactly in both paths.
     """
     if not turn.words:
         return [turn]
     total = estimate_tokens(" ".join(turn.words))
     if total <= 2 * max(32, budget_tokens):
         return [turn]
+    budget = max(32, int(budget_tokens))
     pieces: list[list[str]] = []
     current: list[str] = []
     for word in turn.words:
         current.append(word)
-        if word.endswith((".", "!", "?", "\u2026")) and estimate_tokens(" ".join(current)) >= budget_tokens:
+        if word.endswith((".", "!", "?", "\u2026")) and estimate_tokens(" ".join(current)) >= budget:
             pieces.append(current)
             current = []
     if current:
         pieces.append(current)
     if len(pieces) <= 1:
+        pieces = _pack_words(turn.words, budget)
+    else:
+        pieces = [piece if estimate_tokens(" ".join(piece)) <= 2 * budget
+                  else _pack_words(piece, budget) for piece in pieces]
+    pieces = [piece for piece in pieces if piece]
+    if len(pieces) <= 1:
         return [turn]
-    return [(_Turn(speaker=turn.speaker, words=piece))
-            for index, piece in enumerate(pieces)]
+    return [_Turn(speaker=turn.speaker, words=piece) for piece in pieces]
+
+
+def _pack_words(words: Sequence[str], budget_tokens: int) -> list[list[str]]:
+    """Chunk a word list into runs of at most ``budget_tokens`` estimated tokens.
+
+    Used when a turn has no usable sentence boundary. The break always falls
+    between words - never inside one - so the words survive intact and in order.
+    A single word longer than the budget cannot be broken and stands alone.
+    """
+    packed: list[list[str]] = []
+    current: list[str] = []
+    for word in words:
+        if current and estimate_tokens(" ".join(current + [word])) > budget_tokens:
+            packed.append(current)
+            current = []
+        current.append(word)
+    if current:
+        packed.append(current)
+    return packed
 
 
 def _segment_turns(turns: Sequence[_Turn], header_every_tokens: int, header_tokens: int) -> list[list[_Turn]]:
@@ -313,7 +421,9 @@ def prepare_transcript(
 
     turns: list[_Turn] = []
     label_lines = 0
+    paren_label_lines = 0
     label_counts: dict[str, int] = {}
+    paren_counts: dict[str, int] = {}
     cue_lines = 0
     nonempty = 0
     for raw in lines:
@@ -325,9 +435,12 @@ def prepare_transcript(
             cue_lines += 1
         parsed = _parse_turn(line)
         if parsed is not None:
-            speaker, body = parsed
+            speaker, body, style = parsed
             label_lines += 1
             label_counts[speaker.lower()] = label_counts.get(speaker.lower(), 0) + 1
+            if style == "paren":
+                paren_label_lines += 1
+                paren_counts[speaker.lower()] = paren_counts.get(speaker.lower(), 0) + 1
             if body:
                 turns.append(_Turn(speaker=speaker, words=body.split()))
             else:
@@ -342,7 +455,13 @@ def prepare_transcript(
 
     subtitle_cues = cue_lines >= 3
     distinct = len(label_counts)
-    repeated = any(count >= 2 for count in label_counts.values())
+    # The parenthesised family is the one prose can imitate ("(see above)",
+    # "(1) first"), so it has to clear a higher bar: the SAME label must head at
+    # least three lines before the document counts as a transcript. A stray
+    # parenthetical repeated twice is a writing habit, not a speaker.
+    render_style = "paren" if paren_label_lines >= max(3, label_lines - paren_label_lines) else "colon"
+    repeat_required = 3 if render_style == "paren" else 2
+    repeated = any(count >= repeat_required for count in label_counts.values())
     # Detection is deliberately conservative; a document that fails any of these
     # is handed to LightRAG untouched.
     labelled_transcript = (
@@ -354,7 +473,7 @@ def prepare_transcript(
     # One voice, repeated enough to be a recording rather than a labelled list.
     single_voice = (
         distinct == 1
-        and max(label_counts.values(), default=0) >= 4
+        and max(label_counts.values(), default=0) >= (4 if render_style == "paren" else 4)
         and label_lines >= 0.5 * nonempty
     )
     captioned = (
@@ -401,15 +520,19 @@ def prepare_transcript(
     header_tokens = estimate_tokens(probe)
     segments = _segment_turns(merged, header_every_tokens, header_tokens)
 
+    def render(turn: _Turn) -> str:
+        body = " ".join(turn.words)
+        if not turn.speaker:
+            return body
+        if render_style == "paren":
+            return f"({turn.speaker}) {body}"
+        return f"{turn.speaker}: {body}"
+
     blocks: list[str] = []
     total = len(segments)
     for index, segment in enumerate(segments, start=1):
         header = _header_line(title, date, speakers, index, total)
-        rendered = [
-            (f"{turn.speaker}: " if turn.speaker else "") + " ".join(turn.words)
-            for turn in segment
-        ]
-        blocks.append(header + "\n" + "\n\n".join(rendered))
+        blocks.append(header + "\n" + "\n\n".join(render(turn) for turn in segment))
     prepared = "\n\n".join(blocks)
 
     return PrepResult(
@@ -420,6 +543,7 @@ def prepare_transcript(
         title=title,
         date=date,
         reason="detected"
+        + ("-paren-labels" if render_style == "paren" else "")
         + ("-subtitle-cues" if subtitle_cues and not any(t.speaker for t in merged) else ""),
         turns=len(merged),
         header_tokens_estimate=header_tokens,

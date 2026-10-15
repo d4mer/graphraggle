@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -162,6 +163,24 @@ Action items are tracked in the board, not here.
 """
 
 
+def _content_tokens(text: str) -> list[str]:
+    """Words of the content lines, with each line's own speaker label removed.
+
+    Used to prove nothing is split, lost, reordered or truncated: a split turn
+    repeats its label on every piece, so dropping the label keeps the comparison
+    honest (extra labels cannot mask a missing word).
+    """
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or prep._HEADER_RE.match(line):
+            continue
+        match = (re.match(r"^\(([^()]+)\)[ \t]+(.*)$", line)
+                 or re.match(r"^([^\W\d_][\w\u2019.\-]*(?:[ \t]+[^\W\d_][\w\u2019.\-]*){0,2})[ \t]*:[ \t](.*)$", line))
+        out.extend(prep.word_tokens(match.group(2) if match else line))
+    return out
+
+
 def _subsequence(needles, haystack) -> bool:
     it = iter(haystack)
     return all(any(needle == item for item in it) for needle in needles)
@@ -290,13 +309,33 @@ class TestNormalisation(unittest.TestCase):
                             for line in content_lines), content_lines[:3])
         self.assertGreater(once.text.count("Alice:"), 2)
 
-    def test_turn_with_no_sentence_terminator_is_never_broken_or_truncated(self):
+    def test_terminator_free_turn_is_broken_at_whitespace_not_left_header_free(self):
+        """Changed on purpose: a header-free 7,000-token wall was the coverage hole.
+
+        The old rule ("never break a turn that has no sentence terminator") left
+        every chunk inside such a turn without any context. Now the break falls at
+        whitespace between whole words: words are still never split, lost,
+        reordered or truncated, and a header lands inside the run.
+        """
         once = prep.prepare_transcript(LONG_TURNS_NO_SENTENCES, filename="wall.txt",
                                        header_every_tokens=60)
-        self.assertEqual(once.headers_inserted, 3, "one header per turn, nothing invented")
+        self.assertGreater(once.headers_inserted, 3, "headers must land inside the run")
         self.assertTrue(_subsequence(prep.word_tokens(LONG_TURNS_NO_SENTENCES),
                                      prep.word_tokens(once.text)))
         self.assertIn("alpha399", once.text, "nothing is truncated")
+        # No word was cut in half: strip headers and the leading label from every
+        # content line and the remaining words must be exactly the source words.
+        self.assertEqual(_content_tokens(once.text), _content_tokens(LONG_TURNS_NO_SENTENCES))
+        # Coverage: no header-free stretch bigger than the budget.
+        gaps, current = [], 0
+        for line in once.text.splitlines():
+            if prep._HEADER_RE.match(line.strip()):
+                gaps.append(current)
+                current = 0
+            else:
+                current += prep.estimate_tokens(line)
+        gaps.append(current)
+        self.assertLessEqual(max(gaps[1:-1]), 2 * 60, "a chunk-sized gap survived")
 
 
 class TestHeaders(unittest.TestCase):
@@ -493,6 +532,224 @@ class TestWorkerWiring(unittest.TestCase):
         again = prep.prepare_transcript(first["payload"], filename="standup_2026-10-09.txt",
                                         header_every_tokens=60)
         self.assertEqual(again.text, first["payload"])
+
+    def test_the_paren_dialect_keeps_its_shape_through_the_worker(self):
+        """The corpus dialect is not rewritten to "Name:" on the production path."""
+        with patch.object(worker.settings, "transcript_prep_enabled", True):
+            got = self._submit("Kickoff_2026-10-09-transcript.txt", PAREN_LABELS)
+        self.assertIn("[Meeting: Kickoff | Date: 2026-10-09", got["payload"])
+        self.assertIn("(Ana) We should ship the bridge change behind a flag.", got["payload"])
+        self.assertNotIn("Ana:", got["payload"])
+        row = self.store.docs[got["path"]]
+        self.assertEqual(row["sha256"], got["digest"], "hash must be the ORIGINAL bytes")
+        self.assertEqual(row["content_hash"], got["digest"])
+        self.assertEqual(self.store.meta(got["path"]).get("transcript_prep"), "applied")
+
+    def test_flag_off_sends_a_paren_dialect_file_byte_identical(self):
+        expected = worker.normalize_text_submission_payload(PAREN_LABELS)
+        got = self._submit("Kickoff_2026-10-09-transcript.txt", PAREN_LABELS)
+        self.assertEqual(got["payload"], expected)
+        self.assertNotIn("transcript_prep", self.store.meta(got["path"]))
+
+
+
+# ── the real corpus shape: "(Label) text", no timestamps, no colons ───────────
+# Hermes' content-free report on the actual corpus: every transcript uses a
+# parenthesised label, no timestamps, long-tailed turns (p90 65-155 tokens, max
+# 2201, one file with a single 7,661-token turn), 40-51% of turns under 10 tokens.
+# These fixtures are synthetic but shaped to that description.
+
+PAREN_LABELS = """(Ana) We should ship the bridge change behind a flag.
+(Ben) Agreed, but the rollback path needs a test first.
+(Ana) The rehearsal is Thursday, (see above) for the room.
+(Speaker 1) Thursday afternoon works for me.
+(Dr Smith) Then the freeze window is the only risk left.
+(Ana) Noted, I will write the announcement tonight.
+(Ben) Thursday then.
+"""
+
+PAREN_CONTINUATION = """(Ana) First thing I want to say,
+and I keep talking on the next line.
+(Ben) Short reply here.
+(Ana) Another turn from Ana,
+still the same turn, no label.
+(Ben) Understood.
+(Ana) One more from Ana.
+(Cara) I have nothing to add.
+"""
+
+NON_TRANSCRIPT_PARENS = {
+    "prose cross-reference": """The result (see above) is stable under the freeze.
+See (see above) for the rehearsal plan of the same week.
+Option (1) is cheaper and option (2) is safer for us.
+We shipped (1) on Friday and rolled (2) back on Monday.
+""",
+    "enumerated list": "(a) first item of the list\n(b) second item of the list\n"
+                       "(c) third item of the list\n(d) fourth item of the list\n"
+                       "(e) fifth item of the list\n",
+    "stage directions": "(Ana) Hello everyone.\n(laughter)\n(Ben) Nice to see you.\n"
+                        "(silence)\n(Ana) Thanks for coming.\n(laughter)\n",
+    "figure reference": "(Fig 3) shows the layout of the deck.\n(Fig 3) is cited twice below.\n"
+                        "(Fig 3) again here for the same point.\n(Fig 3) and the notes agree.\n",
+}
+
+
+class TestParenthesisDialect(unittest.TestCase):
+    """`(Label) text`: detected, kept in its own shape, prose parens refused."""
+
+    def test_detected_and_written_back_in_the_same_shape(self):
+        result = prep.prepare_transcript(PAREN_LABELS, filename="Kickoff_2026-10-09-transcript.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertIn("paren", result.reason)
+        self.assertIn("Ana", result.speakers)
+        self.assertIn("Speaker 1", result.speakers)
+        self.assertIn("Dr Smith", result.speakers)
+        for line in result.text.splitlines():
+            stripped = line.strip()
+            if not stripped or prep._HEADER_RE.match(stripped):
+                continue
+            self.assertTrue(stripped.startswith("("), f"label rewritten: {stripped[:40]}")
+            self.assertNotIn(": ", stripped.split(") ", 1)[-1][:20])
+        self.assertNotIn("Ana:", result.text, "the corpus form must not be rewritten to Name:")
+        self.assertIn("(Ana) The rehearsal is Thursday, (see above) for the room.", result.text,
+                      "a mid-line prose paren survives as content")
+        self.assertTrue(_subsequence(prep.word_tokens(PAREN_LABELS), prep.word_tokens(result.text)))
+
+    def test_idempotent_on_the_paren_shape(self):
+        once = prep.prepare_transcript(PAREN_LABELS, filename="Kickoff_2026-10-09-transcript.txt")
+        twice = prep.prepare_transcript(once.text, filename="Kickoff_2026-10-09-transcript.txt")
+        self.assertTrue(twice.detected, "the output must still be transcript-shaped")
+        self.assertEqual(twice.text, once.text)
+        self.assertEqual(twice.headers_inserted, once.headers_inserted)
+
+    def test_label_less_continuation_belongs_to_the_previous_turn(self):
+        result = prep.prepare_transcript(PAREN_CONTINUATION, filename="sync.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertIn("(Ana) First thing I want to say, and I keep talking on the next line.",
+                      result.text)
+        self.assertEqual(_content_tokens(result.text), _content_tokens(PAREN_CONTINUATION))
+
+    def test_prose_parentheses_are_never_treated_as_speakers(self):
+        for name, text in NON_TRANSCRIPT_PARENS.items():
+            with self.subTest(name):
+                result = prep.prepare_transcript(text, filename="notes.txt")
+                self.assertFalse(result.detected, f"{name}: {result.reason}")
+                self.assertEqual(result.text, text, "byte-identical when unsure")
+
+    def test_a_paren_label_must_head_three_lines_before_it_counts(self):
+        text = """(Ann) First point from Ann about the deploy.
+(Bob) Reply to Ann about the same deploy.
+(Ann) Second point from Ann about the freeze.
+(Bob) Second reply from Bob about it.
+(Cara) A third voice says something else.
+"""
+        result = prep.prepare_transcript(text, filename="notes.txt")
+        self.assertFalse(result.detected)
+        self.assertIn("no-recurring-speaker", result.reason)
+
+    def test_titles_come_from_the_stem_and_never_invent_a_date(self):
+        cases = {
+            "Project_Kickoff_2026-10-09-transcript.txt": ("Project Kickoff", "2026-10-09"),
+            "why_the_deploy_failed-transcript.txt": ("why the deploy failed", None),
+            "Standup_20261009_transcript.txt": ("Standup", "2026-10-09"),
+            "transcript.txt": (None, None),
+        }
+        for filename, (title, date) in cases.items():
+            with self.subTest(filename):
+                self.assertEqual(prep._metadata_from_name(filename), (title, date))
+                result = prep.prepare_transcript(PAREN_LABELS, filename=filename)
+                header = prep.headers_only(result.text)[0]
+                if title:
+                    self.assertIn(f"Meeting: {title}", header)
+                else:
+                    self.assertNotIn("Meeting:", header)
+                self.assertEqual("Date: " in header, date is not None)
+
+
+class TestRealisticTurnShapes(unittest.TestCase):
+    """40-51% tiny turns and one 7,000-token turn, from Hermes' shape report."""
+
+    @staticmethod
+    def _mix(turns: int = 150) -> str:
+        """Turn lengths from Hermes: 40-51% under 10 tokens, p50 12-18, p90 65-155."""
+        speakers = ["(Ana)", "(Ben)", "(Cara)"]
+        lines = []
+        for index in range(turns):
+            speaker = speakers[index % len(speakers)]
+            if index % 5 == 0:
+                lines.append(f"{speaker} " + " ".join(f"point{index}item{j}" for j in range(24)))
+            elif index % 2 == 0:
+                lines.append(f"{speaker} " + " ".join(f"note{index}item{j}" for j in range(5)))
+            else:
+                lines.append(f"{speaker} ok, sure, thanks, fine, yeah.")
+        return "\n".join(lines) + "\n"
+
+    def test_headers_follow_the_token_cadence_not_the_turn_count(self):
+        text = self._mix()
+        cadence = 200
+        result = prep.prepare_transcript(text, filename="standup.txt", header_every_tokens=cadence)
+        self.assertTrue(result.detected, result.reason)
+        total = prep.estimate_tokens(text)
+        self.assertGreater(result.turns, 140)
+        self.assertLess(result.headers_inserted, result.turns / 3,
+                        "a header per sub-ten-token turn would be noise")
+        self.assertGreaterEqual(result.headers_inserted, total // (3 * cadence),
+                                "far fewer headers than the cadence means uncovered chunks")
+        self.assertLessEqual(result.headers_inserted, total // (cadence // 3),
+                             "far more headers than the cadence wastes payload")
+        # Tiny turns are grouped: one header covers several labelled lines.
+        segment, widest = 0, 0
+        for line in result.text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if prep._HEADER_RE.match(stripped):
+                widest = max(widest, segment)
+                segment = 0
+            else:
+                segment += 1
+        self.assertGreaterEqual(max(widest, segment), 3, "tiny turns were not grouped")
+        self.assertEqual(_content_tokens(result.text), _content_tokens(text))
+
+    @staticmethod
+    def _wall(words: int = 7000) -> str:
+        # One turn of `words` words with no sentence terminator at all, spread over
+        # two lines, plus enough labelled lines from two speakers to be detected.
+        run = " ".join(f"fillerword{n}" for n in range(words))
+        head, tail = run[: len(run) // 2], run[len(run) // 2:]
+        return ("(Ana) Let me explain the whole thing now " + head + "\n" + tail + "\n"
+                "(Ben) Short reply.\n(Ana) More from Ana.\n(Ben) And from Ben.\n"
+                "(Ana) Closing from Ana.\n")
+
+    def test_a_terminator_free_wall_of_words_still_gets_headers(self):
+        text = self._wall()
+        cadence = 200
+        result = prep.prepare_transcript(text, filename="wall.txt", header_every_tokens=cadence)
+        self.assertTrue(result.detected, result.reason)
+        total = prep.estimate_tokens(text)
+        self.assertGreater(total, 5000, "fixture must be the degenerate size")
+        self.assertGreater(result.headers_inserted, total // (4 * cadence),
+                           "headers must land inside the run, not only before it")
+        # Words intact, in order, none split, nothing dropped.
+        self.assertEqual(_content_tokens(result.text), _content_tokens(text))
+        for line in result.text.splitlines():
+            stripped = line.strip()
+            if not stripped or prep._HEADER_RE.match(stripped):
+                continue
+            self.assertTrue(stripped.startswith("(Ana) ") or stripped.startswith("(Ben) "),
+                            f"a piece lost its speaker label: {stripped[:40]}")
+            self.assertLessEqual(prep.estimate_tokens(stripped), 2 * cadence + 40,
+                                 "a piece is far bigger than the cadence")
+        gaps, current = [], 0
+        for line in result.text.splitlines():
+            if prep._HEADER_RE.match(line.strip()):
+                gaps.append(current)
+                current = 0
+            else:
+                current += prep.estimate_tokens(line)
+        gaps.append(current)
+        self.assertLessEqual(max(gaps[1:-1]), 2 * cadence, "a header-free stretch survived")
+
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import dis
 import io
 import json
@@ -22,6 +23,7 @@ import time
 import unittest
 import urllib.error
 from contextlib import redirect_stdout
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -2479,6 +2481,327 @@ Friday works, the freeze starts that night.
         self.assertIn("[Meeting: doc1 | ", posted[0])
         self.assertIn("Alice Chen: We should ship the bridge change behind a flag.", posted[0])
         self.assertIn("Bob Nguyen: Friday works, the freeze starts that night.", posted[0])
+
+
+
+# ── experiment-level per-request chunker (LightRAG 1.5.7) ───────────────────
+
+class TestChunkingExperimentKey(_Case):
+    """``"chunking": {"strategy": ..., "params": {...}}`` on every posted insert.
+
+    Param key names come from Hermes reading the 1.5.7 image; they are validated
+    structurally here so a typo fails at startup instead of three hours into an
+    ingest, and the values are forwarded untouched. No key at all means the body
+    is byte-identical to what this driver posted before the key existed.
+    """
+
+    def _bodies(self, experiment: dict) -> list[dict]:
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        self.make_loop(config).run()
+        return [payload for url, payload in self.ops.payloads_seen
+                if url.endswith("/documents/text")]
+
+    def test_absent_key_posts_exactly_the_old_body(self):
+        bodies = self._bodies({"name": "C0", "env": {}, "reingest": True})
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(set(bodies[0]), {"text", "file_source"})
+        self.assertEqual(bodies[0]["text"], "transcript body\n")
+
+    def test_valid_strategy_and_params_are_forwarded_untouched(self):
+        spec = {"strategy": "semantic_vector",
+                "params": {"chunk_token_size": 1200, "breakpoint_threshold_type": "percentile",
+                           "breakpoint_threshold_amount": 95, "buffer_size": 1}}
+        bodies = self._bodies({"name": "C2", "env": {}, "reingest": True, "chunking": spec})
+        self.assertEqual(bodies[0]["chunking"], spec)
+        self.assertEqual(set(bodies[0]), {"text", "file_source", "chunking"})
+
+    def test_recursive_params_pass_through_as_written(self):
+        spec = {"strategy": "recursive_character",
+                "params": {"chunk_token_size": 1200, "chunk_overlap_token_size": 100,
+                           "separators": ["\n\n", "\n", ". "]}}
+        bodies = self._bodies({"name": "C1", "env": {}, "reingest": True, "chunking": spec})
+        self.assertEqual(bodies[0]["chunking"]["params"]["separators"], ["\n\n", "\n", ". "])
+
+    def _refuse(self, params: dict, fragment: str, strategy: str = "fixed_token") -> None:
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "X", "env": {}, "reingest": False,
+                 "chunking": {"strategy": strategy, "params": params}}]})
+        message = str(caught.exception)
+        self.assertIn(fragment, message, message)
+
+    def test_unknown_strategy_refuses_at_load(self):
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "X", "env": {}, "chunking": {"strategy": "hyde"}}]})
+        self.assertIn("chunking.strategy must be one of", str(caught.exception))
+
+    def test_params_must_be_an_object(self):
+        with self.assertRaises(ol.LoopConfigError):
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "X", "env": {}, "chunking": {"strategy": "fixed_token", "params": [1]}}]})
+
+    def test_unknown_param_key_is_refused_and_names_the_accepted_ones(self):
+        self._refuse({"chunk_token_size": 800, "chunk_overlap_tokens": 100},
+                     "chunk_overlap_tokens is not a fixed_token param")
+        self._refuse({"chunk_token_size": 800, "chunk_overlap_tokens": 100},
+                     "chunk_overlap_token_size")
+
+    def test_typed_keys_are_checked_the_way_lightrag_checks_them(self):
+        self._refuse({"chunk_token_size": "1200"}, "chunk_token_size must be an integer")
+        self._refuse({"chunk_token_size": True}, "chunk_token_size must be an integer")
+        self._refuse({"chunk_token_size": 1200, "chunk_overlap_token_size": "100"},
+                     "chunk_overlap_token_size must be an integer")
+        self._refuse({"chunk_token_size": 1200, "chunk_overlap_token_size": 1200},
+                     "must be smaller than chunk_token_size")
+        self._refuse({"split_by_character_only": 1}, "must be a boolean, not an int or a string")
+        self._refuse({"split_by_character": 3}, "split_by_character must be a string")
+
+    def test_semantic_vector_takes_no_overlap_key(self):
+        self._refuse({"chunk_token_size": 1200, "chunk_overlap_token_size": 100},
+                     "not accepted by semantic_vector", strategy="semantic_vector")
+
+    def test_env_only_regex_key_is_refused_by_name(self):
+        self._refuse({"sentence_split_regex": r"[.!?]" + "$"}, "env-only")
+
+    def test_semantic_thresholds_are_range_checked_for_the_type_that_needs_it(self):
+        self._refuse({"breakpoint_threshold_type": "quartile"},
+                     "breakpoint_threshold_type must be one of", strategy="semantic_vector")
+        self._refuse({"breakpoint_threshold_type": "percentile",
+                      "breakpoint_threshold_amount": 150},
+                     "within (0, 100]", strategy="semantic_vector")
+        self._refuse({"breakpoint_threshold_amount": "0.5"},
+                     "breakpoint_threshold_amount must be a number", strategy="semantic_vector")
+        self._refuse({"buffer_size": 0}, "buffer_size must be an integer", strategy="semantic_vector")
+        # standard_deviation has no (0, 100] requirement: 1.0 must be accepted.
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "OK", "env": {}, "chunking": {
+                "strategy": "semantic_vector",
+                "params": {"breakpoint_threshold_type": "standard_deviation",
+                           "breakpoint_threshold_amount": 1.0}}}]})
+        self.assertEqual(config["experiments"][0]["chunking"]["params"]["breakpoint_threshold_amount"], 1.0)
+
+    def test_separators_are_shape_checked(self):
+        self._refuse({"separators": "abc"}, "separators must be a list", strategy="recursive_character")
+        self._refuse({"separators": ["a", 3]}, "every separator must be a string",
+                     strategy="recursive_character")
+        self._refuse({"separators": ["x"] * 65}, "at most 64 entries", strategy="recursive_character")
+        self._refuse({"separators": ["y" * 257]}, "at most 256 characters",
+                     strategy="recursive_character")
+
+    def test_the_shipped_chunking_arms_file_is_valid_and_ordered(self):
+        path = Path(__file__).resolve().parent.parent / "docs" / "ops" / "loop" / "experiments-chunking.json"
+        config = ol.load_experiments(path)
+        names = [experiment["name"] for experiment in config["experiments"]]
+        self.assertEqual(names, ["C0-baseline", "P1-transcript-prep", "C2-semantic-vector",
+                                 "C1-recursive-character", "P2-prep-plus-semantic"])
+        by_name = {experiment["name"]: experiment for experiment in config["experiments"]}
+        self.assertIsNone(by_name["C0-baseline"]["chunking"])
+        self.assertFalse(by_name["C0-baseline"]["transcript_prep"])
+        self.assertTrue(by_name["P1-transcript-prep"]["transcript_prep"])
+        self.assertIsNone(by_name["P1-transcript-prep"]["chunking"])
+        self.assertEqual(by_name["C2-semantic-vector"]["chunking"]["strategy"], "semantic_vector")
+        self.assertNotIn("chunk_overlap_token_size",
+                         by_name["C2-semantic-vector"]["chunking"]["params"])
+        self.assertEqual(by_name["C1-recursive-character"]["chunking"]["strategy"],
+                         "recursive_character")
+        self.assertTrue(by_name["P2-prep-plus-semantic"]["transcript_prep"])
+        self.assertTrue(all(experiment["reingest"] for experiment in config["experiments"]))
+
+
+# ── second-stack targeting and the production-wipe gate ─────────────────────
+
+SECOND_LIGHTRAG = "http://127.0.0.1:9911"
+SECOND_GATEWAY = "http://127.0.0.1:9912"
+
+
+class TestTargetSelection(_Case):
+    """--lightrag-url / --gateway-url / containers / --env-file.
+
+    Defaults must point at production exactly as before; the clear step must use
+    the URL it was given, not the constant.
+    """
+
+    def test_defaults_are_the_module_constants(self):
+        target = ol.Target()
+        self.assertEqual(target.lightrag_url, ol.LIGHTRAG_URL)
+        self.assertEqual(target.gateway_url, ol.GATEWAY_URL)
+        self.assertEqual(target.lightrag_container, ol.CONTAINER)
+        self.assertEqual(target.gateway_container, ol.GATEWAY_CONTAINER)
+        self.assertTrue(target.is_production_lightrag())
+
+    def test_unset_fields_follow_the_constants_at_construction(self):
+        """Tests redirect these globals to a stub; a Target built after must follow."""
+        original = ol.LIGHTRAG_URL
+        try:
+            ol.LIGHTRAG_URL = "http://127.0.0.1:1/stub"
+            target = ol.Target()
+            self.assertEqual(target.lightrag_url, "http://127.0.0.1:1/stub")
+            self.assertFalse(target.is_production_lightrag())
+        finally:
+            ol.LIGHTRAG_URL = original
+
+    def test_the_clear_step_uses_the_url_it_was_given(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": True}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="second-lightrag", gateway_container="second-gateway")
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops,
+                       max_hours=11.0, handle_signals=False, print_fn=lambda line: None,
+                       target=target)
+        loop.run()
+        urls = [url for _method, url in self.ops.http_calls]
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents", urls, "the clear must hit the given stack")
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents/text", urls)
+        self.assertIn(f"{SECOND_GATEWAY}/api/chat", urls)
+        self.assertFalse([url for url in urls if url.startswith(ol.PRODUCTION_LIGHTRAG_URL)],
+                         "a request still went to the production LightRAG")
+        self.assertIn("name=second-lightrag",
+                      " ".join(" ".join(command) for command in self.ops.commands
+                               if command[:2] == ["docker", "ps"]))
+        execs = [" ".join(command) for command in self.ops.commands if command[:2] == ["docker", "exec"]]
+        self.assertTrue(execs and all("second-gateway" in line or "second-lightrag" in line
+                                      for line in execs), execs)
+
+    def test_env_file_override_replaces_the_root_dotenv(self):
+        other = self.root / "stack-two.env"
+        other.write_text(ENV_TEXT, encoding="utf-8")
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops,
+                       max_hours=11.0, handle_signals=False, print_fn=lambda line: None,
+                       target=ol.Target(env_file=str(other)))
+        self.assertEqual(loop.env_path, other)
+        default = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops,
+                          max_hours=11.0, handle_signals=False, print_fn=lambda line: None)
+        self.assertEqual(default.env_path, self.root / ".env")
+
+
+class _ExplodingOps:
+    """Proves the guard runs before anything could talk to a stack."""
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("a real Ops was built; the guard must return first")
+
+
+class TestProductionWipeGuard(_Case):
+    """reingest on the production LightRAG needs --allow-production."""
+
+    def _main(self, argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), patch.object(ol, "Ops", _ExplodingOps), \
+                patch.object(ol, "DryRunOps", _ExplodingOps):
+            code = ol.main(argv)
+        return code, buffer.getvalue()
+
+    def _run_with_fake_ops(self, argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), patch.object(ol, "Ops", lambda: self.ops):
+            code = ol.main(argv)
+        return code, buffer.getvalue()
+
+    def test_default_target_plus_reingest_refuses_before_any_request(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, err = self._main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                                "--out", str(self.out)])
+        self.assertEqual(code, 3)
+        self.assertIn("this would wipe the production store", err)
+        self.assertIn("--allow-production", err)
+
+    def test_explicit_production_url_is_refused_too(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, err = self._main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                                "--out", str(self.out),
+                                "--lightrag-url", ol.PRODUCTION_LIGHTRAG_URL + "/"])
+        self.assertEqual(code, 3)
+        self.assertIn("this would wipe the production store", err)
+
+    def test_allow_production_proceeds_and_warns(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, err = self._run_with_fake_ops(
+            ["--root", str(self.root), "--experiments", str(self.experiments_path),
+             "--out", str(self.out), "--allow-production"])
+        self.assertEqual(code, 0)
+        self.assertIn("--allow-production", err)
+        self.assertIn(f"{ol.PRODUCTION_LIGHTRAG_URL}/documents",
+                      [url for _method, url in self.ops.http_calls])
+
+    def test_second_stack_needs_no_flag_and_never_touches_production(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, _err = self._run_with_fake_ops(
+            ["--root", str(self.root), "--experiments", str(self.experiments_path),
+             "--out", str(self.out), "--lightrag-url", SECOND_LIGHTRAG,
+             "--gateway-url", SECOND_GATEWAY])
+        self.assertEqual(code, 0)
+        urls = [url for _method, url in self.ops.http_calls]
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents", urls)
+        self.assertFalse([url for url in urls if url.startswith(ol.PRODUCTION_LIGHTRAG_URL)])
+
+    def test_no_reingest_on_production_is_allowed(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": False}]}),
+            encoding="utf-8")
+        code, err = self._run_with_fake_ops(
+            ["--root", str(self.root), "--experiments", str(self.experiments_path),
+             "--out", str(self.out)])
+        self.assertEqual(code, 0)
+        self.assertNotIn("wipe the production store", err)
+
+    def test_dry_run_warns_instead_of_refusing(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = ol.main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                            "--out", str(self.out), "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("this would wipe the production store", buffer.getvalue())
+
+
+class TestLoopLogsUseDocPositions(_Case):
+    """Loop logs name corpus documents by position, never by file name."""
+
+    def _three_file_corpus(self) -> list[Path]:
+        paths = [self.root / f"doc{n}.txt" for n in (1, 2, 3)]
+        for path in paths:
+            path.write_text("body of one synthetic document\n", encoding="utf-8")
+        (self.root / "probe" / ol.CORPUS_FILE.split("/", 1)[1]).write_text(
+            json.dumps([str(path) for path in paths]), encoding="utf-8")
+        return paths
+
+    def _log_after_reingest(self, experiment: dict) -> str:
+        self._three_file_corpus()
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        self.make_loop(config).run()
+        return (self.out / "loop.log").read_text(encoding="utf-8")
+
+    def test_positions_appear_and_names_do_not(self):
+        log = self._log_after_reingest({"name": "E1", "env": {}, "reingest": True})
+        for label in ("doc 1/3", "doc 2/3", "doc 3/3"):
+            self.assertIn(label, log)
+        for name in ("doc1.txt", "doc2.txt", "doc3.txt"):
+            self.assertNotIn(name, log, f"the log leaked {name}")
+
+    def test_transcript_prep_lines_are_positioned_too(self):
+        (self.root / "doc2.txt").write_text(
+            "(Ana) Ship it behind a flag.\n(Ben) Agreed, test the rollback first.\n"
+            "(Ana) I will write the test.\n(Ben) Fine.\n(Ana) Cutting Friday.\n",
+            encoding="utf-8")
+        log = self._log_after_reingest({"name": "E1", "env": {}, "reingest": True,
+                                        "transcript_prep": True})
+        self.assertIn("transcript_prep doc 2/3:", log)
+        self.assertNotIn("doc2.txt", log)
+        self.assertNotIn("doc1.txt", log)
+
 
 
 if __name__ == "__main__":

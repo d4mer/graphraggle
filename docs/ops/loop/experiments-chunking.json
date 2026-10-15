@@ -1,0 +1,84 @@
+{
+  "_readme": [
+    "Chunking arms for the transcript/chunker experiment (branch chunking). Run order is",
+    "cheapest hypothesis first; each arm is roughly 8-9 h, so C1 and P2 are marked",
+    "\"_optional\": run them only if C0/P1/C2 show a signal. Every arm reingests, so the run",
+    "clears the LightRAG store it points at: run this file against a second stack",
+    "(--lightrag-url/--gateway-url/--env-file) or pass --allow-production deliberately.",
+    "chunking.params keys are exactly the names Hermes read out of the LightRAG 1.5.7",
+    "image (docs/ops/runs/chunker-experiments.md): chunk_token_size is shared;",
+    "recursive_character takes chunk_overlap_token_size and separators;",
+    "semantic_vector takes NO overlap key, plus breakpoint_threshold_type,",
+    "breakpoint_threshold_amount and buffer_size. sentence_split_regex is env-only and is",
+    "rejected in a request. LightRAG answers an unknown key, a bool-as-int or a numeric",
+    "string with a synchronous 422; the loop refuses the same shapes before starting an arm.",
+    "Docs: docs/ops/runs/chunker-experiments.md, app/transcript_prep.py."
+  ],
+  "baseline_env": {},
+  "experiments": [
+    {
+      "name": "C0-baseline",
+      "env": {},
+      "reingest": true,
+      "probe_concurrency": 1,
+      "_note": "No chunking key and no transcript_prep: LightRAG's fixed-token default (1200/100) on raw corpus text."
+    },
+    {
+      "name": "P1-transcript-prep",
+      "env": {},
+      "reingest": true,
+      "probe_concurrency": 1,
+      "transcript_prep": true,
+      "_note": "Same chunker as C0, but every file goes through app.transcript_prep first (turns + context headers). Isolates the text change from the chunker change."
+    },
+    {
+      "name": "C2-semantic-vector",
+      "env": {},
+      "reingest": true,
+      "probe_concurrency": 1,
+      "chunking": {
+        "strategy": "semantic_vector",
+        "params": {
+          "chunk_token_size": 1200,
+          "breakpoint_threshold_type": "percentile",
+          "breakpoint_threshold_amount": 95,
+          "buffer_size": 1
+        }
+      },
+      "_note": "Semantic breakpoints instead of fixed 1200-token cuts. Note the absence of chunk_overlap_token_size: semantic_vector rejects it (422)."
+    },
+    {
+      "name": "C1-recursive-character",
+      "env": {},
+      "reingest": true,
+      "probe_concurrency": 1,
+      "_optional": true,
+      "_note": "Run only if C0/P1/C2 show a signal. Recursive character splitting with the production sizes.",
+      "chunking": {
+        "strategy": "recursive_character",
+        "params": {
+          "chunk_token_size": 1200,
+          "chunk_overlap_token_size": 100
+        }
+      }
+    },
+    {
+      "name": "P2-prep-plus-semantic",
+      "env": {},
+      "reingest": true,
+      "probe_concurrency": 1,
+      "_optional": true,
+      "_note": "Run only if P1 and C2 each helped: prepared text plus the C2 semantic_vector params, to see whether the two gains stack.",
+      "transcript_prep": true,
+      "chunking": {
+        "strategy": "semantic_vector",
+        "params": {
+          "chunk_token_size": 1200,
+          "breakpoint_threshold_type": "percentile",
+          "breakpoint_threshold_amount": 95,
+          "buffer_size": 1
+        }
+      }
+    }
+  ]
+}
