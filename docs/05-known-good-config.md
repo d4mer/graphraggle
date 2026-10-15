@@ -14,17 +14,17 @@ podman/macmini setup and was wrong for what runs now.
 4. `open-webui` is the conversational frontend
 5. `rag-chromadb` is the vector-store container that runs alongside them
 
-## Production Runtime (verified 2026-10-09)
+## Production Runtime (verified 2026-10-15)
 
 Runtime is **Docker** (`docker compose`) — **not podman**. **(changed 2026-10-09)**
 
 | Container | Image | Note |
 |---|---|---|
-| `rag-gateway-api` | `local/rag-gateway:p24` (image `4629dcab0bea`) | built from commit `c89b293` |
-| `lightrag-server` | `ghcr.io/hkuds/lightrag:v1.5.7` | **(changed 2026-10-09)** — the repo `compose.yml` was reconciled to this tag on **2026-10-11** (packet-26) |
+| `rag-gateway-api` | `local/rag-gateway:rc2` (image `d0f31398fec5`) | **(changed 2026-10-15)** built from tag `rc-2` = commit `11b1833`; previous image `4629dcab0bea` (`p24` = rc-1) is tagged `local/rag-gateway:pre-rc2` for rollback |
+| `lightrag-server` | `ghcr.io/hkuds/lightrag:v1.5.7` | unchanged since **2026-10-09**; the repo `compose.yml` was reconciled to this tag on **2026-10-11** (packet-26) |
 | `open-webui` | `ghcr.io/open-webui/open-webui:0.12.0` | **(changed 2026-10-14)** canary on a data copy, then cutover; DB migrated (6 revisions), **downgrade unsupported**, rollback = restore the backup tarball. Pinned tag, not `main` |
 | `rag-chromadb` | `chromadb/chroma:latest` | |
-| `rag-ingest-worker` | image `d9d9ce2307a2` | **an old build from before packet-18.** The worker dedupe hardening (`2f74255`) is in the repo but is **not yet deployed** to this container |
+| `rag-ingest-worker` | `local/rag-gateway:rc2` (image `d0f31398fec5`) | **(changed 2026-10-15)** same image as the gateway. Correcting the stale note that used to sit here: the worker was **not** on a pre-packet-18 build (`d9d9ce2307a2`) — it has run rc-1 (`4629dcab0bea`) since **2026-10-10**, so packet-18's dedupe hardening was already live. Worker rollback uses `compose.rollback-rc2.yml`, not a retag — that override file lives on the Thinkpad and is **not** committed in this repo (see `08-change-log.md`) |
 
 Host ports (production):
 
@@ -145,6 +145,13 @@ OPENAI_API_KEYS: "${OPENWEBUI_OPENAI_API_KEYS:-}"
 Set **`OPENWEBUI_OPENAI_API_KEYS`** in the host `.env` file (the same file as every
 other secret). There is no `.env.example` in this repo, so the variable is documented
 here and in the change log only.
+
+> **Known drift, accepted (2026-10-15):** the live `compose.yml` on the Thinkpad
+> currently **inlines** the Open WebUI OpenAI key value instead of using the `${...}`
+> reference shown above. The repo form stays parameterised, which is what
+> `tests/test_compose_config.py` enforces. The operator has accepted the difference as
+> a risk (single-user machine on a LAN) and is not scheduling a rotation. No key value
+> belongs in this repo or in any doc.
 
 ## Production `.env` Settings (non-secret, verified 2026-10-09)
 

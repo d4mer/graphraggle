@@ -1,9 +1,53 @@
 # Handoff — worker
 
-Last updated: 2026-10-14 (Open WebUI 0.12.0 pin handed back, uncommitted; nothing
-else owned)
+Last updated: 2026-10-15 (rc-2 docs item **handed back uncommitted on master**;
+nothing else owned)
 
 ## Current state
+
+`qitem-20261015090325-ec23f24e` — record the rc-2 production release in the docs
+(master, docs only). Uncommitted: `docs/05-known-good-config.md` +11/-4 (runtime table:
+BOTH gateway and worker now `local/rag-gateway:rc2` / image `d0f31398fec5` / commit
+`11b1833`, previous `4629dcab0bea` tagged `pre-rc2`; the stale "worker on pre-packet-18
+`d9d9ce2307a2`" row corrected — it ran rc-1 since 2026-10-10; header now "verified
+2026-10-15"; Open WebUI key drift recorded as an **accepted risk**, no rotation
+scheduled, no key values written anywhere), `docs/08-change-log.md` +7/-2 (Production
+Releases item 9 for rc-2 — image, tarball, backup
+`~/rag-project/backups/pre-rc2-20261015T083456Z/`, what is live, rollback (gateway
+retag; worker via `compose.rollback-rc2.yml`); Pending rewritten: old items 1 and 4
+struck with the corrected premise, note that `COMPANY_AWARE_DEDUPE` stays off on
+purpose), `docs/04-troubleshooting.md` +50 (two sections: 401 on `GET /ingest/status`
+— bearer guard predates rc-2, verify the auth **and** the port (host 8020 → container
+8000, docs examples use :8000), the unexplained unauthenticated 200 recorded as
+unestablished; and "The ingest worker logs nothing on a clean scan" — `warn()` prints
+only `WARNING:` to stderr, refusals come from the `gateway.state_store` logger,
+liveness via `docker stats --no-stream`, `docker inspect -f '{{.State.Status}}
+{{.State.StartedAt}}'`, `stat -c %y ~/rag-project/state/ingest.db`, or POST /reindex and
+watch `summary.by_status` / rows' `updated_at`).
+Suite: `env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` →
+**`698 passed, 2 warnings, 6 subtests passed in 4.42s`** (master baseline unchanged; no
+test reads docs files).
+Reported-not-fixed: several curl examples in docs/03, 04, 09 use
+`http://localhost:8000` while production publishes the gateway on host **8020** — a
+docs inconsistency outside this brief.
+
+Earlier today: the transcript-prep chunking item (`qitem-20261015074912-069626d5`) was
+handed back uncommitted in the worktree `/home/maverick/work/graphraggle-chunking`
+(branch `chunking`) and the lead committed it as **`b535792`**; worktree suite
+**726 passed** (baseline 698 + 26 + 2). Design points, in case of rework: token
+estimate `max(chars/4.0, words)` (tiktoken lives in LightRAG's image, not this venv;
+200-token cadence vs 1200-token chunks = 6x margin); turns longer than 2 budgets split
+at sentence terminators with the speaker label repeated; detection needs >=3 label
+lines, >=2 distinct speakers with one recurring, labels >=30% of non-empty lines (or
+>=3 subtitle cues); `Q:`/`A:` and Note/Step/Action-style labels are stoplisted;
+caption-only output is stable but not re-detectable. Coverage script kept at
+`/tmp/coverage_report.py` (synthetic ~5,000-token transcript: 30 headers, 15% payload
+growth, spacing mean 158 / max 164 estimated tokens, 5/5 windows at 1200 tokens contain
+a header, largest header-free window 0).
+
+Earlier items (all committed by the lead on master): Open WebUI 0.12.0 pin,
+company-aware dedupe behind `COMPANY_AWARE_DEDUPE` (do-not-enable per the live
+probe), lifecycle cleanup, TODO #2/#3, conftest.
 
 `qitem-20261014135220-06657d8a` — pin Open WebUI 0.12.0. **Uncommitted:**
 `compose.yml` (image tag `0.11.4` → `0.12.0`), `docs/05-known-good-config.md`
@@ -421,11 +465,21 @@ on an ERROR line.
 ## Next step
 
 On wake: `rig queue list --owned` and `rig queue inbox-pending
-dev-worker@graphraggle`. If the Open WebUI pin comes back for tweaks it is
-uncommitted here (`compose.yml`, `docs/05-known-good-config.md`,
-`docs/08-change-log.md`); verify with
-`env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
-**698 passed**).
+dev-worker@graphraggle`. Queue at hand-back: `[]` (only `qitem-20261015090325-ec23f24e`
+in progress, now handed off).
+
+If the rc-2 docs item comes back for tweaks it is uncommitted **on master**:
+`docs/04-troubleshooting.md`, `docs/05-known-good-config.md`, `docs/08-change-log.md`;
+verify with `env -i PATH=$PATH HOME=$HOME .venv/bin/python -m pytest tests/ -q` (expect
+**698 passed**; no test reads docs files, so a docs edit can only fail the suite if it
+touches `compose.yml`).
+
+Chunking work is in the worktree `/home/maverick/work/graphraggle-chunking` (branch
+`chunking`, now `b535792`, suite **726 passed** with the shared venv). If Hermes'
+content-free shape report arrives (label pattern, timestamp pattern, turn lengths), add
+the dialects it names to `tests/test_transcript_prep.py` and re-check the detection
+thresholds — especially whether the real corpus uses `Q:`/`A:` labels (currently
+stoplisted) and whether filenames carry usable meeting titles.
 
 Likely follow-ups: a new packet off the
 Hermes brief series in `docs/briefs/` (`hermes-widen-corpus.md`,
