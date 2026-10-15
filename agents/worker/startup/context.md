@@ -4,35 +4,26 @@ Last rewrite: after delivering qitem-20261015133902-cf21b1c5 (multi-stack loop f
 Earlier per-item history is in git (`git log --oneline` on `master` and `chunking`); this file
 keeps only live state, load-bearing facts and open threads.
 
-## Current state — nothing owned, waiting on the lead
+## Current state — queue empty, nothing owned
 
-Queue: empty after this handoff. Watchdog `parked-owner-consumer`
-(job 01M4AYEG0WK885GGJPDGRNVGD5) is parked on the handoff; if it fires with no new row,
-report honestly and park again rather than inventing work.
+Last item: **qitem-20261015133902-cf21b1c5** (multi-stack loop flags) — verified and committed by
+the lead as **7d74feb** on branch `chunking`; lead explicitly kept `--lightrag-service`. No
+further work on it. Queue is empty (`rig queue list` -> 0 rows); the
+`parked-owner-consumer` watchdog (job 01M4AYEG0WK885GGJPDGRNVGD5) is parked on the handoff. If it
+fires and the queue is still empty, say so honestly and park again — do not invent work.
 
-**Uncommitted work sits in the worktree `/home/maverick/work/graphraggle-chunking`**
-(branch `chunking`, base `b7fe10f`). The main checkout `/home/maverick/work/graphraggle` is on
-`master` (4741cab, 2 docs commits ahead of origin) — never edit chunking work there.
-Shared venv: `/home/maverick/work/graphraggle/.venv`. I never `git push`; the lead commits.
+Worktrees: `/home/maverick/work/graphraggle-chunking` = branch `chunking`, HEAD **7d74feb**, clean
+working tree, suite **776 passed, 2 warnings, 16 subtests**. `/home/maverick/work/graphraggle` =
+branch `master` (4741cab + this context commit), suite 698. Shared venv:
+`/home/maverick/work/graphraggle/.venv`. Chunking-program work happens in the **worktree**;
+release-line docs work happens in **master**. I never `git push`.
 
-Worktree diff left for the lead (uncommitted):
-- `scripts/overnight_loop.py` +101/-18 — `--worker-container NAME` (default production
-  `rag-ingest-worker`; `none` skips the guard), `worker_guard_refusal()` refuses `none` when the
-  RESOLVED LightRAG URL is production, `--compose-file`/`--compose-project` threaded through
-  every `docker compose` call, `--lightrag-service` (default = container name) added because the
-  loop used the container name as the compose service name.
-- `tests/conftest.py` +43 — patches `socket.socket.connect{,_ex}` to raise on ports 9621/8020.
-- `tests/test_overnight_loop.py` +208 — 16 new tests; fixes the pre-existing undefined `Any`.
-- NEW `tests/test_conftest_socket_guard.py` — 4 tests proving the guard.
-- `docs/ops/loop/experiments-chunking.json` — `_readme` second-stack run line + the exact
-  warning sentence.
-
-Gates: `env -i PATH=$PATH HOME=$HOME /home/maverick/work/graphraggle/.venv/bin/python -m pytest
-tests/ -q` in the worktree → **776 passed, 2 warnings, 16 subtests** (baseline b7fe10f = 760).
-pyflakes clean (`PYTHONPATH=/tmp/pyflakes_lib ... -m pyflakes`, installed with
-`-i https://pypi.org/simple/` — the corporate index has no flakes8/pyflakes).
-Controls: revert `scripts/` → 9 failed / 164 passed; revert `tests/conftest.py` → the guard test
-cannot import.
+What 7d74feb contains (for later reference): `Target` fields `worker_container` / `compose_file` /
+`compose_project` / `lightrag_service`; `--worker-container NAME` (default production
+`rag-ingest-worker`, `none` skips the guard, `none` refused by `worker_guard_refusal()` when the
+RESOLVED LightRAG URL is production); `--compose-file`/`--compose-project` on every compose call;
+`tests/conftest.py` socket guard on ports 9621/8020; 16 new loop tests + 4 guard tests; the
+`experiments-chunking.json` `_readme` run line and wipe warning.
 
 ## Load-bearing rules I learned the hard way
 
@@ -101,7 +92,8 @@ the mandatory A/B). The program still needs **real transcript labels**:
     never sees `sentence_split_regex` (env-only). LightRAG's 422 is the backstop either way.
 13. `--dev-probes` existence is checked before the target gates, so a bad-target refusal often
     surfaces as the probe-file message first.
-14. `--lightrag-service` was added beyond the flag list in qitem-…cf21b1c5 item 2 (the loop used
-    the LightRAG **container** name as the compose **service** name). Drop the hunk if unwanted.
+14. `--lightrag-service` shipped (lead-approved): the loop used the LightRAG **container** name as
+    the compose **service** name, which is wrong in a second compose project. Defaults preserve the
+    old behaviour.
 15. `FakeOps` in the loop tests grew `names` (scripted `docker ps --format {{.Names}}`) and
     `env_file` (which `.env` the fake reads/snapshots).
