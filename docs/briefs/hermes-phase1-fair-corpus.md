@@ -1,9 +1,9 @@
 # Hermes brief: Phase 1 of the retrieval accuracy plan (fair corpus + frozen baseline C0)
 
-**Status: DRAFT, NOT APPROVED.** Operator said yes (2026-10-16) to the plan's decisions 1 and 2
-(use all 6 transcripts + the other production documents on stack2; smaller chunks later); the
-brief itself needs a written go before it is sent. Part 1 (steps A-C) is read-only /
-scratch-only. Part 2 (step D, the ingest and baseline run on stack2) needs its own go.
+**Status: Part 1 (steps A, B, C, D0) APPROVED by the operator in writing on 2026-10-16.
+Part 2 (the ingest and baseline run on stack2) is NOT approved: it needs its own written go.**
+Part 1 is read-only / scratch-only. Operator decisions already taken: use all 6 transcripts +
+the other production documents on stack2; smaller chunks are the later Phase 3 route.
 Plan: `docs/09-retrieval-accuracy-plan.md`. Stack2 only (127.0.0.1:9622 / :8021, project
 `rag-chunk2`). Never production, never `--allow-production`, never :9621/:8020 except
 read-only count checks.
