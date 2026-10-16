@@ -10,7 +10,9 @@ production config back at the end.
 Usage:
     python3 scripts/overnight_loop.py --root ~/rag-project \
         --experiments experiments.json --out ~/rag-project/probe/loop \
-        --max-hours 11 [--dry-run] [--resume] [--retry-errors]
+        --max-hours 11 [--dry-run] [--resume] [--retry-errors] \
+        [--draws 3] [--compare ARM_A ARM_B] [--second-judge-model MODEL] \
+        [--no-retrieval-recall] [--recall-mode mix]
 
     python3 scripts/overnight_loop.py --root ~/rag-project \
         --rejudge ~/rag-project/probe/loop
@@ -69,18 +71,54 @@ requests) and prints the same text as a warning.
 Corpus files are logged by position (``doc 3/6``), never by name: transcript file
 names are themselves sensitive.
 
+Measuring (what the instrument can actually see)
+------------------------------------------------
+The adversarial review's central point was that this harness could not see most of
+the effects it was testing, so the numbers below are what changed, each tied to the
+finding it answers:
+
+* ``--draws N`` asks every probe N times (default 1, unchanged). One draw over ~40
+  questions resolves about one standard error, which is not enough to adopt an arm
+  (F25). Per-probe means across draws go into ``<name>/summary.json`` under
+  ``probe_scores``.
+* ``--compare A B`` writes a paired per-probe difference A - B with a bootstrap 95%
+  interval (cluster bootstrap over probes, fixed seed, so the same two arms always
+  give the same numbers) into results.md and ``state.json``. An interval covering
+  zero is printed as "not resolved", which is the honest reading of a small set.
+* Retrieval recall: for every probe that carries a gold quote (``evidence``, or a
+  turn id in ``evidence_turn``/``turn_id``), the driver posts ``/query`` with
+  ``only_need_context: true`` and checks whether that quote is in what LightRAG
+  returned. That splits retrieval failures from synthesis failures without any
+  judge. It sends no top_k/chunk_top_k/token budgets: the container env the arm set
+  is what is being measured. ``--no-retrieval-recall`` skips it; a probe with no
+  gold quote is ``na``, never a miss. Reported as ``evidence in context%``.
+* Attribution (F4): the content rubric no longer folds speaker attribution in, and
+  a separate judge call grades it right/wrong/na, reported as its own columns.
+  Only probes with ``expected_speaker`` are graded, so an existing probe set is
+  unaffected.
+* Refusals and accuracy are separated (F7): ``ok%`` is kept for comparability with
+  old summaries, and ``heldout answerable%`` (correct over answerable probes) plus
+  ``refusal acc%`` (refused over unanswerable probes) are reported next to it. A
+  system that refuses more cannot raise accuracy.
+* ``--second-judge-model`` (off by default) re-grades a deterministic sample
+  (``--second-judge-fraction``, default 0.2) with another model and reports
+  agreement, because the answerer and the judge are the same family (F6).
+
 An experiment may also carry ``"gateway_env": {...}`` with the gateway knobs
 (BRIDGE_*, GATEWAY_CHUNK_TOP_K, CITATION_TOP_K). They live in the same .env, are
 verified against the rag-gateway-api container, and that service is recreated and
 waited for too. ENTITY_TYPES is refused: LightRAG v1.5.7 will not start with it.
 
 Outputs, all under --out:
-    state.json     resumable run state, written atomically after every step
+    state.json     resumable run state, written atomically after every step, plus
+                   the comparison block when --compare was given
     heartbeat      ISO timestamp, rewritten at least every 60 s while waiting
     loop.log       human-readable log (appended)
-    results.md     one row per experiment, dev + heldout columns
+    results.md     one row per experiment, dev + heldout columns, plus the paired
+                   comparison section when --compare was given
     env.original   the untouched copy of <root>/.env (chmod 600)
-    <name>/answers.jsonl, verdicts.jsonl, summary.json
+    <name>/answers.jsonl, verdicts.jsonl, summary.json (verdict rows also carry
+                   draw, attribution and recall; summaries carry probe_scores)
 
 Stdlib only (urllib, json, subprocess, argparse, time, pathlib, re) plus one
 first-party import: ``app.transcript_prep``, the same transcript preprocessor the
@@ -95,6 +133,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import signal
 import subprocess
@@ -103,7 +142,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -473,9 +512,7 @@ Rules (apply in this order, and name the rule that decided the verdict):
    contradict. wrong = key facts are missing or contradicted. A refusal ("not in
    the documents") on an answerable question is refused_wrong, unless the question
    is itself unanswerable from the evidence (then refused_ok).
-3. Speaker attribution: do not mark an answer wrong merely because it attributes a
-   statement to a different speaker label, or omits who said it, unless the
-   question explicitly asks who said it.
+3. Speaker attribution: do not mark an answer wrong merely because it attributes a statement to a different speaker label, or omits who said it. Attribution is NOT part of this verdict at all - it is graded by a separate call with its own rubric, so never fold it in here.
 4. Judge only against the evidence quote and the expected answer given, never
    against outside knowledge. Extra detail that is not in the evidence is not an
    error unless it contradicts the evidence.
@@ -486,6 +523,47 @@ Verdicts: correct, partial, wrong, hallucinated, refused_ok, refused_wrong.
 
 Reply with ONLY this JSON object and nothing else:
 {{"verdict": "correct|partial|wrong|hallucinated|refused_ok|refused_wrong", "reason": "<one sentence naming the deciding rule>"}}
+"""
+
+# Finding F4: rule 3 above deliberately refuses to fold attribution into the content
+# verdict, which is also exactly what speaker-aware chunking is supposed to improve.
+# So attribution gets its own call, its own verdict and its own column. "na" when
+# the probe pins no speaker, or when there was no answer to attribute anything to.
+ATTRIBUTION_VALUES = ("right", "wrong", "na")
+ATTRIBUTION_ERROR = "attribution_error"
+
+ATTRIBUTION_PROMPT = """You are checking ONE thing about an answer from a document
+question-answering system: did it attribute the statement to the right speaker?
+
+Question:
+{question}
+
+Expected answer (ground truth):
+{expected_answer}
+
+Speaker the expected answer attributes this to:
+{expected_speaker}
+
+Evidence quote from the documents:
+{evidence}
+
+System answer:
+{answer}
+
+Rules (apply in this order):
+1. right - the answer names the expected speaker, or an unambiguous form of that
+   name (an initial, a title, a label from the transcript) for the statement the
+   question asks about.
+2. wrong - the answer attributes the statement to a DIFFERENT named speaker than
+   the expected one. Contradicting the expected speaker is wrong.
+3. na    - the answer neither states nor implies who spoke, or the expected speaker
+   is not identified, or the answer refused to answer. Never guess: absence is na,
+   not wrong.
+4. Judge the attribution only. Content errors, extra detail and wording are
+   irrelevant here and must not change this verdict.
+
+Reply with ONLY this JSON object and nothing else:
+{{"attribution": "right|wrong|na", "reason": "<one sentence>"}}
 """
 
 
@@ -598,6 +676,8 @@ def load_experiments(path: Path) -> dict[str, Any]:
                     f"experiment {name}: chunking.params for {strategy}: " + "; ".join(problems)
                 )
             chunking = {"strategy": strategy, "params": params}
+        if entry.get("recall_mode") is not None and not isinstance(entry["recall_mode"], str):
+            raise LoopConfigError(f"experiment {name}: recall_mode must be a string")
         experiments.append({
             "name": name,
             "env": {str(k): str(v) for k, v in env.items()},
@@ -611,6 +691,10 @@ def load_experiments(path: Path) -> dict[str, Any]:
             # byte-identical to what this driver posted before the key existed.
             "chunking": chunking,
             "probe_concurrency": concurrency,
+            # Which LightRAG mode the retrieval-recall probe asks for the context in.
+            # The metric itself is on unless --no-retrieval-recall is given; this only
+            # says which retrieval mode "the context" means for this arm.
+            "recall_mode": str(entry.get("recall_mode") or ""),
         })
     return {
         "baseline_env": {str(k): str(v) for k, v in baseline.items()},
@@ -785,11 +869,78 @@ def judge_prompt_for(item: dict[str, Any], answer: str) -> str:
     )
 
 
-def judge_reply(ops: Ops, prompt: str, judge_key: str) -> tuple[str, str, str]:
+def expected_speaker_of(item: dict[str, Any]) -> str:
+    """The speaker a probe pins its answer to. Optional - never invented.
+
+    Probe files may carry "expected_speaker" or "expected_speaker_label" (the label
+    as written in the transcript). A probe with neither simply never gets an
+    attribution grade, so adding this field cannot change an existing set's numbers.
+    """
+    for key in ("expected_speaker", "expected_speaker_label", "speaker"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def attribution_applicable(item: dict[str, Any]) -> bool:
+    return bool(expected_speaker_of(item)) and not is_unanswerable(item)
+
+
+def attribution_prompt_for(item: dict[str, Any], answer: str) -> str:
+    return ATTRIBUTION_PROMPT.format(
+        question=item.get("question") or "",
+        expected_answer=item.get("expected_answer") or "",
+        expected_speaker=expected_speaker_of(item) or "(not identified)",
+        evidence=item.get("evidence") or "",
+        answer=answer,
+    )
+
+
+def parse_attribution(text: str | None, *, prefer_last: bool = False) -> str | None:
+    """Pull ``{"attribution": "right|wrong|na"}`` out of a judge reply."""
+    if not text:
+        return None
+    candidate = text.strip()
+    fenced = _FENCE.search(candidate)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    obj = last_json_object(candidate) if prefer_last else first_json_object(candidate)
+    if obj is None:
+        return None
+    value = str(obj.get("attribution", "")).strip().lower()
+    return value if value in ATTRIBUTION_VALUES else None
+
+
+def judge_attribution(ops: Ops, item: dict[str, Any], answer: str, judge_key: str) -> str:
+    """One attribution call. Raises JudgeTruncated on a truncated reply so the
+    caller records attribution_error instead of a silent "na"."""
+    content, reasoning, finish_reason = judge_reply(
+        ops, attribution_prompt_for(item, answer), judge_key
+    )
+    verdict = parse_attribution(content)
+    if verdict is not None:
+        return verdict
+    if finish_reason == "length":
+        raise JudgeTruncated(f"attribution reply truncated at max_tokens={JUDGE_MAX_TOKENS}")
+    verdict = parse_attribution(reasoning, prefer_last=True)
+    if verdict is not None:
+        return verdict
+    raise RuntimeError("attribution judge reply unparsable")
+
+
+def judge_reply(
+    ops: Ops, prompt: str, judge_key: str, model: str | None = None
+) -> tuple[str, str, str]:
     """One judge call. Returns (message.content, message.reasoning_content,
-    choices[0].finish_reason). Transport and HTTP problems raise."""
+    choices[0].finish_reason). Transport and HTTP problems raise.
+
+    ``model`` overrides the judge for a cross-check (finding F6: the answerer and
+    the judge are the same model family). The payload is otherwise identical, so a
+    second-judge number is comparable to the primary one.
+    """
     payload = {
-        "model": JUDGE_MODEL,
+        "model": model or JUDGE_MODEL,
         "temperature": 0,
         "max_tokens": JUDGE_MAX_TOKENS,
         "stream": False,
@@ -813,7 +964,10 @@ def judge_reply(ops: Ops, prompt: str, judge_key: str) -> tuple[str, str, str]:
     )
 
 
-def judge_answer(ops: Ops, item: dict[str, Any], answer: str, judge_key: str) -> dict[str, str]:
+def judge_answer(
+    ops: Ops, item: dict[str, Any], answer: str, judge_key: str,
+    model: str | None = None,
+) -> dict[str, str]:
     """Grade one answer against the item's evidence.
 
     The verdict normally sits in message.content. If it is missing and the call
@@ -821,7 +975,9 @@ def judge_answer(ops: Ops, item: dict[str, Any], answer: str, judge_key: str) ->
     is where a reasoning model puts it. Raises JudgeTruncated when the token
     budget was the problem, RuntimeError when the reply is simply unusable.
     """
-    content, reasoning, finish_reason = judge_reply(ops, judge_prompt_for(item, answer), judge_key)
+    content, reasoning, finish_reason = judge_reply(
+        ops, judge_prompt_for(item, answer), judge_key, model
+    )
     verdict = parse_verdict(content)
     if verdict is not None:
         return verdict
@@ -848,6 +1004,156 @@ def is_unanswerable(item: dict[str, Any]) -> bool:
     return expected == "" or bool(UNANSWERABLE.search(expected))
 
 
+# ── retrieval recall ───────────────────────────────────────────────────────
+# The harness could only see the ANSWER, so a retrieval failure and a synthesis
+# failure looked identical (adversarial review, "build an instrument that can see
+# retrieval"). This asks LightRAG for the context it WOULD pass, and checks
+# whether the probe's gold evidence is in it - no judge involved.
+
+RECALL_VALUES = ("hit", "miss", "na")
+
+# Every field below is copied from a call this repo already makes against LightRAG
+# 1.5.7 (app/api.py build_ollama_bridge_query_payload and the /query path near
+# line 1290): query, mode, response_type, only_need_context, only_need_prompt,
+# stream, include_references, include_chunk_content. Nothing is invented.
+# No top_k / chunk_top_k / max_*_tokens here on purpose: those come from the
+# container env the arm itself set, so the metric measures the stack as
+# configured rather than numbers this script made up. enable_rerank is likewise
+# left out so LightRAG's own RERANK_BY_DEFAULT applies.
+def recall_probe_payload(question: str, mode: str = "mix") -> dict[str, Any]:
+    return {
+        "query": question,
+        "mode": mode,
+        "response_type": "Multiple Paragraphs",
+        "only_need_context": True,
+        "only_need_prompt": False,
+        "stream": False,
+        "include_references": True,
+        "include_chunk_content": True,
+    }
+
+
+# Keys whose values are the request echoed back, not retrieved material: matching
+# them would score a hit for the question itself.
+_RECALL_ECHO_KEYS = frozenset({
+    "query", "question", "mode", "response_type", "model", "status", "message",
+    "only_need_context", "only_need_prompt", "stream", "include_references",
+    "include_chunk_content",
+})
+
+
+def context_strings(payload: Any, *, skip: str = "") -> list[str]:
+    """Every string the query response carries, at any depth, minus request echoes.
+
+    What only_need_context returns is not documented in this repo, so the
+    extractor refuses to guess an envelope: it walks the JSON and returns every
+    string. That is a superset of the context and the chunk content, so a "hit"
+    always means the gold text really was somewhere in what the stack returned.
+    """
+    found: list[str] = []
+
+    def walk(node: Any, key: str | None) -> None:
+        if isinstance(node, str):
+            if key in _RECALL_ECHO_KEYS:
+                return
+            if node and node != skip:
+                found.append(node)
+        elif isinstance(node, list):
+            for entry in node:
+                walk(entry, key)
+        elif isinstance(node, dict):
+            for name, value in node.items():
+                walk(value, str(name))
+
+    walk(payload, None)
+    return found
+
+
+def _normalise_quote(text: Any) -> str:
+    normalised = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    return normalised.strip('"\u2018\u2019\u201c\u201d\'` ')
+
+
+def gold_evidence_of(item: dict[str, Any]) -> list[str]:
+    """Strings that would prove the gold evidence was retrieved. Optional in probes.
+
+    Accepts "evidence" (the quote the judge already uses) and turn identifiers
+    ("evidence_turn", "turn_id", "evidence_ids"), as a string or a list. A probe
+    with none of them is not counted, rather than scored as a miss.
+    """
+    values: list[str] = []
+    for key in ("evidence", "evidence_turn", "turn_id", "evidence_ids", "gold_span"):
+        raw = item.get(key)
+        if isinstance(raw, str):
+            values.append(raw)
+        elif isinstance(raw, (list, tuple)):
+            values.extend(str(entry) for entry in raw)
+    return [value for value in (_normalise_quote(value) for value in values) if len(value) >= 4]
+
+
+def evidence_in_context(item: dict[str, Any], payload: Any, *, question: str = "") -> str:
+    """hit / miss / na for one probe: is its gold evidence in the returned context?"""
+    gold = gold_evidence_of(item)
+    if not gold:
+        return "na"
+    haystack = _normalise_quote(" \n ".join(context_strings(payload, skip=question)))
+    if not haystack:
+        return "miss"
+    return "hit" if any(needle in haystack for needle in gold) else "miss"
+
+
+# ── paired statistics ──────────────────────────────────────────────────────
+# One draw per probe on 40 questions cannot resolve the differences being chased
+# (finding F25). Draws give a per-probe mean, and the comparison between two named
+# arms is paired per probe with a cluster bootstrap over probes.
+
+def mean_of(values: Sequence[float]) -> float:
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
+def paired_bootstrap_difference(
+    a: dict[str, float],
+    b: dict[str, float],
+    *,
+    samples: int = 2000,
+    seed: int = 0,
+    confidence: float = 0.95,
+) -> dict[str, Any]:
+    """Paired mean difference (a - b) with a bootstrap CI, resampled by PROBE.
+
+    Probes are the cluster: each probe contributes one paired value (its mean
+    across draws), and the bootstrap resamples probes with replacement. The seed is
+    fixed so the same two arms always produce the same interval - an interval that
+    moves between readings of the same data is not evidence.
+    """
+    shared = sorted(set(a) & set(b))
+    if not shared:
+        return {"n": 0, "mean_a": 0.0, "mean_b": 0.0, "difference": 0.0,
+                "ci_low": 0.0, "ci_high": 0.0, "excludes_zero": False, "only_in_a": 0,
+                "only_in_b": 0}
+    diffs = [float(a[key]) - float(b[key]) for key in shared]
+    observed = mean_of(diffs)
+    generator = random.Random(seed)
+    means: list[float] = []
+    for _ in range(max(1, int(samples))):
+        means.append(mean_of([diffs[generator.randrange(len(diffs))] for _ in diffs]))
+    means.sort()
+    tail = (1.0 - confidence) / 2.0
+    low = means[max(0, int(tail * len(means)) - (1 if tail * len(means) < 1 else 0))]
+    high = means[min(len(means) - 1, int((1.0 - tail) * len(means)))]
+    return {
+        "n": len(shared),
+        "mean_a": mean_of([float(a[key]) for key in shared]),
+        "mean_b": mean_of([float(b[key]) for key in shared]),
+        "difference": round(observed, 4),
+        "ci_low": round(low, 4),
+        "ci_high": round(high, 4),
+        "excludes_zero": not (low <= 0.0 <= high),
+        "only_in_a": len(set(a) - set(b)),
+        "only_in_b": len(set(b) - set(a)),
+    }
+
+
 def percentile(values: list[float], fraction: float) -> float:
     if not values:
         return 0.0
@@ -858,9 +1164,20 @@ def percentile(values: list[float], fraction: float) -> float:
     return float(ordered[min(rank - 1, len(ordered) - 1)])
 
 
-def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[float]) -> dict[str, Any]:
+def score_set(
+    items: list[dict[str, Any]],
+    verdicts: list[str],
+    latencies: list[float],
+    extra: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Percentage maths for one probe set. judge_error, no_answer and any
-    unrecognised verdict are excluded from the rates and reported separately."""
+    unrecognised verdict are excluded from the rates and reported separately.
+
+    ``extra`` carries the per-row non-verdict measurements that came out of the same
+    pass - ``attribution`` (finding F4) and ``recall`` (the retrieval metric). It is
+    optional so a summary written before those keys existed still scores, and a
+    caller can re-score an old verdicts file unchanged.
+    """
     judge_errors = sum(1 for verdict in verdicts if verdict == JUDGE_ERROR)
     no_answers = sum(1 for verdict in verdicts if verdict == NO_ANSWER)
     unknown_verdicts = sum(
@@ -870,6 +1187,7 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
     pairs = [
         (item, verdict) for item, verdict in zip(items, verdicts) if verdict in VERDICT_VALUES
     ]
+    rows_extra = list(extra) if extra is not None else [{} for _ in items]
     total = len(pairs)
 
     counts: dict[str, int] = {value: 0 for value in VERDICT_VALUES}
@@ -894,9 +1212,48 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
         ) if bucket["n"] else 0.0
 
     unanswerable = [(item, verdict) for item, verdict in pairs if is_unanswerable(item)]
+    answerable = [(item, verdict) for item, verdict in pairs if not is_unanswerable(item)]
     refusal_accuracy = round(
         100.0 * sum(1 for _, verdict in unanswerable if verdict == "refused_ok") / len(unanswerable), 2
     ) if unanswerable else None
+
+    def rate(numerator: int, denominator: int) -> float:
+        return round(100.0 * numerator / denominator, 2) if denominator else 0.0
+
+    # Finding F7: ok% counted a correct refusal as accuracy, so a system that
+    # refuses more looked better. Both halves are now reported on their own terms:
+    # accuracy over answerable probes, refusal rate over unanswerable ones.
+    answerable_correct = sum(1 for _, verdict in answerable if verdict == "correct")
+    answerable_partial = sum(1 for _, verdict in answerable if verdict == "partial")
+
+    attribution_counts = {value: 0 for value in ATTRIBUTION_VALUES}
+    attribution_errors = 0
+    for index, (item, verdict) in enumerate(pairs):
+        row = rows_extra[index] if index < len(rows_extra) else {}
+        value = row.get("attribution")
+        if value in attribution_counts:
+            attribution_counts[value] += 1
+        elif value == ATTRIBUTION_ERROR:
+            attribution_errors += 1
+    attribution_n = sum(attribution_counts[value] for value in ("right", "wrong"))
+
+    recall_hits = sum(1 for index in range(len(pairs))
+                      if (rows_extra[index] if index < len(rows_extra) else {}).get("recall") == "hit")
+    recall_misses = sum(1 for index in range(len(pairs))
+                        if (rows_extra[index] if index < len(rows_extra) else {}).get("recall") == "miss")
+    recall_n = recall_hits + recall_misses
+
+    # Second judge (finding F6): the same model family grades its own answers.
+    # Agreement is measured only where both judges graded the same row.
+    second_judge_n = 0
+    second_judge_agree = 0
+    for index, (item, verdict) in enumerate(pairs):
+        row = rows_extra[index] if index < len(rows_extra) else {}
+        other = row.get("second_verdict")
+        if other in VERDICT_VALUES:
+            second_judge_n += 1
+            if other == verdict:
+                second_judge_agree += 1
 
     return {
         "n": len(verdicts),
@@ -907,8 +1264,15 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
         "counts": counts,
         "correct_pct": pct(counts["correct"]),
         # ok% also counts a correct refusal, so refusing an unanswerable probe
-        # correctly is no longer scored below answering it wrongly.
+        # correctly is no longer scored below answering it wrongly. Kept for
+        # comparability with older run summaries; accuracy_pct is the honest one.
         "ok_pct": pct(counts["correct"] + counts["refused_ok"]),
+        "answerable_n": len(answerable),
+        "answerable_correct_pct": rate(answerable_correct, len(answerable)),
+        "answerable_partial_credit_pct": (
+            round(100.0 * (answerable_correct + 0.5 * answerable_partial) / len(answerable), 2)
+            if answerable else 0.0
+        ),
         "partial_credit_pct": round(100.0 * (counts["correct"] + 0.5 * counts["partial"]) / total, 2) if total else 0.0,
         "ok_partial_credit_pct": round(
             100.0 * (counts["correct"] + counts["refused_ok"] + 0.5 * counts["partial"]) / total, 2
@@ -918,6 +1282,21 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
         "refused_wrong": counts["refused_wrong"],
         "refusal_accuracy_pct": refusal_accuracy,
         "unanswerable_n": len(unanswerable),
+        # Same number as refusal_accuracy_pct, under a name that says what it is:
+        # how often an unanswerable probe was refused. Kept separate so a table
+        # reader never mistakes it for accuracy on answerable questions (F7).
+        "unanswerable_refused_pct": refusal_accuracy,
+        "attribution_n": attribution_n,
+        "attribution_right": attribution_counts["right"],
+        "attribution_wrong": attribution_counts["wrong"],
+        "attribution_na": attribution_counts["na"],
+        "attribution_errors": attribution_errors,
+        "attribution_right_pct": rate(attribution_counts["right"], attribution_n),
+        "attribution_wrong_pct": rate(attribution_counts["wrong"], attribution_n),
+        "evidence_n": recall_n,
+        "evidence_in_context_pct": rate(recall_hits, recall_n),
+        "second_judge_n": second_judge_n,
+        "second_judge_agreement_pct": rate(second_judge_agree, second_judge_n),
         "by_type": by_type,
         "latency_p50": round(percentile(latencies, 0.50), 2),
         "latency_p95": round(percentile(latencies, 0.95), 2),
@@ -926,9 +1305,10 @@ def score_set(items: list[dict[str, Any]], verdicts: list[str], latencies: list[
 
 RESULTS_TABLE_HEADER = (
     "| experiment | status | dev correct% | dev ok% | dev correct+0.5*partial% | heldout correct% "
-    "| heldout ok% | heldout correct+0.5*partial% | heldout halluc% | refusal acc% | p50 s | p95 s "
+    "| heldout ok% | heldout answerable% | heldout correct+0.5*partial% | heldout halluc% "
+    "| refusal acc% | evidence in context% | attrib right% | attrib wrong% | p50 s | p95 s "
     "| judge errors |\n"
-    "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
 )
 
 
@@ -941,7 +1321,14 @@ def results_row(
     p95: float,
 ) -> str:
     """One markdown row. Shared by results.md and results-rejudged.md so the two
-    tables stay comparable."""
+    tables stay comparable.
+
+    The columns separate what used to be mixed together: "heldout answerable%" is
+    accuracy over answerable probes only, "refusal acc%" is the refusal rate over
+    unanswerable ones (so refusing more cannot raise accuracy - finding F7), and
+    "evidence in context%" is retrieval rather than answer quality. A summary
+    written before those keys existed renders as n/a rather than 0.
+    """
     judge_errors = int(dev.get("judge_errors", 0)) + int(heldout.get("judge_errors", 0))
     refusal = heldout.get("refusal_accuracy_pct")
 
@@ -950,7 +1337,10 @@ def results_row(
         value = mapping.get(key)
         return value if isinstance(value, (int, float)) else "n/a"
 
-    return "| {name} | {status} | {dc} | {dok} | {dp} | {hc} | {hok} | {hp} | {hh} | {ra} | {p50} | {p95} | {je} |\n".format(
+    return (
+        "| {name} | {status} | {dc} | {dok} | {dp} | {hc} | {hok} | {hacc} | {hp} | {hh} "
+        "| {ra} | {recall} | {ar} | {aw} | {p50} | {p95} | {je} |\n"
+    ).format(
         name=name,
         status=status,
         dc=dev.get("correct_pct", 0.0),
@@ -958,9 +1348,13 @@ def results_row(
         dp=dev.get("partial_credit_pct", 0.0),
         hc=heldout.get("correct_pct", 0.0),
         hok=cell(heldout, "ok_pct"),
+        hacc=cell(heldout, "answerable_correct_pct"),
         hp=heldout.get("partial_credit_pct", 0.0),
         hh=heldout.get("hallucination_pct", 0.0),
         ra=refusal if refusal is not None else "n/a",
+        recall=cell(heldout, "evidence_in_context_pct"),
+        ar=cell(heldout, "attribution_right_pct"),
+        aw=cell(heldout, "attribution_wrong_pct"),
         p50=p50,
         p95=p95,
         je=judge_errors,
@@ -1170,6 +1564,8 @@ class DryRunOps(Ops):
             return 200, {"track_id": "dryrun-track", "documents": [
                 {"id": "doc-1", "status": "processed", "file_path": "dryrun.txt", "chunks_count": 1},
             ], "total_count": 1, "status_summary": {"processed": 1}}
+        if url.endswith("/query"):
+            return 200, {"status": "success", "result": "[dry-run] simulated retrieved context"}
         if url.endswith("/v1/models"):
             return 200, {"data": [{"id": JUDGE_MODEL}]}
         if url.endswith("/api/chat"):
@@ -1206,6 +1602,12 @@ class Loop:
         target: Target | None = None,
         handle_signals: bool = True,
         print_fn: Callable[[str], None] | None = None,
+        draws: int = 1,
+        second_judge_model: str | None = None,
+        second_judge_fraction: float = 0.2,
+        retrieval_recall: bool = True,
+        recall_mode: str = "mix",
+        compare_arms: tuple[str, str] | None = None,
     ) -> None:
         self.root = Path(root)
         self.out = Path(out)
@@ -1243,6 +1645,17 @@ class Loop:
         self.judge_truncated = 0
         self.gateway_touched = False
         self.plan: list[str] = []
+        # One draw per probe cannot resolve the differences being chased (finding
+        # F25): draws give a per-probe mean, and --compare turns two arms into a
+        # paired difference with a bootstrap interval.
+        self.draws = max(1, int(draws))
+        self.second_judge_model = second_judge_model or None
+        self.second_judge_fraction = min(1.0, max(0.0, float(second_judge_fraction)))
+        self.retrieval_recall = bool(retrieval_recall)
+        self.recall_mode = str(recall_mode or "mix")
+        # Per-arm override from the experiments file ("recall_mode": "naive").
+        self.recall_mode_override: str | None = None
+        self.compare_arms = compare_arms
 
     # ── logging, heartbeat, state ──────────────────────────────────────────
 
@@ -1640,11 +2053,19 @@ class Loop:
             if prepared.applied:
                 self.log(
                     f"transcript_prep {doc_label}: {prepared.headers_inserted} headers, "
-                    f"{prepared.turns} turns, {len(prepared.speakers)} speakers"
+                    f"{prepared.turns} turns, {len(prepared.speakers)} speakers, "
+                    f"labels parsed {prepared.labels_parsed}/{prepared.lines_nonempty} lines, "
+                    f"rejected {prepared.labels_rejected} (unparseable "
+                    f"{prepared.labels_unparseable})"
                 )
                 text = prepared.text
             else:
-                self.log(f"transcript_prep {doc_label}: skipped ({prepared.reason})")
+                self.log(
+                    f"transcript_prep {doc_label}: skipped ({prepared.reason}); "
+                    f"labels parsed {prepared.labels_parsed}/{prepared.lines_nonempty} lines, "
+                    f"rejected {prepared.labels_rejected} (unparseable "
+                    f"{prepared.labels_unparseable})"
+                )
         payload: dict[str, Any] = {"text": text, "file_source": str(path)}
         if chunking:
             # Experiment-level key "chunking": a per-request chunker for LightRAG
@@ -1743,35 +2164,83 @@ class Loop:
             raise RuntimeError("/api/chat response has no message.content")
         return str(answer), latency
 
+    def _ask_for_recall(self, item: dict[str, Any]) -> Any:
+        """Ask LightRAG for the context it WOULD pass, and return the raw response.
+
+        Sent straight to the LightRAG this run points at, with only_need_context set,
+        so the answer step cannot colour it. top_k, chunk_top_k and the token budgets
+        are deliberately absent: the container env the arm itself set decides them, so
+        the metric measures the stack as configured (see recall_probe_payload).
+        """
+        question = str(item.get("question") or "")
+        mode = str(item.get("_recall_mode") or self.recall_mode)
+        status, body = self.ops.http_json(
+            "POST", f"{self.t.lightrag_url}/query",
+            headers=self._lightrag_headers(),
+            payload=recall_probe_payload(question, mode),
+            timeout=PROBE_TIMEOUT,
+        )
+        if status >= 400:
+            raise RuntimeError(f"LightRAG /query returned HTTP {status}")
+        return body
+
+    def _recall_for(self, item: dict[str, Any]) -> str:
+        """hit/miss/na for one probe. A stack that will not answer is na, not miss."""
+        if not gold_evidence_of(item):
+            return "na"
+        try:
+            body = self._attempt(
+                lambda: self._ask_for_recall(item), what=f"recall {item.get('id')}", attempts=2
+            )
+        except (StepError, RuntimeError, OSError) as exc:
+            self.log(f"recall probe {item.get('id')}: unavailable ({exc})")
+            return "na"
+        return evidence_in_context(item, body, question=str(item.get("question") or ""))
+
     def _run_set(self, items: list[dict[str, Any]], concurrency: int) -> list[dict[str, Any]]:
-        results: list[dict[str, Any] | None] = [None] * len(items)
+        """Ask every probe ``draws`` times, tagging each row with its draw.
+
+        One draw per probe is what made the old comparisons unable to resolve a
+        10-point difference (finding F25): a repeat is what makes a per-probe mean
+        and a paired test possible. Recall is measured next to the answer, in the
+        same thread, against the same stack state.
+        """
+        jobs = [(index, draw) for index in range(len(items)) for draw in range(1, self.draws + 1)]
+        results: list[dict[str, Any] | None] = [None] * len(jobs)
         cursor = [0]
         lock = threading.Lock()
 
         def worker_thread() -> None:
             while True:
                 with lock:
-                    index = cursor[0]
-                    if index >= len(items):
+                    slot = cursor[0]
+                    if slot >= len(jobs):
                         return
                     cursor[0] += 1
+                index, draw = jobs[slot]
                 item = items[index]
                 row = {
                     "id": item.get("id"),
                     "type": item.get("type"),
                     "question": item.get("question"),
+                    "item_index": index,
+                    "draw": draw,
                     "answer": "",
                     "latency": 0.0,
                     "error": None,
+                    "recall": "na",
                 }
                 try:
                     answer, latency = self._attempt(
-                        lambda: self._ask(item), what=f"probe {item.get('id')}", attempts=2
+                        lambda: self._ask(item), what=f"probe {item.get('id')} draw {draw}",
+                        attempts=2,
                     )
                     row["answer"], row["latency"] = answer, latency
                 except StepError as exc:
                     row["error"] = str(exc)
-                results[index] = row
+                if self.retrieval_recall and not self.dry_run:
+                    row["recall"] = self._recall_for(item)
+                results[slot] = row
                 self.heartbeat()
 
         threads = [threading.Thread(target=worker_thread) for _ in range(max(1, int(concurrency)))]
@@ -1781,16 +2250,86 @@ class Loop:
             thread.join()
         return [row for row in results if row is not None]
 
+    def _probe_scores(self, items: list[dict[str, Any]], rows: list[dict[str, Any]],
+                      verdicts: list[str]) -> dict[str, float]:
+        """Per-probe mean correctness across draws - the unit a paired test uses.
+
+        1.0 correct, 0.5 partial, 0 for anything else. judge_error and no_answer
+        draws are skipped rather than scored 0, so a flaky judge cannot manufacture
+        a difference between arms.
+        """
+        totals: dict[str, list[float]] = {}
+        for row, verdict in zip(rows, verdicts):
+            if verdict not in VERDICT_VALUES:
+                continue
+            score = {"correct": 1.0, "partial": 0.5}.get(verdict, 0.0)
+            totals.setdefault(str(row.get("id")), []).append(score)
+        return {key: mean_of(values) for key, values in totals.items()}
+
     # ── step 5: judge ──────────────────────────────────────────────────────
 
     def _judge_one(self, item: dict[str, Any], answer: str) -> dict[str, str]:
         return judge_answer(self.ops, item, answer, self.judge_key)
 
-    def _judge_set(self, items: list[dict[str, Any]], results: list[dict[str, Any]]) -> list[str]:
+    def _sampled_for_second_judge(self, item: dict[str, Any], draw: int) -> bool:
+        """Deterministic sample of rows for the cross-check judge (F6).
+
+        Seeded by probe id and draw, so re-running the same run picks the same rows
+        and the agreement number means the same thing twice.
+        """
+        if not self.second_judge_model or self.second_judge_fraction <= 0.0:
+            return False
+        if self.second_judge_fraction >= 1.0:
+            return True
+        seed = f"{item.get('id')}|{draw}"
+        return random.Random(seed).random() < self.second_judge_fraction
+
+    def _attribution_for(self, item: dict[str, Any], answer: str, verdict: str) -> str:
+        """The separate attribution grade (F4). Never changes the content verdict."""
+        if verdict in (NO_ANSWER, JUDGE_ERROR) or not attribution_applicable(item):
+            return "na"
+        try:
+            return self._attempt(
+                lambda: judge_attribution(self.ops, item, answer, self.judge_key),
+                what=f"attribution {item.get('id')}", attempts=2,
+            )
+        except JudgeTruncated:
+            self.judge_truncated += 1
+            return ATTRIBUTION_ERROR
+        except (StepError, RuntimeError, OSError):
+            return ATTRIBUTION_ERROR
+
+    def _second_judge_for(self, item: dict[str, Any], answer: str) -> str:
+        try:
+            return self._attempt(
+                lambda: judge_answer(self.ops, item, answer, self.judge_key,
+                                     self.second_judge_model)["verdict"],
+                what=f"second judge {item.get('id')}", attempts=2,
+            )
+        except JudgeTruncated:
+            self.judge_truncated += 1
+            return JUDGE_ERROR
+        except (StepError, RuntimeError, OSError):
+            return JUDGE_ERROR
+
+    def _judge_set(
+        self, items: list[dict[str, Any]], results: list[dict[str, Any]]
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Grade every row. Returns (verdicts, extras) aligned with ``results``.
+
+        ``extras`` carries the measurements that are not the content verdict:
+        the attribution grade (F4), the retrieval check recorded while answering,
+        and the second judge's verdict where a cross-check was sampled (F6).
+        """
         verdicts: list[str] = []
-        for item, row in zip(items, results):
+        extras: list[dict[str, Any]] = []
+        for row in results:
+            item = items[int(row.get("item_index", 0))]
+            extra: dict[str, Any] = {"draw": row.get("draw", 1), "recall": row.get("recall", "na")}
             if row.get("error"):
                 verdicts.append(JUDGE_ERROR)
+                extra["attribution"] = "na"
+                extras.append(extra)
                 continue
             try:
                 verdict = self._attempt(
@@ -1804,7 +2343,19 @@ class Loop:
                 verdicts.append(JUDGE_ERROR)
             except StepError:
                 verdicts.append(JUDGE_ERROR)
-        return verdicts
+            extra["attribution"] = self._attribution_for(
+                item, str(row.get("answer") or ""), verdicts[-1]
+            )
+            if self._sampled_for_second_judge(item, int(row.get("draw", 1))):
+                extra["second_verdict"] = self._second_judge_for(
+                    item, str(row.get("answer") or "")
+                )
+            extras.append(extra)
+        return verdicts, extras
+
+    def _repeated_items(self, items: list[dict[str, Any]], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The probe list expanded to one entry per row, so score_set() stays aligned."""
+        return [items[int(row.get("item_index", 0))] for row in rows]
 
     # ── step 6: record ─────────────────────────────────────────────────────
 
@@ -1824,16 +2375,24 @@ class Loop:
         items: list[dict[str, Any]],
         rows: list[dict[str, Any]],
         verdicts: list[str],
+        extras: list[dict[str, Any]] | None = None,
     ) -> None:
         exp_dir = self.out / experiment["name"]
         answers = [
-            {"set": set_name, **{key: row.get(key) for key in ("id", "type", "question", "answer", "latency", "error")}}
+            {"set": set_name,
+             **{key: row.get(key) for key in ("id", "type", "question", "answer", "latency", "error", "draw", "recall")}}
             for row in rows
         ]
-        judged = [
-            {"set": set_name, "id": item.get("id"), "type": item.get("type"), "verdict": verdict}
-            for item, verdict in zip(items, verdicts)
-        ]
+        judged = []
+        for index, (row, verdict) in enumerate(zip(rows, verdicts)):
+            extra = extras[index] if index < len(extras) else {}
+            entry = {"set": set_name, "id": row.get("id"), "type": row.get("type"),
+                     "draw": row.get("draw", 1), "verdict": verdict,
+                     "attribution": extra.get("attribution", "na"),
+                     "recall": extra.get("recall", "na")}
+            if "second_verdict" in extra:
+                entry["second_verdict"] = extra["second_verdict"]
+            judged.append(entry)
         self.ops.append_text(
             exp_dir / "answers.jsonl", "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in answers)
         )
@@ -1843,6 +2402,7 @@ class Loop:
 
     def _run_experiment(self, experiment: dict[str, Any]) -> dict[str, Any]:
         name = experiment["name"]
+        self.recall_mode_override = experiment.get("recall_mode") or None
         self.log(f"{name}: start (reingest={experiment['reingest']}, concurrency={experiment['probe_concurrency']})")
         set_values = self._apply_env(experiment)
         self.save_state()
@@ -1857,23 +2417,43 @@ class Loop:
 
         dev_items = self._load_probe_items(self.dev_probe_file)
         heldout_items = self._load_probe_items(self.heldout_probe_file)
+        if self.recall_mode_override:
+            for item in dev_items + heldout_items:
+                item["_recall_mode"] = self.recall_mode_override
         dev_rows = self._run_set(dev_items, experiment["probe_concurrency"])
         self.judge_truncated = 0
-        dev_verdicts = self._judge_set(dev_items, dev_rows)
-        self._record(experiment, "dev", dev_items, dev_rows, dev_verdicts)
+        dev_verdicts, dev_extras = self._judge_set(dev_items, dev_rows)
+        self._record(experiment, "dev", dev_items, dev_rows, dev_verdicts, dev_extras)
         heldout_rows = self._run_set(heldout_items, experiment["probe_concurrency"])
-        heldout_verdicts = self._judge_set(heldout_items, heldout_rows)
-        self._record(experiment, "heldout", heldout_items, heldout_rows, heldout_verdicts)
+        heldout_verdicts, heldout_extras = self._judge_set(heldout_items, heldout_rows)
+        self._record(experiment, "heldout", heldout_items, heldout_rows, heldout_verdicts,
+                     heldout_extras)
 
         latencies = [row["latency"] for row in dev_rows + heldout_rows if not row.get("error")]
         summary = {
-            "dev": score_set(dev_items, dev_verdicts, [row["latency"] for row in dev_rows]),
-            "heldout": score_set(heldout_items, heldout_verdicts, [row["latency"] for row in heldout_rows]),
+            "dev": score_set(self._repeated_items(dev_items, dev_rows), dev_verdicts,
+                             [row["latency"] for row in dev_rows], dev_extras),
+            "heldout": score_set(self._repeated_items(heldout_items, heldout_rows), heldout_verdicts,
+                                 [row["latency"] for row in heldout_rows], heldout_extras),
             "all_latencies_p50": percentile(latencies, 0.5),
             "all_latencies_p95": percentile(latencies, 0.95),
             "probe_errors": sum(1 for row in dev_rows + heldout_rows if row.get("error")),
             "reingest": experiment["reingest"],
             "env": set_values,
+            # What produced these numbers, so a table row can be compared honestly:
+            # draws per probe, whether retrieval was measured, and which judge
+            # cross-checked what.
+            "draws": self.draws,
+            "retrieval_recall": self.retrieval_recall,
+            "recall_mode": self.recall_mode if self.retrieval_recall else None,
+            "second_judge_model": self.second_judge_model,
+            "second_judge_fraction": self.second_judge_fraction if self.second_judge_model else None,
+            # Per-probe means across draws: the paired unit --compare consumes. Saved
+            # per arm so a comparison can be run after the fact, or on a resumed run.
+            "probe_scores": {
+                "dev": self._probe_scores(dev_items, dev_rows, dev_verdicts),
+                "heldout": self._probe_scores(heldout_items, heldout_rows, heldout_verdicts),
+            },
         }
         self.ops.write_json_atomic(self.out / name / "summary.json", summary)
         if self.judge_truncated:
@@ -1887,11 +2467,16 @@ class Loop:
             "dev_ok_pct": summary["dev"]["ok_pct"],
             "dev_partial_credit_pct": summary["dev"]["partial_credit_pct"],
             "dev_ok_partial_credit_pct": summary["dev"]["ok_partial_credit_pct"],
+            "dev_answerable_correct_pct": summary["dev"]["answerable_correct_pct"],
             "heldout_correct_pct": summary["heldout"]["correct_pct"],
             "heldout_ok_pct": summary["heldout"]["ok_pct"],
             "heldout_partial_credit_pct": summary["heldout"]["partial_credit_pct"],
             "heldout_hallucination_pct": summary["heldout"]["hallucination_pct"],
             "refusal_accuracy_pct": summary["heldout"]["refusal_accuracy_pct"],
+            "heldout_answerable_correct_pct": summary["heldout"]["answerable_correct_pct"],
+            "heldout_evidence_in_context_pct": summary["heldout"]["evidence_in_context_pct"],
+            "heldout_attribution_wrong_pct": summary["heldout"]["attribution_wrong_pct"],
+            "draws": self.draws,
             "latency_p50": summary["all_latencies_p50"],
             "latency_p95": summary["all_latencies_p95"],
             "judge_errors": summary["dev"]["judge_errors"] + summary["heldout"]["judge_errors"],
@@ -2044,8 +2629,85 @@ class Loop:
         finally:
             self._finalise()
             self._write_recommendation()
+            if self.compare_arms:
+                try:
+                    self._report_comparison()
+                except Exception as exc:  # a statistic must never break the run
+                    self.log(f"comparison skipped: {type(exc).__name__}: {exc}")
             self.heartbeat()
         return exit_code
+
+    def _arm_probe_scores(self, name: str) -> dict[str, dict[str, float]] | None:
+        """Read one arm's per-probe scores back out of its summary.json."""
+        try:
+            summary = self.ops.read_json(self.out / name / "summary.json")
+        except (OSError, json.JSONDecodeError):
+            return None
+        scores = summary.get("probe_scores") if isinstance(summary, dict) else None
+        if not isinstance(scores, dict):
+            return None
+        cleaned: dict[str, dict[str, float]] = {}
+        for set_name, mapping in scores.items():
+            if isinstance(mapping, dict):
+                cleaned[str(set_name)] = {str(key): float(value) for key, value in mapping.items()}
+        return cleaned
+
+    def _report_comparison(self) -> None:
+        """Paired difference between the two named arms, appended to results.md.
+
+        One draw of 40 probes cannot resolve the effects being chased (finding F25),
+        so the comparison is paired per probe and carries a bootstrap interval over
+        probes. An interval that covers zero is reported as "not resolved", which is
+        the honest reading of a small probe set.
+        """
+        left, right = self.compare_arms
+        a_scores = self._arm_probe_scores(left)
+        b_scores = self._arm_probe_scores(right)
+        if not a_scores or not b_scores:
+            missing = left if not a_scores else right
+            self.log(f"comparison {left} vs {right}: no probe_scores in {missing}/summary.json")
+            return
+        lines = [
+            "",
+            f"## Paired comparison: {left} vs {right}",
+            "",
+            "| set | probes paired | mean A | mean B | difference | 95% CI | resolved |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        summary: dict[str, Any] = {}
+        for set_name in ("dev", "heldout"):
+            a = a_scores.get(set_name) or {}
+            b = b_scores.get(set_name) or {}
+            stats = paired_bootstrap_difference(a, b)
+            summary[set_name] = stats
+            lines.append(
+                f"| {set_name} | {stats['n']} | {stats['mean_a']} | {stats['mean_b']} "
+                f"| {stats['difference']} | [{stats['ci_low']}, {stats['ci_high']}] "
+                f"| {'yes' if stats['excludes_zero'] else 'not resolved'} |"
+            )
+            if stats["only_in_a"] or stats["only_in_b"]:
+                lines.append(
+                    f"| unpaired | {stats['only_in_a']} only in {left}, "
+                    f"{stats['only_in_b']} only in {right} | | | | | |"
+                )
+        lines += [
+            "",
+            f"Scores are per-probe means across {self.draws} draw(s) "
+            "(correct 1.0, partial 0.5, anything else 0), paired by probe id; the "
+            "interval is a cluster bootstrap over probes with a fixed seed, so the "
+            "same two arms always give the same numbers.",
+            "",
+        ]
+        self.ops.append_text(self.results_path, "\n".join(lines) + "\n")
+        self.state["comparison"] = {"a": left, "b": right, "draws": self.draws, **summary}
+        self.save_state()
+        for set_name, stats in summary.items():
+            self.log(
+                f"comparison {left} vs {right} ({set_name}): difference "
+                f"{stats['difference']:+.4f} over {stats['n']} probes, "
+                f"95% CI [{stats['ci_low']}, {stats['ci_high']}], "
+                f"{'resolved' if stats['excludes_zero'] else 'not resolved'}"
+            )
 
     # ── finalise ───────────────────────────────────────────────────────────
 
@@ -2109,6 +2771,18 @@ class Loop:
             lines.append(f"- best experiment by dev ok+0.5*partial%: **{best_name}** "
                          f"({best.get('dev_ok_partial_credit_pct', best.get('dev_partial_credit_pct'))}%, "
                          f"p95 {best.get('latency_p95')} s)")
+            # The ranking metric still counts a correct refusal, because every older
+            # run's number does. Say plainly what that number is not: accuracy on the
+            # questions that have answers (F7), which is the one that moves when an
+            # arm actually retrieves better.
+            honest = best.get("dev_answerable_correct_pct")
+            refusals = best.get("refusal_accuracy_pct")
+            if isinstance(honest, (int, float)):
+                tail = f"; answerable-only accuracy was {honest}%"
+                if isinstance(refusals, (int, float)):
+                    tail += f" and unanswerable probes were refused {refusals}% of the time"
+                lines.append("- that ranking counts a correct refusal as answered, so read it "
+                             "with the split columns" + tail)
             if diff:
                 lines.append("- recommended env diff (NOT applied — apply by hand if you agree):")
                 lines.extend(f"  - `{key}={value}`" for key, value in sorted(diff.items()))
@@ -2432,6 +3106,36 @@ def main(argv: list[str] | None = None) -> int:
              "requests reingest: true, because that deletes every document in that store before "
              "re-inserting it",
     )
+    parser.add_argument(
+        "--draws", type=int, default=1, metavar="N",
+        help="ask every probe N times per experiment (default 1). One draw over ~40 "
+             "questions resolves about one standard error, which is not enough to adopt "
+             "an arm; draws give a per-probe mean a paired test can use",
+    )
+    parser.add_argument(
+        "--compare", nargs=2, metavar=("ARM_A", "ARM_B"), default=None,
+        help="after the run, report the paired per-probe difference ARM_A - ARM_B with a "
+             "bootstrap 95%% CI in results.md (names must match experiments)",
+    )
+    parser.add_argument(
+        "--second-judge-model", default=None, metavar="MODEL",
+        help="optional cross-check: grade a sample of rows with this model too and report "
+             "agreement with the primary judge (off by default)",
+    )
+    parser.add_argument(
+        "--second-judge-fraction", type=float, default=0.2, metavar="FRACTION",
+        help="share of graded rows the second judge re-grades (default 0.2)",
+    )
+    parser.add_argument(
+        "--no-retrieval-recall", dest="retrieval_recall", action="store_false",
+        help="skip the per-probe check that the gold evidence is in the context LightRAG "
+             "returned (it costs one extra LightRAG query per probe per draw)",
+    )
+    parser.add_argument(
+        "--recall-mode", default="mix",
+        help="LightRAG query mode for the retrieval-recall probe (default mix, the mode the "
+             "production bridge sends)",
+    )
     arguments = parser.parse_args(argv)
 
     root_path = Path(arguments.root).expanduser()
@@ -2502,6 +3206,12 @@ def main(argv: list[str] | None = None) -> int:
         dev_probe_file=dev_probe,
         heldout_probe_file=heldout_probe,
         target=target,
+        draws=arguments.draws,
+        second_judge_model=arguments.second_judge_model,
+        second_judge_fraction=arguments.second_judge_fraction,
+        retrieval_recall=arguments.retrieval_recall,
+        recall_mode=arguments.recall_mode,
+        compare_arms=tuple(arguments.compare) if arguments.compare else None,
     )
     # file names only, never their contents
     loop.log(f"probe files: dev={dev_probe} heldout={heldout_probe}")
@@ -2512,6 +3222,13 @@ def main(argv: list[str] | None = None) -> int:
              f"containers={target.lightrag_container},{target.gateway_container} "
              f"worker={target.worker_container} compose={compose_shown} "
              f"env={target.env_file or (root_path / '.env')}")
+    loop.log(
+        f"measurement: draws={loop.draws} retrieval_recall={loop.retrieval_recall} "
+        f"(mode={loop.recall_mode}) second_judge="
+        f"{loop.second_judge_model or 'off'}"
+        + (f"({loop.second_judge_fraction:g})" if loop.second_judge_model else "")
+        + (f" compare={loop.compare_arms[0]} vs {loop.compare_arms[1]}" if loop.compare_arms else "")
+    )
     for line in build_plan_lines(config):
         loop.log(line)
     if arguments.dry_run:

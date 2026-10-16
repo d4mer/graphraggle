@@ -587,11 +587,25 @@ We shipped (1) on Friday and rolled (2) back on Monday.
     "enumerated list": "(a) first item of the list\n(b) second item of the list\n"
                        "(c) third item of the list\n(d) fourth item of the list\n"
                        "(e) fifth item of the list\n",
-    "stage directions": "(Ana) Hello everyone.\n(laughter)\n(Ben) Nice to see you.\n"
-                        "(silence)\n(Ana) Thanks for coming.\n(laughter)\n",
     "figure reference": "(Fig 3) shows the layout of the deck.\n(Fig 3) is cited twice below.\n"
                         "(Fig 3) again here for the same point.\n(Fig 3) and the notes agree.\n",
+    "parenthetical asides": """Deploy Friday (and then we agreed on the rollback).
+Scope Friday (the plan is unchanged, see the note above).
+Deploy Friday (same as last week, nothing new here).
+Scope Friday (we both said yes to this one).
+""",
 }
+
+# Stage directions are content, not voices. This fixture IS a two-voice recording
+# (Ana speaks twice), so it is now detected - the guarantee is that the directions
+# never become speakers and their words survive.
+STAGE_DIRECTIONS = """(Ana) Hello everyone.
+(laughter)
+(Ben) Nice to see you.
+(silence)
+(Ana) Thanks for coming.
+(laughter)
+"""
 
 
 class TestParenthesisDialect(unittest.TestCase):
@@ -636,7 +650,24 @@ class TestParenthesisDialect(unittest.TestCase):
                 self.assertFalse(result.detected, f"{name}: {result.reason}")
                 self.assertEqual(result.text, text, "byte-identical when unsure")
 
-    def test_a_paren_label_must_head_three_lines_before_it_counts(self):
+    def test_stage_directions_stay_content_even_when_the_file_is_detected(self):
+        """Deliberate change (brief item 2): two repeats of one label now detect.
+
+        The fixture has two real voices, so preparing it is correct; the guarantee
+        that matters is that (laughter)/(silence) never become speakers.
+        """
+        result = prep.prepare_transcript(STAGE_DIRECTIONS, filename="sync.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertEqual(set(result.speakers), {"Ana", "Ben"})
+        for direction in ("laughter", "silence"):
+            self.assertNotIn(direction, [speaker.lower() for speaker in result.speakers])
+            self.assertIn(f"({direction})", result.text, "the direction's words survive")
+        self.assertEqual(result.labels_parsed, 3)
+        self.assertEqual(result.labels_rejected, 3)
+        self.assertEqual(result.labels_unparseable, 0)
+
+    def test_a_paren_label_needs_two_repeats_not_three(self):
+        """F3: the old bar of three discarded real two-voice recordings."""
         text = """(Ann) First point from Ann about the deploy.
 (Bob) Reply to Ann about the same deploy.
 (Ann) Second point from Ann about the freeze.
@@ -644,8 +675,22 @@ class TestParenthesisDialect(unittest.TestCase):
 (Cara) A third voice says something else.
 """
         result = prep.prepare_transcript(text, filename="notes.txt")
-        self.assertFalse(result.detected)
-        self.assertIn("no-recurring-speaker", result.reason)
+        self.assertTrue(result.detected, result.reason)
+        self.assertIn("paren", result.reason)
+        self.assertEqual(result.labels_parsed, 5)
+        self.assertEqual(set(result.speakers), {"Ann", "Bob", "Cara"})
+
+    def test_a_single_recurring_parenthetical_is_still_not_a_transcript(self):
+        """Widening the grammar must not turn a writing habit into speakers."""
+        text = """(ibid) the same source as before.
+(ibid) repeated citation in this note.
+(ibid) once more for the third claim.
+(ibid) and again for the closing line.
+"""
+        result = prep.prepare_transcript(text, filename="notes.txt")
+        self.assertFalse(result.detected, result.reason)
+        self.assertEqual(result.labels_parsed, 0)
+        self.assertEqual(result.labels_rejected, 4)
 
     def test_titles_come_from_the_stem_and_never_invent_a_date(self):
         cases = {
@@ -749,6 +794,191 @@ class TestRealisticTurnShapes(unittest.TestCase):
                 current += prep.estimate_tokens(line)
         gaps.append(current)
         self.assertLessEqual(max(gaps[1:-1]), 2 * cadence, "a header-free stretch survived")
+
+
+
+class TestLabelGrammarCoversTheCorpus(unittest.TestCase):
+    """F3: the parser was narrower than the dialect, so whole documents were skipped."""
+
+    DIALECT = """(Dr. Lee) We need the rollback tested before Friday.
+(Ana, Acme Legal) The contract wording is the only blocker.
+(Ben (Acme Finance)) The numbers are agreed on my side.
+(Speaker 2) I will take the announcement.
+00:12 (Ana) Noted, I will write it tonight.
+7 (Ben) Thursday then, with the freeze after.
+(J. Smith) One correction on the meeting date.
+(Dr. Lee) Good, closing the item now.
+"""
+
+    def test_every_shape_the_corpus_uses_becomes_a_speaker(self):
+        result = prep.prepare_transcript(self.DIALECT, filename="Vendor_ sync_2026-10-13.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertEqual(result.labels_parsed, 8)
+        self.assertEqual(result.labels_unparseable, 0)
+        for name in ("Dr. Lee", "Ana, Acme Legal", "Ben (Acme Finance)", "Speaker 2",
+                     "Ana", "Ben", "J. Smith"):
+            self.assertIn(name, result.speakers, f"{name} was not read as a speaker")
+        self.assertIn("(Dr. Lee) We need the rollback tested before Friday.", result.text)
+        self.assertIn("(Ana, Acme Legal) The contract wording is the only blocker.", result.text)
+        self.assertIn("(Ana) Noted, I will write it tonight.", result.text,
+                      "a timestamp before the label is cue noise: the words stay, the cue goes")
+        self.assertTrue(_subsequence(prep.word_tokens(self.DIALECT), prep.word_tokens(result.text)))
+        self.assertEqual(prep.prepare_transcript(result.text, filename="Vendor_ sync_2026-10-13.txt").text,
+                         result.text, "the widened shape must still be idempotent")
+
+    def test_labels_differing_only_by_a_role_suffix_stay_distinct_people(self):
+        """A fixture whose labels differ only by the role suffix after the comma."""
+        doc = """(Ana Reyes, Acme Legal) The clause needs a carve-out.
+(Ben Ortiz, Acme Legal) Agreed, and the same for the vendor schedule.
+(Ana Reyes, Acme Finance) On my side the numbers are already agreed.
+(Cara Ito, Acme Legal) Then we only need the announcement.
+(Ben Ortiz, Acme Legal) Thursday works for the schedule.
+(Ana Reyes, Acme Legal) Closing it tonight.
+"""
+        result = prep.prepare_transcript(doc, filename="legal-sync.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertEqual(result.labels_unparseable, 0)
+        self.assertEqual(result.labels_parsed, 6)
+        self.assertEqual(set(result.speakers), {"Ana Reyes, Acme Legal", "Ben Ortiz, Acme Legal",
+                                                "Ana Reyes, Acme Finance", "Cara Ito, Acme Legal"})
+        labels = [line.split(")", 1)[0][1:] for line in result.text.splitlines()
+                  if line.startswith("(")]
+        self.assertEqual(set(labels), {"Ana Reyes, Acme Legal", "Ben Ortiz, Acme Legal",
+                                      "Ana Reyes, Acme Finance", "Cara Ito, Acme Legal"},
+                         "labels collapsed onto one speaker or split apart")
+
+    def test_a_timestamp_or_index_before_the_label_is_parsed_not_dropped(self):
+        """The reproduction in F3: anchored parsing rejected '00:12 (Ana) ...'."""
+        for prefix in ("00:12 ", "[00:01:02] ", "7 ", "00:01:02,123 "):
+            with self.subTest(prefix=prefix):
+                doc = (f"{prefix}(Ana) First line here.\n{prefix}(Ben) Second line here.\n"
+                       f"{prefix}(Ana) Third line here.\n{prefix}(Ben) Fourth line here.\n")
+                result = prep.prepare_transcript(doc, filename="sync.txt")
+                self.assertTrue(result.detected, result.reason)
+                self.assertEqual(result.labels_parsed, 4)
+
+    def test_prose_parentheticals_are_still_not_speakers_after_widening(self):
+        for label in ("(and then we agreed)", "(see the note above)", "(e.g. the plan)",
+                      "(Fig. 3)", "(Table 2.)", "(yes)", "(ibid)", "(what did we decide)",
+                      "(a) first", "(1) first"):
+            with self.subTest(label=label):
+                self.assertEqual(prep._classify_paren_label(label[1:-1])[0], None,
+                                 f"{label} became a speaker")
+
+    def test_an_eight_word_label_is_the_limit(self):
+        eight = "von der Leyen Sanchez Gomez de la Cruz"
+        self.assertEqual(prep._classify_paren_label(eight)[1], "ok")
+        self.assertEqual(prep._classify_paren_label(eight + " Moreno")[1], "unparseable",
+                         "nine name-like words is past the label budget")
+        self.assertEqual(prep._classify_paren_label("Ana and Ben")[1], "non-speaker",
+                         "a conjunction inside the brackets is prose, not a name")
+
+
+class TestUnreadableLabelsNeverBorrowSomeoneElsesTurn(unittest.TestCase):
+    """F2: a (Label) line that failed validation was appended to the PREVIOUS
+    speaker's turn, writing the wrong person into every chunk that covers it."""
+
+    def one_line(self, label: str) -> str:
+        return f"({label})"
+
+    def test_an_unreadable_label_stands_as_its_own_turn(self):
+        doc = """(Ana) We ship the bridge change behind a flag.
+(Dr. Lee.) That label has a stray period, so this parser cannot read it.
+(Ben) The rollback path needs a test first.
+(Ana) Noted, I will own the release note.
+(Ben) Thursday then.
+(Ana) Closing tonight.
+"""
+        result = prep.prepare_transcript(doc, filename="sync.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertEqual(result.labels_unparseable, 1)
+        self.assertIn("unparseable(1)", result.reason)
+        blocks = [block for block in result.text.split("\n\n") if block.strip()]
+        offender = [block for block in blocks if "stray period" in block]
+        self.assertEqual(len(offender), 1)
+        self.assertTrue(offender[0].startswith("(Dr. Lee.)"),
+                        "the line must keep its own words, not inherit Ana's label")
+        self.assertNotIn("(Ana) (Dr. Lee.)", result.text)
+        self.assertNotIn("Dr. Lee", result.speakers, "an unreadable label claims no speaker")
+        self.assertTrue(_subsequence(prep.word_tokens(doc), prep.word_tokens(result.text)),
+                        "the label's own words still survive")
+
+    def test_a_file_whose_labels_cannot_be_read_is_left_untouched(self):
+        doc = """(Ana) First line here.
+(Ana/Ben) Two names in one label, unreadable.
+(Dr. Lee.) A stray period, unreadable.
+(Ana, Acme, Legal, Berlin, Europe) Too many parts, unreadable.
+(Ben) Second real line here.
+(Ana) Third line from Ana.
+(Ben) Fourth line, still readable.
+"""
+        result = prep.prepare_transcript(doc, filename="sync.txt")
+        self.assertFalse(result.detected, result.reason)
+        self.assertEqual(result.reason, "unparseable-labels(3)")
+        self.assertEqual(result.text, doc, "byte-identical: the safer failure is doing nothing")
+        self.assertEqual(result.labels_unparseable, 3)
+        self.assertEqual(result.labels_parsed, 4)
+
+    def test_a_couple_of_unreadable_lines_do_not_block_the_whole_file(self):
+        doc = """(Ana) We ship the bridge change behind a flag.
+(Ben) Rollback needs a test first.
+(Ana/Ben) Two names in one label here.
+(Ana) Noted, writing the note tonight.
+(Ben) Thursday then.
+(Ana) Closing tonight.
+"""
+        result = prep.prepare_transcript(doc, filename="sync.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertEqual(result.labels_unparseable, 1)
+        self.assertIn("unparseable(1)", result.reason)
+
+    def test_the_counts_a_skip_is_diagnosed_by_are_on_the_result(self):
+        """F3: 'no-recurring-speaker(2 labels)' explained nothing before."""
+        doc = """(Ana) One labelled line.
+(Ben) Two labelled lines.
+(see above) a parenthetical that is not a speaker.
+(a) an enumerated item.
+(Fig 3) a numbered cross-reference.
+""" + "\n".join(f"Continuation prose line {index} with no label at all."
+                     for index in range(12)) + "\n"
+        result = prep.prepare_transcript(doc, filename="mixed.txt")
+        self.assertFalse(result.detected, result.reason)
+        self.assertEqual(result.labels_parsed, 2)
+        self.assertEqual(result.labels_rejected, 3)
+        self.assertEqual(result.labels_unparseable, 0)
+        self.assertEqual(result.lines_nonempty, 17)
+
+
+class TestPrepCountsReachTheWorkerRow(unittest.TestCase):
+    def test_label_counts_are_recorded_without_any_text_from_the_file(self):
+        text = """(Ana) Ship it behind a flag.
+(Dr. Lee.) Unreadable label here.
+(Ben) Rollback needs a test.
+(Ana) Noted tonight.
+(Ben) Thursday then.
+(Ana) Closing tonight.
+"""
+        with patch.object(worker.settings, "transcript_prep_enabled", True):
+            prepared, updates = worker.prepare_transcript_payload(Path("Transcripts/x/sync.txt"), text)
+        self.assertIn("(Dr. Lee.)", prepared)
+        self.assertEqual(updates["transcript_prep"], "applied")
+        self.assertEqual(updates["transcript_prep_labels_parsed"], 5)
+        self.assertEqual(updates["transcript_prep_labels_unparseable"], 1)
+        self.assertEqual(updates["transcript_prep_lines"], 6)
+        for value in (updates["transcript_prep_labels_parsed"],
+                      updates["transcript_prep_labels_rejected"],
+                      updates["transcript_prep_labels_unparseable"],
+                      updates["transcript_prep_lines"]):
+            self.assertIsInstance(value, int)
+        self.assertNotIn("Ship it behind a flag", json.dumps(updates))
+
+    def test_a_skipped_file_still_reports_its_counts(self):
+        text = "(Ana) one line\n(Ben) two lines\n" + "prose with no label at all here.\n" * 12
+        with patch.object(worker.settings, "transcript_prep_enabled", True):
+            _prepared, updates = worker.prepare_transcript_payload(Path("notes.txt"), text)
+        self.assertEqual(updates["transcript_prep"], "skipped")
+        self.assertEqual(updates["transcript_prep_labels_parsed"], 2)
+        self.assertIsInstance(updates["transcript_prep_lines"], int)
 
 
 

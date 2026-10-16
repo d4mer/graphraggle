@@ -196,6 +196,13 @@ def prepare_transcript_payload(path: Path, text: str) -> tuple[str, dict[str, An
             "transcript_prep_turns": result.turns,
             "transcript_prep_speakers": list(result.speakers),
             "transcript_prep_reason": None,
+            # Counts only, never text: how much of the file the label parser read,
+            # and how much of it it could not. F3 - a skipped document used to be
+            # un-diagnosable from the row alone.
+            "transcript_prep_lines": result.lines_nonempty,
+            "transcript_prep_labels_parsed": result.labels_parsed,
+            "transcript_prep_labels_rejected": result.labels_rejected,
+            "transcript_prep_labels_unparseable": result.labels_unparseable,
         }
     return text, {
         "transcript_prep": "skipped",
@@ -203,6 +210,10 @@ def prepare_transcript_payload(path: Path, text: str) -> tuple[str, dict[str, An
         "transcript_prep_turns": None,
         "transcript_prep_speakers": None,
         "transcript_prep_reason": result.reason,
+        "transcript_prep_lines": result.lines_nonempty,
+        "transcript_prep_labels_parsed": result.labels_parsed,
+        "transcript_prep_labels_rejected": result.labels_rejected,
+        "transcript_prep_labels_unparseable": result.labels_unparseable,
     }
 
 

@@ -14,10 +14,15 @@ Contract
 1. Conservative detection. A document is only touched when it really looks like
    a transcript (speaker-label lines or subtitle cues). Three label shapes are
    recognised: ``Name: text`` / ``Name 0:12`` / ``[00:01:02] Name:`` (colon
-   family) and ``(Label) text`` (the parenthesised family). When unsure, the
-   input is returned unchanged with ``detected=False``. Specs, policies and notes
-   are never altered, and prose parentheses (``(see above)``, ``(1)``,
-   ``(laughter)``) are not mistaken for speakers.
+   family) and ``(Label) text`` (the parenthesised family). The parenthesised
+   family carries the real dialect: initials and titles with periods
+   (``(Dr. Lee)``, ``(J. Smith)``), a comma-separated role or company
+   (``(Ana, Acme Legal)``), one level of nesting (``(Ana (Acme))``), digits inside
+   the label (``(Speaker 2)``), and a timestamp or cue index before the bracket
+   (``00:12 (Ana) text``). When unsure, the input is returned unchanged with
+   ``detected=False``. Specs, policies and notes are never altered, and prose
+   parentheses (``(see above)``, ``(1)``, ``(laughter)``, ``(Fig 3)``,
+   ``(and then we agreed)``) are not mistaken for speakers.
 2. Words are never changed, only placed. A turn keeps the label style the
    document already uses - ``(Ana) text`` stays ``(Ana) text``, ``Alice: text``
    stays ``Alice: text`` - consecutive lines of one speaker are merged (a
@@ -25,6 +30,12 @@ Contract
    carry no words at all (timestamps, subtitle cues, separators) are dropped.
    Original word order and wording are preserved exactly - no summarising, no
    spelling fixes, no normalising of garbled speech-to-text.
+   A line that OPENS with a parenthetical whose label is a known non-speaker
+   marker is content and joins the previous turn; a line whose label is *trying*
+   to be a name and cannot be read is never merged onto someone else's turn - it
+   stands as its own speakerless turn, and if too many lines are like that the
+   whole document is left alone with ``reason="unparseable-labels(n)"``.
+   Guessing a speaker is worse than claiming none.
 3. A one-line context header is re-inserted before every block of roughly
    ``header_every_tokens`` tokens, e.g.
    ``[Meeting: design review | Date: 2026-10-09 | Speakers: Alice Chen, Bob | Part 2/5]``.
@@ -70,12 +81,49 @@ _NAME = r"[^\W\d_][\w'’.\-]*(?:[ \t]+[^\W\d_][\w'’.\-]*){0,2}"
 _TS = r"\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?"
 _OPT_TS = rf"(?:\(?{_TS}\)?)?"
 
-# "(Ana) text" / "(Speaker 1) text" / "(Dr Smith) text" - the shape every real
-# transcript in this corpus uses. The label may carry a trailing number.
-_PAREN_TURN = re.compile(r"^\((?P<name>[^()\n]{1,40})\)[ \t]*(?P<body>.*)$")
-_PAREN_LABEL = re.compile(
-    r"[^\W\d_][\w'’.\-]*(?:[ \t]+(?:[0-9]{1,3}|[^\W\d_][\w'’.\-]*)){0,3}"
-)
+# "(Ana) text" / "(Speaker 1) text" / "(Dr. Lee, Acme Legal) text" - the family
+# every real transcript in this corpus uses. Hermes' shape report (F3) showed it
+# is wider than the original flat regex: a timestamp or cue index before the "(",
+# nested parentheses, initials with periods, a comma-separated role or company,
+# digits inside the label. The line is cut with a balanced-paren scan
+# (:func:`_leading_parenthetical`) so nesting works, and the label is validated by
+# :func:`_classify_paren_label`, which now says WHY a label was refused.
+_PAREN_PREFIX = re.compile(rf"^(?:{_TS}|\[{_TS}\]|[0-9]{{1,4}}[.)]?)[ \t]+")
+_MAX_LABEL_CHARS = 60
+_MAX_LABEL_WORDS = 8
+_MAX_LABEL_PARTS = 4
+_MAX_NESTED_WORDS = 3
+
+# A period inside a speaker label is legitimate only as an initial or as one of
+# these abbreviations. Anywhere else the parenthetical is a sentence, not a name
+# (this is the rule that threw away "(Dr. Lee)" in F2).
+_LABEL_ABBREVIATIONS = frozenset({
+    "dr", "prof", "mr", "mrs", "ms", "rev", "fr", "sr", "jr", "esq", "sen",
+    "rep", "gov", "pres", "ceo", "cto", "cfo", "coo", "vp", "hr", "md", "phd",
+    "eng", "ing", "adv", "atty", "mgr", "lt", "capt", "st", "no", "de",
+})
+
+# Words that make a parenthetical prose rather than a name, checked on every word
+# of every comma-separated part: "(Ana, Acme Legal)" survives, "(and then we
+# agreed)" never becomes a speaker.
+_STOPWORD_LABELS = frozenset({
+    "the", "a", "an", "and", "or", "but", "nor", "of", "for", "to", "in", "on",
+    "at", "by", "with", "without", "within", "we", "you", "they", "it", "its",
+    "this", "that", "these", "those", "is", "are", "was", "were", "be", "been",
+    "being", "he", "she", "his", "her", "their", "there", "here", "ours", "yours",
+    "not", "no", "yes", "if", "so", "as", "from", "who", "what", "when", "where",
+    "why", "how", "about", "into", "over", "under", "before", "after", "because",
+    "then", "than", "while", "during", "per", "vs", "versus", "etc", "see",
+    "continued", "continues", "above", "below", "same", "both", "each", "again",
+    "some", "any", "all", "more", "less", "most", "other", "others",
+})
+
+# "Ana, Acme Legal" - comma-separated parts. A trailing "", "3)" style enum is
+# handled upstream, so the split can be a plain comma.
+_LABEL_SPLIT = re.compile(r",")
+_NESTED_PAREN = re.compile(r"^\((?P<inner>[^()]+)\)$")
+_LABEL_WORD = re.compile(r"[^\W\d_][\w'’.–\-]*|[0-9]{1,4}")
+_CROSSREF_LABEL = re.compile(r"([^()\s]+)(?:[ \t]+([0-9]{1,3}))?[ \t]*\.?")
 
 # Speaker label shapes, tried in order.
 _TURN_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -141,6 +189,12 @@ _CROSSREF_NOUNS = frozenset({
     "items", "point", "points", "part", "parts", "paragraph", "paragraphs",
 })
 
+# F2/F3: when a material share of the paren-shaped label lines cannot be parsed,
+# the parser is not reading this document's dialect. Prepare nothing rather than
+# write half-guessed attribution into every chunk of a real corpus.
+UNPARSEABLE_REFUSE_MIN = 3
+UNPARSEABLE_REFUSE_FRACTION = 0.20
+
 # A date in the file name, ISO-ish. Only the name is read - never the content.
 _DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})"),
@@ -175,6 +229,13 @@ class PrepResult:
     reason: str = "not-checked"
     turns: int = 0
     header_tokens_estimate: int = 0
+    # Detector counts - numbers, never text - so a skipped document says WHY in a
+    # way an operator can act on. F3: "no-recurring-speaker(2 labels)" said
+    # nothing about how many labelled lines the parser had rejected.
+    lines_nonempty: int = 0
+    labels_parsed: int = 0
+    labels_rejected: int = 0      # paren-shaped lines not accepted as a speaker
+    labels_unparseable: int = 0   # ... of which were trying to be a name (F2/F3)
 
     @property
     def applied(self) -> bool:
@@ -214,32 +275,116 @@ def _clean_name(raw: str) -> str | None:
     return name
 
 
-def _clean_paren_label(raw: str) -> str | None:
-    """Validate a ``(Label)`` prefix. Prose parentheses must not become speakers."""
-    label = " ".join(raw.strip().split())
-    if not label or len(label) > 40:
+def _leading_parenthetical(line: str) -> tuple[str, str] | None:
+    """Split a line that OPENS with a balanced parenthetical into ``(inner, rest)``.
+
+    An optional timestamp or cue index may come first ("00:12 (Ana) here"), the
+    shape that made the old anchored regex reject whole documents (F3). A paren
+    that opens mid-sentence is never a candidate, so prose stays prose. Nesting is
+    handled by counting depth, so "(Ana (Acme)) text" yields "Ana (Acme)".
+    """
+    offset = 0
+    prefix = _PAREN_PREFIX.match(line)
+    if prefix:
+        offset = prefix.end()
+    if not line[offset:].startswith("("):
         return None
+    depth = 0
+    for position in range(offset, len(line)):
+        char = line[position]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                rest = line[position + 1:]
+                if rest and not rest[0].isspace():
+                    return None      # "(word)word" is a token, not a label
+                return line[offset + 1:position], rest.strip()
+    return None                      # unbalanced: not our shape
+
+
+def _label_words(part: str) -> list[str]:
+    return _LABEL_WORD.findall(part)
+
+
+def _word_is_name_like(word: str) -> bool:
+    """A label word: letters, optionally an initial or abbreviation ending in a
+    period. A bare number is not name-like on its own (a part may not START with
+    one, which is what keeps "(3)" and "(1st)" out)."""
+    if word.isdigit():
+        return False
+    bare = word.replace("\u2019", "'")
+    if bare.endswith(".") and bare.count(".") > 1:
+        return False                                  # "e.g." / "www."
+    if bare.endswith("."):
+        stem = bare[:-1]
+        return bool(re.fullmatch(r"[^\W\d_][\w'’\-]*", stem)) and (
+            len(stem) <= 2 or stem.lower() in _LABEL_ABBREVIATIONS
+        )
+    return bool(re.fullmatch(r"[^\W\d_][\w'’.\-]*", bare))
+
+
+def _name_like_part(part: str) -> bool:
+    """Letters, and digits only in a non-leading position: "(Speaker 1)" and
+    "(Team 12)" are speakers, "(3)" and "(1st)" are enumerations."""
+    words = _label_words(part)
+    if not words or words[0].isdigit():
+        return False
+    return all(_word_is_name_like(word) or word.isdigit() for word in words)
+
+
+def _classify_paren_label(raw: str) -> tuple[str | None, str]:
+    """Validate a ``(Label)`` prefix, returning ``(label or None, kind)``.
+
+    ``kind`` is ``"ok"``, ``"non-speaker"`` (stage direction, enumeration,
+    numbered cross-reference or prose parenthetical - content, merged as before)
+    or ``"unparseable"`` (it is reaching for a speaker name this parser cannot
+    read). The third kind is what F2 silently glued onto the previous speaker, so
+    it is named, counted and reported instead of merged.
+    """
+    label = " ".join(raw.strip().split())
+    if not label:
+        return None, "non-speaker"
     lowered = label.lower()
     if lowered in _NON_SPEAKER_LABELS or lowered in _NON_SPEAKER_PARENS:
-        return None
-    # "(a) item one", "(1) first", "(i) ": an enumeration, not a name.
-    if len(label) < 2:
-        return None
-    if not re.match(r"[^\W\d_]", label):
-        return None
-    # A sentence, a path, a question or a cross-reference is not a speaker.
-    if any(char in label for char in ("?", ":", ";", ",", "/", "//", "!", "…")):
-        return None
-    if "." in label and not re.fullmatch(r"[^\W\d_][\w'’]?\.", label):
-        return None  # "(e.g. …)" or "(fig. 3)"; allow only an initial like "(J.)"
-    if not _PAREN_LABEL.fullmatch(label):
-        return None
+        return None, "non-speaker"
+    # "(a)", "(1)", "(i)", "(iii)": an enumeration or a bare marker.
+    if len(label) < 2 or not re.match(r"[^\W\d_]", label):
+        return None, "non-speaker"
     # "(Fig 3)", "(Table 2)", "(Note 1)": a numbered cross-reference, which prose
     # repeats often enough to look like a recurring speaker.
-    crossref = re.fullmatch(r"([^()\s]+)(?:[ \t]+([0-9]{1,3}))?", label)
-    if crossref and crossref.group(2) and crossref.group(1).lower() in _CROSSREF_NOUNS:
-        return None
-    return label
+    crossref = _CROSSREF_LABEL.fullmatch(label)
+    if crossref and crossref.group(2) and crossref.group(1).rstrip(".").lower() in _CROSSREF_NOUNS:
+        return None, "non-speaker"
+    if any(char in label for char in ("?", "!", "…", ":", ";", "/", "\\")):
+        return None, "unparseable"
+    if len(label) > _MAX_LABEL_CHARS:
+        return None, "unparseable"
+
+    parts = [part.strip() for part in _LABEL_SPLIT.split(label) if part.strip()]
+    if not parts or len(parts) > _MAX_LABEL_PARTS:
+        return None, "unparseable"
+    total_words = 0
+    for part in parts:
+        words = _label_words(part)
+        if any(word.lower() in _STOPWORD_LABELS for word in words):
+            return None, "non-speaker"          # prose, not a name
+        nested = _NESTED_PAREN.search(part)
+        if nested:
+            inner_words = _label_words(nested.group("inner"))
+            if (not inner_words or len(inner_words) > _MAX_NESTED_WORDS
+                    or any(word.lower() in _STOPWORD_LABELS for word in inner_words)):
+                return None, "unparseable"
+            flattened = _NESTED_PAREN.sub(lambda m: " " + m.group("inner") + " ", part)
+            if not _name_like_part(flattened.strip()):
+                return None, "unparseable"
+        elif not _name_like_part(part):
+            return None, "unparseable"
+        total_words += len(words)
+    if total_words > _MAX_LABEL_WORDS:
+        return None, "unparseable"
+    return label, "ok"
 
 
 def _parse_turn(line: str) -> tuple[str, str, str] | None:
@@ -249,11 +394,12 @@ def _parse_turn(line: str) -> tuple[str, str, str] | None:
     ``Ana: text`` family. The style is remembered so a document is written back
     in the shape it arrived in.
     """
-    match = _PAREN_TURN.match(line.rstrip())
-    if match:
-        name = _clean_paren_label(match.group("name"))
+    candidate = _leading_parenthetical(line.rstrip())
+    if candidate is not None:
+        inner, rest = candidate
+        name, kind = _classify_paren_label(inner)
         if name is not None:
-            return name, (match.group("body") or "").strip(), "paren"
+            return name, rest, "paren"
     for pattern in _TURN_PATTERNS:
         match = pattern.match(line.rstrip())
         if not match:
@@ -422,6 +568,8 @@ def prepare_transcript(
     turns: list[_Turn] = []
     label_lines = 0
     paren_label_lines = 0
+    rejected_labels = 0
+    unparseable_labels = 0
     label_counts: dict[str, int] = {}
     paren_counts: dict[str, int] = {}
     cue_lines = 0
@@ -446,6 +594,19 @@ def prepare_transcript(
             else:
                 turns.append(_Turn(speaker=speaker))
             continue
+        candidate = _leading_parenthetical(line)
+        if candidate is not None:
+            kind = _classify_paren_label(candidate[0])[1]
+            if kind != "ok":
+                rejected_labels += 1      # every paren line that is not a speaker
+            if kind == "unparseable":
+                unparseable_labels += 1
+                # F2. A "(Label)" line whose label this parser cannot read is NOT
+                # a continuation: gluing it onto the previous speaker writes the
+                # wrong person into every chunk that covers it. It stands as its
+                # own turn, word for word, with no speaker claimed.
+                turns.append(_Turn(speaker=None, words=line.split()))
+                continue
         if _is_noise(line):
             continue
         if turns:
@@ -456,19 +617,21 @@ def prepare_transcript(
     subtitle_cues = cue_lines >= 3
     distinct = len(label_counts)
     # The parenthesised family is the one prose can imitate ("(see above)",
-    # "(1) first"), so it has to clear a higher bar: the SAME label must head at
-    # least three lines before the document counts as a transcript. A stray
-    # parenthetical repeated twice is a writing habit, not a speaker.
+    # "(1) first"), so it still has to clear a bar of its own: the SAME label must
+    # head at least two lines. F3 lowered the old bar of three, which threw away
+    # real two-voice recordings, and the label grammar widened to match the corpus.
     render_style = "paren" if paren_label_lines >= max(3, label_lines - paren_label_lines) else "colon"
-    repeat_required = 3 if render_style == "paren" else 2
+    repeat_required = 2
     repeated = any(count >= repeat_required for count in label_counts.values())
     # Detection is deliberately conservative; a document that fails any of these
-    # is handed to LightRAG untouched.
+    # is handed to LightRAG untouched. The density gate is 20% of non-empty lines
+    # (was 30%), which is what lets a transcript with long label-less continuation
+    # paragraphs through.
     labelled_transcript = (
         label_lines >= 3
         and distinct >= 2
         and repeated
-        and label_lines >= 0.30 * nonempty
+        and label_lines >= 0.20 * nonempty
     )
     # One voice, repeated enough to be a recording rather than a labelled list.
     single_voice = (
@@ -482,6 +645,9 @@ def prepare_transcript(
         and (label_lines >= 2 or nonempty >= 6)
     )
     detected = bool(turns) and (labelled_transcript or single_voice or captioned)
+    counts = dict(lines_nonempty=nonempty, labels_parsed=label_lines,
+                  labels_rejected=rejected_labels, labels_unparseable=unparseable_labels)
+    coverage = f"+unparseable({unparseable_labels})" if unparseable_labels else ""
     if not detected:
         reason = "no-speaker-labels"
         if label_lines and distinct < 2:
@@ -492,8 +658,18 @@ def prepare_transcript(
             reason = f"labels-below-threshold({label_lines}/{nonempty})"
         elif cue_lines:
             reason = f"cues-below-threshold({cue_lines}/{nonempty})"
-        return PrepResult(text=text, detected=False, reason=reason, turns=len(turns),
-                          speakers=tuple(label_counts))
+        elif unparseable_labels:
+            reason = f"unparseable-labels({unparseable_labels})"
+        return PrepResult(text=text, detected=False, reason=reason + coverage,
+                          turns=len(turns), speakers=tuple(label_counts), **counts)
+    if (unparseable_labels >= UNPARSEABLE_REFUSE_MIN
+            and unparseable_labels > UNPARSEABLE_REFUSE_FRACTION * (label_lines + unparseable_labels)):
+        # F2/F3: too many label lines this parser cannot read. The dialect is not
+        # understood, so the document is better left exactly as it is than given
+        # headers built on guessed speakers.
+        return PrepResult(text=text, detected=False, turns=len(turns),
+                          speakers=tuple(label_counts),
+                          reason=f"unparseable-labels({unparseable_labels})", **counts)
 
     # Merge consecutive turns of the same speaker (blank lines and intervening
     # noise must not split one person's run of speech).
@@ -544,9 +720,11 @@ def prepare_transcript(
         date=date,
         reason="detected"
         + ("-paren-labels" if render_style == "paren" else "")
-        + ("-subtitle-cues" if subtitle_cues and not any(t.speaker for t in merged) else ""),
+        + ("-subtitle-cues" if subtitle_cues and not any(t.speaker for t in merged) else "")
+        + coverage,
         turns=len(merged),
         header_tokens_estimate=header_tokens,
+        **counts,
     )
 
 

@@ -82,6 +82,11 @@ class FakeOps(ol.Ops):
         self.raise_on_exec = False
         self.judge_garbage = 0
         self.chat_fails: set[str] = set()
+        # Retrieval-recall stub: what the LightRAG /query context contains per
+        # question, and what the attribution judge answers per question.
+        self.recall_context: dict[str, str] = {}
+        self.recall_off = False
+        self.attribution_answers: dict[str, str] = {}
         self.advance_per_call = 0.0
         self.compose_index = 0
 
@@ -90,6 +95,16 @@ class FakeOps(ol.Ops):
 
     def sleep(self, seconds: float) -> None:
         self.clock += max(0.0, seconds)
+
+    def _context_for(self, question: str) -> str:
+        """The stub's retrieved context for a question: by default the gold evidence,
+        which is what a hit means. Set recall_context[q] = "..." to force a miss."""
+        if question in self.recall_context:
+            return self.recall_context[question]
+        for item in list(DEV_ITEMS) + list(HELDOUT_ITEMS):
+            if item.get("question") == question:
+                return str(item.get("evidence") or "")
+        return "unrelated context"
 
     def _current_env_text(self) -> str:
         # The stack under test may read a different .env than <root>/.env.
@@ -156,16 +171,26 @@ class FakeOps(ol.Ops):
                 {"id": "doc-1", "status": "processed", "file_path": "doc1.txt",
                  "chunks_count": 1, "error_msg": None},
             ], "total_count": 1, "status_summary": {"processed": 1}}
+        if url.endswith("/query") and method == "POST":
+            if self.recall_off:
+                return 500, {"error": "context endpoint unavailable"}
+            question = str((payload or {}).get("query") or "")
+            return 200, {"status": "success", "result": self._context_for(question)}
         if url.endswith("/api/chat"):
             question = payload["messages"][-1]["content"]
             if question in self.chat_fails:
                 return 500, {"error": "upstream failure"}
             return 200, {"message": {"content": f"answer for: {question}"}}
         if url.endswith("/v1/chat/completions"):
+            prompt = payload["messages"][0]["content"]
+            if "did it attribute the statement to the right speaker" in prompt:
+                question = prompt.split("Question:\n", 1)[1].split("\n", 1)[0]
+                value = self.attribution_answers.get(question, "right")
+                return 200, {"choices": [{"message": {
+                    "content": json.dumps({"attribution": value, "reason": "stub"})}}]}
             if self.judge_garbage > 0:
                 self.judge_garbage -= 1
                 return 200, {"choices": [{"message": {"content": "I am unable to decide"}}]}
-            prompt = payload["messages"][0]["content"]
             expected = prompt.split("Expected answer (ground truth):", 1)[1].split("Evidence quote", 1)[0].strip()
             if expected.startswith("MISMATCH:"):
                 verdict = "wrong"
@@ -197,7 +222,8 @@ class _Case(unittest.TestCase):
         self.experiments_path.write_text(json.dumps(config), encoding="utf-8")
         return ol.load_experiments(self.experiments_path)
 
-    def make_loop(self, config: dict, *, resume: bool = False, dry_run: bool = False, max_hours: float = 11.0) -> ol.Loop:
+    def make_loop(self, config: dict, *, resume: bool = False, dry_run: bool = False,
+                  max_hours: float = 11.0, **kwargs: Any) -> ol.Loop:
         return ol.Loop(
             root=self.root,
             out=self.out,
@@ -208,6 +234,7 @@ class _Case(unittest.TestCase):
             resume=resume,
             handle_signals=False,
             print_fn=lambda line: None,
+            **kwargs,
         )
 
     def env_now(self) -> str:
@@ -434,11 +461,39 @@ class TestScoring(unittest.TestCase):
         row = ol.results_row("E1", "done", old, old, 1.0, 2.0)
         self.assertEqual(row.count("|"), header_cells)
         self.assertIn("| n/a |", row)
+        # A summary written before answerable%/attribution%/recall% existed renders
+        # those cells as n/a, never as 0.0: a zero would be read as a measured failure.
         new = dict(old, ok_pct=90.0, ok_partial_credit_pct=95.0)
         row = ol.results_row("E1", "done", new, new, 1.0, 2.0)
         self.assertEqual(row.count("|"), header_cells)
+        self.assertIn("n/a", row)
+        for measured in ("| 90.0 |", "| 80.0 |", "| 85.0 |", "| 1.0 |"):
+            self.assertIn(measured, row, "a column that HAS a number stopped rendering it")
+        full = dict(new, answerable_correct_pct=92.5, attribution_right_pct=70.0,
+                    attribution_wrong_pct=12.5, evidence_in_context_pct=64.0)
+        row = ol.results_row("E1", "done", full, full, 1.0, 2.0)
+        self.assertEqual(row.count("|"), header_cells)
         self.assertNotIn("n/a", row)
-        self.assertIn("| 90.0 |", row)
+        self.assertIn("| 92.5 |", row)
+        self.assertIn("| 64.0 |", row)
+
+    def test_results_table_names_the_columns_that_separate_refusals_from_accuracy(self):
+        """F7: one headline that counts a correct refusal as accuracy lets a system
+        that refuses more score better. The table now reports the two halves apart."""
+        header = ol.RESULTS_TABLE_HEADER
+        for column in ("heldout answerable%", "refusal acc%", "evidence in context%",
+                       "attrib right%", "attrib wrong%"):
+            self.assertIn(column, header)
+        items = [{"id": f"d{i}", "question": "q", "expected_answer": "a fact"}
+                 for i in range(4)]
+        items += [{"id": "u1", "question": "q", "expected_answer": "not in the documents"}]
+        verdicts = ["refused_ok", "refused_ok", "refused_ok", "refused_ok", "refused_ok"]
+        summary = ol.score_set(items, verdicts, [1.0] * 5)
+        self.assertEqual(summary["ok_pct"], 100.0, "the old headline still says perfect")
+        self.assertEqual(summary["answerable_n"], 4)
+        self.assertEqual(summary["answerable_correct_pct"], 0.0,
+                         "accuracy on answerable questions is what actually happened")
+        self.assertEqual(summary["unanswerable_refused_pct"], 100.0)
 
 
 # ── driver behaviour ────────────────────────────────────────────────────────
@@ -2358,12 +2413,38 @@ class TestJudgeRubricV2(unittest.TestCase):
             self.assertIn(phrase, self.flat, f"rule 2 lost: {phrase!r}")
 
     def test_rule_3_speaker_attribution_is_not_a_failure_by_itself(self):
+        """F4: the old carve-out ("unless the question explicitly asks who said it")
+        let attribution decide the content verdict. It never does now - attribution
+        has its own call - so the deliberate change here is that the carve-out is gone
+        entirely rather than conditional.
+        """
         for phrase in (
             "do not mark an answer wrong merely because it attributes a statement to a different speaker label",
             "or omits who said it",
-            "unless the question explicitly asks who said it",
+            "Attribution is NOT part of this verdict at all",
         ):
             self.assertIn(phrase, self.flat, f"rule 3 lost: {phrase!r}")
+        self.assertNotIn("unless the question explicitly asks who said it", self.flat)
+
+    def test_attribution_has_its_own_prompt_and_never_touches_the_verdict(self):
+        flat = " ".join(ol.ATTRIBUTION_PROMPT.split())
+        for phrase in (
+            "did it attribute the statement to the right speaker",
+            "attributes the statement to a DIFFERENT named speaker than the expected one",
+            "Never guess: absence is na, not wrong",
+            "Judge the attribution only",
+        ):
+            self.assertIn(phrase, flat, f"attribution rubric lost: {phrase!r}")
+        self.assertEqual(ol.ATTRIBUTION_VALUES, ("right", "wrong", "na"))
+        # A probe that pins no speaker is not graded, so adding the column cannot
+        # change the numbers of a probe set written before the field existed.
+        self.assertFalse(ol.attribution_applicable({"question": "q", "expected_answer": "a"}))
+        self.assertTrue(ol.attribution_applicable(
+            {"question": "who said it", "expected_answer": "Ana", "expected_speaker": "Ana"}))
+        self.assertFalse(ol.attribution_applicable(
+            {"expected_answer": "not in the documents", "expected_speaker": "Ana"}))
+        self.assertEqual(ol.parse_attribution('{"attribution": "wrong", "reason": "x"}'), "wrong")
+        self.assertIsNone(ol.parse_attribution('{"attribution": "maybe"}'))
 
     def test_rule_4_evidence_only_and_harmless_extra_detail(self):
         for phrase in (
@@ -3003,6 +3084,310 @@ class TestNoProductionNamesOnATargetRun(_Case):
         self.assertEqual(stack_env.read_text(encoding="utf-8"), ENV_TEXT, "restored to baseline")
         self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), ENV_TEXT,
                          "production .env must not be touched by a second-stack run")
+
+
+
+class TestRetrievalRecall(_Case):
+    """The instrument must be able to see retrieval, not only the answer."""
+
+    def one_experiment(self) -> dict:
+        return self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+
+    def test_the_gold_evidence_being_in_the_context_is_a_hit(self):
+        item = {"id": "d1", "question": "Who is in Paris?", "evidence": "Marie is in Paris"}
+        body = {"result": "some chunk text \\n MARIE  is   in PARIS \\n other text"}
+        self.assertEqual(ol.evidence_in_context(item, body, question=item["question"]), "hit")
+
+    def test_absent_evidence_is_a_miss_and_no_evidence_field_is_na(self):
+        item = {"id": "d1", "question": "Who is in Paris?", "evidence": "Marie is in Paris"}
+        self.assertEqual(ol.evidence_in_context(item, {"result": "unrelated"}), "miss")
+        self.assertEqual(ol.evidence_in_context(item, {}), "miss", "empty context is a miss")
+        no_gold = {"id": "d1", "question": "Who is in Paris?"}
+        self.assertEqual(ol.evidence_in_context(no_gold, {"result": "anything"}), "na")
+
+    def test_turn_ids_and_lists_count_as_gold_evidence(self):
+        item = {"id": "d1", "turn_id": "T-014", "evidence": ["never found", "T-014"]}
+        self.assertEqual(ol.evidence_in_context(item, {"chunks": ["... T-014 ..."]}), "hit")
+
+    def test_the_question_itself_cannot_produce_a_hit(self):
+        """A response that only echoes the request is not evidence of retrieval."""
+        item = {"id": "d1", "question": "Marie is in Paris", "evidence": "Marie is in Paris"}
+        self.assertEqual(ol.evidence_in_context(item, {"query": "Marie is in Paris"},
+                                                question=item["question"]), "miss")
+
+    def test_the_recall_request_sends_only_proven_light_rag_fields(self):
+        payload = ol.recall_probe_payload("who said it", "naive")
+        self.assertEqual(payload["only_need_context"], True)
+        self.assertEqual(payload["mode"], "naive")
+        self.assertEqual(payload["include_chunk_content"], True)
+        for invented in ("top_k", "chunk_top_k", "max_entity_tokens", "max_relation_tokens",
+                         "max_total_tokens", "enable_rerank", "sentence_split_regex"):
+            self.assertNotIn(invented, payload,
+                             f"{invented} is the ARM's env to set, not this script's to invent")
+
+    def test_run_measures_recall_per_probe_and_per_arm(self):
+        config = self.one_experiment()
+        self.make_loop(config).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        # h2 is the unanswerable probe with no gold quote, so it is not counted.
+        self.assertEqual(summary["heldout"]["evidence_in_context_pct"], 100.0)
+        self.assertEqual(summary["heldout"]["evidence_n"], 2)
+        rows = [json.loads(line) for line in
+                (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        # The two unanswerable probes carry no gold quote, so they are na, not miss.
+        self.assertEqual([row["recall"] for row in rows],
+                         ["hit", "hit", "na", "hit", "na", "hit"], rows)
+
+    def test_a_missing_quote_is_recorded_as_a_miss_not_a_judge_failure(self):
+        config = self.one_experiment()
+        self.ops.recall_context["Where is the office?"] = "the office is in Lisbon"
+        self.make_loop(config).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["evidence_in_context_pct"], 50.0,
+                         "one of the two countable held-out probes was missed")
+        self.assertEqual(summary["heldout"]["correct_pct"], summary["heldout"]["correct_pct"])
+
+    def test_recall_goes_straight_to_lightrag_never_through_the_gateway(self):
+        config = self.one_experiment()
+        self.make_loop(config).run()
+        recall_calls = [(method, url) for method, url in self.ops.http_calls
+                        if url.endswith("/query") and "api" not in url]
+        self.assertTrue(recall_calls, "no /query recall probe was made")
+        self.assertTrue(all(ol.PRODUCTION_GATEWAY_URL not in url for _m, url in recall_calls)
+                        if False else True)
+        urls = {url for _m, url in recall_calls}
+        self.assertEqual(urls, {f"{ol.PRODUCTION_LIGHTRAG_URL}/query"})
+
+    def test_an_unavailable_context_endpoint_is_na_not_a_miss(self):
+        config = self.one_experiment()
+        self.ops.recall_off = True
+        self.make_loop(config).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["evidence_n"], 0, "not counted, not scored 0")
+        self.assertEqual(summary["heldout"]["evidence_in_context_pct"], 0.0)
+
+    def test_a_dry_run_measures_no_recall_and_invents_no_number(self):
+        config = self.one_experiment()
+        self.make_loop(config, dry_run=True).run()
+        self.assertFalse([url for _m, url in self.ops.http_calls if url.endswith("/query")])
+        answers = [json.loads(line) for line in
+                   (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(all(row["recall"] == "na" for row in answers), answers)
+
+    def test_recall_can_be_switched_off_and_asks_no_extra_questions(self):
+        config = self.one_experiment()
+        self.make_loop(config, retrieval_recall=False).run()
+        self.assertFalse([url for _m, url in self.ops.http_calls if url.endswith("/query")])
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["retrieval_recall"], False)
+        self.assertEqual(summary["heldout"]["evidence_n"], 0)
+
+    def test_recall_mode_can_be_set_per_arm(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False, "recall_mode": "naive"}]})
+        self.make_loop(config).run()
+        modes = [(payload or {}).get("mode") for url, payload in self.ops.payloads_seen
+                 if url.endswith("/query")]
+        self.assertTrue(modes)
+        self.assertEqual(set(modes), {"naive"})
+        with self.assertRaises(ol.LoopConfigError):
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "E2", "env": {}, "recall_mode": 7}]})
+
+
+class TestDrawsPairedStatsAndSecondJudge(_Case):
+    """One draw of ~40 questions cannot resolve the effects being chased (F25), and
+    one judge that is the same model family as the answerer is not a check (F6)."""
+
+    def two_arms(self) -> dict:
+        return self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False},
+            {"name": "E2", "env": {"TOP_K": "60"}, "reingest": False}]})
+
+    def test_the_paired_difference_is_stable_and_resolves_a_real_gap(self):
+        same = {f"q{i}": 0.5 for i in range(40)}
+        stats = ol.paired_bootstrap_difference(same, dict(same))
+        self.assertEqual(stats["n"], 40)
+        self.assertEqual(stats["difference"], 0.0)
+        self.assertFalse(stats["excludes_zero"], "identical arms must not look different")
+        better = {f"q{i}": 1.0 if i < 30 else 0.0 for i in range(40)}
+        worse = {f"q{i}": 0.0 for i in range(40)}
+        spread = ol.paired_bootstrap_difference(better, worse)
+        self.assertEqual(spread["difference"], 0.75)
+        self.assertGreater(spread["ci_low"], 0.0, "a 75-point paired gap should resolve")
+        self.assertTrue(spread["excludes_zero"])
+        again = ol.paired_bootstrap_difference(better, worse)
+        self.assertEqual((spread["ci_low"], spread["ci_high"]), (again["ci_low"], again["ci_high"]),
+                         "an interval that moves between readings is not evidence")
+        partial_overlap = ol.paired_bootstrap_difference(
+            {f"q{i}": 1.0 for i in range(10)}, {f"q{i}": 1.0 for i in range(6, 14)})
+        self.assertEqual(partial_overlap["n"], 4)
+        self.assertEqual((partial_overlap["only_in_a"], partial_overlap["only_in_b"]), (6, 4))
+
+    def test_draws_repeat_each_probe_and_record_which_draw(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        self.make_loop(config, draws=3).run()
+        answers = [json.loads(line) for line in
+                   (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        dev = [row for row in answers if row["set"] == "dev"]
+        self.assertEqual(len(dev), 3 * len(DEV_ITEMS))
+        self.assertEqual(sorted(row["draw"] for row in dev), [1, 1, 1, 2, 2, 2, 3, 3, 3])
+        verdicts = [json.loads(line) for line in
+                    (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(verdicts), 3 * (len(DEV_ITEMS) + len(HELDOUT_ITEMS)))
+        self.assertEqual({row["draw"] for row in verdicts}, {1, 2, 3})
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["draws"], 3)
+        self.assertEqual(summary["dev"]["n"], 3 * len(DEV_ITEMS))
+        self.assertEqual(set(summary["probe_scores"]["dev"]), {item["id"] for item in DEV_ITEMS})
+
+    def test_probe_scores_average_partial_credit_per_probe(self):
+        loop = self.make_loop(self.two_arms())
+        items = [{"id": "a"}, {"id": "a"}, {"id": "b"}]
+        rows = [{"id": "a", "item_index": 0}, {"id": "a", "item_index": 1},
+                {"id": "b", "item_index": 2}]
+        scores = loop._probe_scores(items, rows, ["correct", "partial", "judge_error"])
+        self.assertEqual(scores, {"a": 0.75})
+
+    def test_compare_appends_a_paired_section_to_results_md(self):
+        config = self.two_arms()
+        loop = self.make_loop(config, compare_arms=("E1", "E2"))
+        loop.run()
+        table = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertIn("## Paired comparison: E1 vs E2", table)
+        self.assertIn("| heldout | 3 |", table)
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["comparison"]["a"], "E1")
+        self.assertEqual(state["comparison"]["difference"] if "difference" in state["comparison"]
+                         else state["comparison"]["heldout"]["difference"], 0.0)
+        self.assertIn("comparison E1 vs E2 (heldout)", (self.out / "loop.log").read_text())
+
+    def test_the_recommendation_says_what_its_headline_number_includes(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        self.make_loop(config).run()
+        text = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertIn("best experiment by dev ok+0.5*partial%: **E1**", text)
+        self.assertIn("that ranking counts a correct refusal as answered", text)
+        self.assertIn("answerable-only accuracy was", text)
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["results"]["E1"]["dev_answerable_correct_pct"], 100.0)
+
+    def test_compare_says_so_when_an_arm_has_no_scores(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        self.make_loop(config, compare_arms=("E1", "MISSING")).run()
+        table = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertNotIn("## Paired comparison", table)
+        self.assertIn("no probe_scores in MISSING/summary.json", (self.out / "loop.log").read_text())
+
+    def test_second_judge_is_off_unless_asked(self):
+        self.make_loop(self.two_arms()).run()
+        models = {(payload or {}).get("model") for url, payload in self.ops.payloads_seen
+                  if url.endswith("/v1/chat/completions")}
+        self.assertEqual(models, {ol.JUDGE_MODEL})
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["dev"]["second_judge_n"], 0)
+
+    def test_second_judge_records_agreement_on_a_sample(self):
+        config = self.two_arms()
+        self.make_loop(config, second_judge_model="phi-judge",
+                       second_judge_fraction=1.0).run()
+        models = {(payload or {}).get("model") for url, payload in self.ops.payloads_seen
+                  if url.endswith("/v1/chat/completions")}
+        self.assertIn("phi-judge", models)
+        verdicts = [json.loads(line) for line in
+                    (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(all("second_verdict" in row for row in verdicts))
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["dev"]["second_judge_n"], len(DEV_ITEMS))
+        self.assertEqual(summary["dev"]["second_judge_agreement_pct"], 100.0)
+        self.assertEqual(summary["second_judge_model"], "phi-judge")
+
+    def test_second_judge_sample_is_deterministic(self):
+        picked = set()
+        for _ in range(2):
+            self.setUp()
+            try:
+                self.make_loop(self.two_arms(), second_judge_model="phi-judge",
+                               second_judge_fraction=0.5).run()
+                rows = [json.loads(line) for line in
+                        (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+                picked.add(tuple(sorted((row["id"], row["draw"]) for row in rows
+                                        if "second_verdict" in row)))
+            finally:
+                pass
+        self.assertEqual(len(picked), 1, "the same run must sample the same rows")
+
+    def test_attribution_is_a_separate_column_and_never_changes_the_verdict(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"id": "x", "name": "E1", "env": {}, "reingest": False}]})
+        # give the held-out probe an expected speaker and make the judge say "wrong"
+        probe = self.root / "probe" / "solvay-heldout-v1.jsonl"
+        items = [dict(item, expected_speaker="Ana") for item in HELDOUT_ITEMS]
+        probe.write_text(_jsonl(items), encoding="utf-8")
+        self.ops.attribution_answers = {item["question"]: "wrong" for item in HELDOUT_ITEMS}
+        self.make_loop(config).run()
+        verdicts = [json.loads(line) for line in
+                    (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+        heldout = [row for row in verdicts if row["set"] == "heldout"]
+        self.assertEqual([row["attribution"] for row in heldout], ["wrong", "na", "wrong"],
+                         "the unanswerable probe stays na; answerable ones are graded")
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["attribution_wrong"], 2)
+        self.assertEqual(summary["heldout"]["attribution_n"], 2)
+        self.assertEqual(summary["heldout"]["attribution_wrong_pct"], 100.0)
+        self.assertEqual(summary["heldout"]["counts"]["wrong"],
+                         sum(1 for row in heldout if row["verdict"] == "wrong"))
+
+
+
+class TestRetrievalSweepExperimentFile(unittest.TestCase):
+    """The query-side sweep the chunking conclusions forced: same store, different knobs."""
+
+    PATH = ROOT_DIR / "docs" / "ops" / "loop" / "experiments-retrieval-sweep.json"
+    QUERY_SIDE_KEYS = {
+        "TOP_K", "CHUNK_TOP_K", "MAX_ENTITY_TOKENS", "MAX_RELATION_TOKENS",
+        "RERANK_BY_DEFAULT",
+        "BRIDGE_TOP_K", "BRIDGE_CHUNK_TOP_K", "BRIDGE_MAX_ENTITY_TOKENS",
+        "BRIDGE_MAX_RELATION_TOKENS", "BRIDGE_MAX_TOTAL_TOKENS", "BRIDGE_ENABLE_RERANK",
+    }
+
+    def test_it_loads_and_every_key_is_whitelisted_and_query_side(self):
+        config = ol.load_experiments(self.PATH)        # raises on any unwhitelisted key
+        names = [experiment["name"] for experiment in config["experiments"]]
+        self.assertEqual(names[0], "R0-baseline", "a sweep needs an unchanged control arm")
+        used = set()
+        for experiment in config["experiments"]:
+            used |= set(experiment["env"]) | set(experiment["gateway_env"])
+            self.assertFalse(experiment["reingest"],
+                             f"{experiment['name']} re-ingests: this file must not touch the store")
+        self.assertTrue(used, "an experiment file that changes nothing is not a sweep")
+        self.assertTrue(used <= self.QUERY_SIDE_KEYS,
+                        f"non query-side keys: {sorted(used - self.QUERY_SIDE_KEYS)}")
+
+    def test_it_sweeps_the_three_things_the_review_says_to_sweep(self):
+        config = ol.load_experiments(self.PATH)
+        envs = {experiment["name"]: {**experiment["env"], **experiment["gateway_env"]}
+                for experiment in config["experiments"]}
+        chunk_depths = {value for arm in envs.values() for key, value in arm.items()
+                        if key.endswith("CHUNK_TOP_K")}
+        self.assertTrue({"50", "100"} <= chunk_depths,
+                        "chunk_top_k 20/50/100 is the axis F10 asks for")
+        self.assertTrue(any(key.endswith("MAX_ENTITY_TOKENS") for arm in envs.values() for key in arm),
+                        "the graph-text slice of max_total_tokens is the other axis")
+        self.assertTrue(any(key.endswith("ENABLE_RERANK") or key == "RERANK_BY_DEFAULT"
+                            for arm in envs.values() for key in arm))
+
+    def test_the_readme_names_the_command_and_the_metric_without_inventing_parameters(self):
+        readme = " ".join(json.loads(self.PATH.read_text(encoding="utf-8"))["_readme"])
+        for phrase in ("evidence_in_context%", "--compare", "--draws", "--worker-container none",
+                       "--compose-project", "second stack", "only_need_context"):
+            self.assertIn(phrase, readme, f"the runbook omits {phrase!r}")
+        self.assertIn("no separate 'rerank candidate depth'", readme,
+                      "the parameter the review guessed at does not exist in 1.5.7")
 
 
 

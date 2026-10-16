@@ -1,0 +1,173 @@
+{
+  "_readme": [
+    "Retrieval-side sweep: query-side settings ONLY, no re-ingest, one frozen corpus.",
+    "",
+    "Why this file exists: the earlier conclusions about TOP_K, CHUNK_TOP_K, rerank and the",
+    "token budget were measured on a corpus smaller than what retrieval already returns, so",
+    "every arm saw nearly the whole store and 'no difference' was the only possible result",
+    "(docs/research/graphraggle-adversarial-review.md, F5 and 'Conclusions we should stop",
+    "trusting'). Fix the instrument first: run this with the retrieval-recall probe on",
+    "(--no-retrieval-recall to switch it off) so each arm reports evidence_in_context% -",
+    "whether the gold quote was in the context at all - separately from whether the answer",
+    "was right. Pair the two arms you care about with --compare.",
+    "",
+    "Run it on the SECOND STACK, never on production. This file sets reingest:false on every",
+    "arm, so it does not delete anything, but it does rewrite <root>/.env and restart",
+    "containers while it runs:",
+    "  .venv/bin/python scripts/overnight_loop.py \\",
+    "    --root ~/rag-project --out ~/rag-project/docs/ops/runs/retrieval-sweep \\",
+    "    --experiments docs/ops/loop/experiments-retrieval-sweep.json \\",
+    "    --lightrag-url http://127.0.0.1:9622 --gateway-url http://127.0.0.1:8021 \\",
+    "    --lightrag-container lightrag-server2 --gateway-container gateway-api2 \\",
+    "    --gateway-service gateway-api2 --lightrag-service lightrag-server2 \\",
+    "    --worker-container none --compose-file ~/rag-project/stack2/compose.yml \\",
+    "    --compose-project rag-chunk2 --env-file ~/rag-project/stack2/.env \\",
+    "    --draws 3 --compare R0-baseline R3-graph-budget-shift \\",
+    "    --second-judge-model phi-4 --second-judge-fraction 0.2",
+    "Never run this file against production without --allow-production; it wipes the store.",
+    "(This file asks for reingest:false on every arm, so on a correctly built second stack it",
+    "does not wipe anything - the sentence is here because the driver CAN wipe what it points",
+    "at, and a typo in --lightrag-url is the kind of mistake that costs a corpus.)",
+    "",
+    "Every key below is in the driver's own whitelist (scripts/overnight_loop.py",
+    "ENV_WHITELIST / GATEWAY_ENV_WHITELIST) and names something this repo actually sends:",
+    "  - LightRAG server env: TOP_K, CHUNK_TOP_K, MAX_ENTITY_TOKENS, MAX_RELATION_TOKENS,",
+    "    RERANK_BY_DEFAULT. These are what the direct /query retrieval-recall probe measures.",
+    "  - gateway env (the path Open WebUI actually uses, app/api.py",
+    "    build_ollama_bridge_query_payload): BRIDGE_TOP_K, BRIDGE_CHUNK_TOP_K,",
+    "    BRIDGE_MAX_ENTITY_TOKENS, BRIDGE_MAX_RELATION_TOKENS, BRIDGE_MAX_TOTAL_TOKENS,",
+    "    BRIDGE_ENABLE_RERANK. The bridge sends these as top_k / chunk_top_k /",
+    "    max_entity_tokens / max_relation_tokens / max_total_tokens / enable_rerank.",
+    "How the recall number is produced, with the field names the driver actually sends",
+    "(they are the ones app/api.py already posts to /query): mode, query,",
+    "only_need_context: true, include_chunk_content: true, include_references: true. It sends",
+    "no top_k, chunk_top_k or token budgets at all, because those are what the arm under test",
+    "sets; the response is checked for the probe's gold quote. That is what makes this file",
+    "measurable: it is the only number in the table that moves when ONE of these knobs moves.",
+    "",
+    "There is no separate 'rerank candidate depth' field in what this repo sends: the chunk",
+    "pool the reranker orders IS chunk_top_k, so the depth arms are the CHUNK_TOP_K arms, and",
+    "the rerank arms turn reranking on and off rather than resize its input.",
+    "",
+    "What this file CANNOT sweep: the query MODE. build_ollama_bridge_query_payload hard-codes",
+    "mode 'mix' (app/api.py:217), so a naive/hybrid/local arm is a code change, not an arm",
+    "here. The per-arm 'recall_mode' key only changes the MODE OF THE RECALL PROBE (what we",
+    "ask LightRAG for), never what the answer path retrieves - set it on an arm only when you",
+    "want the recall number computed in another mode.",
+    "",
+    "Production baseline for reference (docs/05-known-good-config.md and app/config.py",
+    "defaults): mix mode, top_k 40, chunk_top_k 20, max_entity_tokens 10000,",
+    "max_relation_tokens 10000, max_total_tokens 32000. With 20k of a 32k budget reserved for",
+    "graph text, roughly eight 1200-token chunks fit however high chunk_top_k is set - that is",
+    "why the budget-shift arm exists next to the depth arms.",
+    "",
+    "Cost: no re-ingest, so every arm is probes x draws x (answer + one /query) plus the",
+    "judge calls. On 60 probes at 3 draws that is about 360 gateway queries per arm, minutes",
+    "to an hour, not the nine hours a re-ingest arm costs."
+  ],
+  "baseline_env": {},
+  "experiments": [
+    {
+      "name": "R0-baseline",
+      "_note": "Control: production settings, unchanged. Every other arm is compared against this one.",
+      "env": {},
+      "gateway_env": {},
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R1-chunk-depth-50",
+      "_note": "chunk_top_k 20 -> 50: a bigger pool for the reranker to order.",
+      "env": {
+        "CHUNK_TOP_K": "50"
+      },
+      "gateway_env": {
+        "BRIDGE_CHUNK_TOP_K": "50"
+      },
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R2-chunk-depth-100",
+      "_note": "chunk_top_k 20 -> 100: the depth where a cross-encoder benchmark stopped being the limiter.",
+      "env": {
+        "CHUNK_TOP_K": "100"
+      },
+      "gateway_env": {
+        "BRIDGE_CHUNK_TOP_K": "100"
+      },
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R3-graph-budget-shift",
+      "_note": "Entity/relation text 10000 -> 3500 each, total unchanged: the chunk slice of max_total_tokens grows from ~12k to ~25k, so more 1200-token chunks actually reach the model. This is the arm F10 says to run.",
+      "env": {
+        "MAX_ENTITY_TOKENS": "3500",
+        "MAX_RELATION_TOKENS": "3500"
+      },
+      "gateway_env": {
+        "BRIDGE_MAX_ENTITY_TOKENS": "3500",
+        "BRIDGE_MAX_RELATION_TOKENS": "3500"
+      },
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R4-shift-plus-depth-100",
+      "_note": "R2 and R3 together: the pool and the budget, which is the combination worth testing once each alone has a number.",
+      "env": {
+        "CHUNK_TOP_K": "100",
+        "MAX_ENTITY_TOKENS": "3500",
+        "MAX_RELATION_TOKENS": "3500"
+      },
+      "gateway_env": {
+        "BRIDGE_CHUNK_TOP_K": "100",
+        "BRIDGE_MAX_ENTITY_TOKENS": "3500",
+        "BRIDGE_MAX_RELATION_TOKENS": "3500"
+      },
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R5-retrieval-k-80",
+      "_note": "top_k 40 -> 80 (more entities/relations collected upstream of the chunk pick).",
+      "env": {
+        "TOP_K": "80"
+      },
+      "gateway_env": {
+        "BRIDGE_TOP_K": "80"
+      },
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R6-no-rerank",
+      "_note": "Rerank off on the path the user actually takes. Keep as a placebo: if this arm is indistinguishable from R0, the reranker is not the lever on this corpus.",
+      "env": {},
+      "gateway_env": {
+        "BRIDGE_ENABLE_RERANK": "false"
+      },
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    },
+    {
+      "name": "R7-lightrag-rerank-off",
+      "_note": "Rerank off on the LightRAG side (RERANK_BY_DEFAULT, which production sets True). The bridge overrides reranking per request, so this arm moves the retrieval-recall number rather than the user path: read it as 'does reranking change what evidence arrives', not as an accuracy arm.",
+      "env": {
+        "RERANK_BY_DEFAULT": "False"
+      },
+      "gateway_env": {},
+      "reingest": false,
+      "recall_mode": "mix",
+      "probe_concurrency": 1
+    }
+  ]
+}
