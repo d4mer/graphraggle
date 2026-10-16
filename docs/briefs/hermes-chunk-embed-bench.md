@@ -1,6 +1,6 @@
 # Hermes brief: offline chunk x embedder x reranker benchmark
 
-**Status: DRAFT, NOT APPROVED.** Needs the operator's written go before it is sent.
+**Status: APPROVED by the operator in writing on 2026-10-16 (all steps).**
 Offline, read-only for every stack: it only chunks local files and calls oMLX
 `/v1/embeddings` (and optionally `/v1/rerank`). No LightRAG ingest, no stack2 change,
 no production change, no restart. Never port 9621 or 8020 (the script refuses them).
