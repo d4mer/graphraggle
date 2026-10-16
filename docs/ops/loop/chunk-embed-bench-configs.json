@@ -1,0 +1,121 @@
+{
+  "_readme": [
+    "Default configs for scripts/chunk_embed_bench.py — an OFFLINE chunk x embedder x",
+    "reranker recall benchmark. No LightRAG, no ingest, no LLM extraction: chunk the",
+    "documents, embed chunks and questions, rank by cosine, optionally rerank, and check",
+    "whether each probe's gold evidence quote is in the top-k chunks.",
+    "",
+    "Run it on the Thinkpad, where the corpus is. Nothing here reads the store:",
+    "  .venv/bin/python scripts/chunk_embed_bench.py \\",
+    "    --corpus ~/rag-project/probe/loop_corpus.json \\",
+    "    --probes ~/rag-project/probe/solvay-dev-v1.jsonl ~/rag-project/probe/solvay-heldout-v1.jsonl \\",
+    "    --out ~/rag-project/probe/chunk-bench \\",
+    "    --configs docs/ops/loop/chunk-embed-bench-configs.json \\",
+    "    --embed-url http://127.0.0.1:8080 --api-key-env OMLX_API_KEY \\",
+    "    --rerank-url http://127.0.0.1:8080 --rerank-model jina-reranker-v3 \\",
+    "    --compare mxbai-recursive-350 current-1200-100-mxbai",
+    "The script refuses an --embed-url or --rerank-url on port 9621 (LightRAG) or 8020",
+    "(gateway): it talks to the model server, never to the stack under production use.",
+    "",
+    "Why these arms (docs/research/decision-embed-rerank-chunk.md, section 1):",
+    "mxbai-embed-large-v1 has a real 512-token window and truncates silently, so today's",
+    "1200/100 chunks are roughly 57% invisible to vector search. The primary recommendation",
+    "is recursive 350/50 with Latin sentence separators on the CURRENT embedder; BGE-M3",
+    "(8192-token window, served by oMLX) is the upgrade option, tested here at the same",
+    "sizes so the embedder and the chunk size are separate questions.",
+    "",
+    "Set the model ids to exactly what oMLX reports for each endpoint. \"bge-m3\" is the",
+    "family name, not necessarily the served id; if the served id differs, edit these arms",
+    "before running, because the embedding cache key includes the model name.",
+    "",
+    "Sanity check before trusting anything: the corpus is 108 chunks at 1200/100 in",
+    "production (Hermes' count). current-1200-100-mxbai should land within a few percent of",
+    "that. If it does not, the local chunkers are approximating badly - compare configs",
+    "against each other and do not quote absolute chunk counts.",
+    "",
+    "The two +rerank arms are placeholders for \"the best two\": after the first pass, swap",
+    "their chunker block for the two arms that led, so the reranker is measured against its",
+    "own baseline rather than against a guess.",
+    "",
+    "tiktoken is not installed in this venv, so runs here report",
+    "tokenizer=whitespace-fallback and their token counts are optimistic. Install tiktoken",
+    "on the Thinkpad (or pass --tokenizer tiktoken to fail loudly) before using the token",
+    "percentiles as a 512-token-window argument.",
+    "",
+    "max_input_tokens on an embedder is not sent to the server: it is the declared real",
+    "window, used only to report over_embedder_window_pct - how many chunks are already",
+    "bigger than the model can see. That number is the whole point of the first arm."
+  ],
+  "configs": [
+    {
+      "name": "current-1200-100-mxbai",
+      "_note": "What production does today. The control: over_embedder_window_pct here is the size of the truncation problem.",
+      "chunker": {"strategy": "fixed_token", "chunk_token_size": 1200, "overlap": 100},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": null
+    },
+    {
+      "name": "mxbai-fixed-350",
+      "_note": "Same embedder, embedder-sized chunks, token-window cutting kept (it can split a word). Overlap held at 50 so the only difference from mxbai-recursive-350 is the strategy.",
+      "chunker": {"strategy": "fixed_token", "chunk_token_size": 350, "overlap": 50},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": null
+    },
+    {
+      "name": "mxbai-recursive-350",
+      "_note": "Recommendation 1A: 350/50 on the current embedder, separators chosen so transcript speaker turns stay whole and a long unpunctuated STT paragraph falls through to sentence boundaries.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": null
+    },
+    {
+      "name": "bge-m3-recursive-350",
+      "_note": "Same chunking as 1A, different embedder: isolates the model from the chunk size.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "rerank": null
+    },
+    {
+      "name": "bge-m3-recursive-600-80",
+      "_note": "BGE-M3 can actually see these, so the size curve is meaningful: 600, 800 and 1200 are unreadable by mxbai and fully readable here.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 600, "overlap": 80,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "rerank": null
+    },
+    {
+      "name": "bge-m3-recursive-800-100",
+      "_note": "Middle of the size curve.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 800, "overlap": 100,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "rerank": null
+    },
+    {
+      "name": "bge-m3-recursive-1200-100",
+      "_note": "Production chunk size with an embedder that fits it. If this beats 350, chunk size was never the problem - the embedder window was.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 1200, "overlap": 100,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "rerank": null
+    },
+    {
+      "name": "mxbai-recursive-350+rerank",
+      "_note": "Reranker on top of the leading candidate: cosine picks top_n_in=40 candidates, /v1/rerank reorders them, metrics are recomputed on the new order.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": {"model": "jina-reranker-v3", "top_n_in": 40}
+    },
+    {
+      "name": "bge-m3-recursive-350+rerank",
+      "_note": "Reranker on the upgrade path. Compare against bge-m3-recursive-350 to price the reranker alone.",
+      "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
+                  "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
+      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "rerank": {"model": "jina-reranker-v3", "top_n_in": 40}
+    }
+  ]
+}

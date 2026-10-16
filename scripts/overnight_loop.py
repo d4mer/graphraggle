@@ -1069,7 +1069,8 @@ def context_strings(payload: Any, *, skip: str = "") -> list[str]:
     return found
 
 
-def _normalise_quote(text: Any) -> str:
+def normalise_quote(text: Any) -> str:
+    """Public: scripts/chunk_embed_bench.py scores recall with the SAME normalisation."""
     normalised = re.sub(r"\s+", " ", str(text or "")).strip().lower()
     return normalised.strip('"\u2018\u2019\u201c\u201d\'` ')
 
@@ -1088,7 +1089,7 @@ def gold_evidence_of(item: dict[str, Any]) -> list[str]:
             values.append(raw)
         elif isinstance(raw, (list, tuple)):
             values.extend(str(entry) for entry in raw)
-    return [value for value in (_normalise_quote(value) for value in values) if len(value) >= 4]
+    return [value for value in (normalise_quote(value) for value in values) if len(value) >= 4]
 
 
 def evidence_in_context(item: dict[str, Any], payload: Any, *, question: str = "") -> str:
@@ -1096,7 +1097,7 @@ def evidence_in_context(item: dict[str, Any], payload: Any, *, question: str = "
     gold = gold_evidence_of(item)
     if not gold:
         return "na"
-    haystack = _normalise_quote(" \n ".join(context_strings(payload, skip=question)))
+    haystack = normalise_quote(" \n ".join(context_strings(payload, skip=question)))
     if not haystack:
         return "miss"
     return "hit" if any(needle in haystack for needle in gold) else "miss"
