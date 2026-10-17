@@ -9,6 +9,7 @@ only — the brief forbids reading the real corpus or probes.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -45,6 +46,7 @@ class FakeHttp:
         self.rerank_calls = 0
         self.rerank_queries: list[str] = []
         self.rerank_candidates: list[int] = []
+        self.rerank_bodies: list[dict[str, Any]] = []
         self.fail_first = fail_first
         self.always_fail = always_fail
         self.rerank_body = rerank_body
@@ -66,7 +68,10 @@ class FakeHttp:
         if url.endswith("/v1/rerank"):
             self.rerank_calls += 1
             self.rerank_queries.append(str(payload.get("query")))
-            docs = [entry["text"] for entry in payload.get("results") or []]
+            self.rerank_bodies.append(dict(payload))
+            docs = list(payload.get("documents") or [])
+            if not docs:
+                docs = [entry["text"] for entry in payload.get("results") or []]
             self.rerank_candidates.append(len(docs))
             if self.rerank_body is not None:
                 return 200, self.rerank_body
@@ -429,7 +434,30 @@ class TestRerankClient(unittest.TestCase):
                               rerank_url="http://127.0.0.1:8080", rerank_model="jina", api_key="",
                               cache=cb.EmbedCache(self.tmp / "cache"), sleep=lambda _s: None)
 
-    def test_the_request_is_the_documented_jina_shape(self):
+    def test_the_request_is_the_cohere_shape_o_m_l_x_accepts(self):
+        """The Jina body (results of {"text": ...}) gets HTTP 422 from oMLX."""
+        http = FakeHttp(rerank_body={"results": [{"index": 0, "relevance_score": 1.0},
+                                                 {"index": 1, "relevance_score": 0.2}]})
+        self.client(http).rerank_order("which budget", ["first doc", "second doc"], 20)
+        self.assertEqual(len(http.rerank_bodies), 1)
+        body = http.rerank_bodies[0]
+        self.assertEqual(body["documents"], ["first doc", "second doc"])
+        self.assertEqual(body["query"], "which budget")
+        self.assertEqual(body["top_n"], 2)
+        self.assertNotIn("results", body)
+
+    def test_a_data_envelope_response_is_understood(self):
+        http = FakeHttp(rerank_body={"data": [{"index": 2, "score": 0.9},
+                                              {"index": 0, "score": 0.4}]})
+        self.assertEqual(self.client(http).rerank_order("q", ["a", "b", "c"], 3), [2, 0, 1])
+
+    def test_an_unknown_response_envelope_is_named_not_guessed(self):
+        http = FakeHttp(rerank_body={"matches": [{"doc": 0}]})
+        with self.assertRaises(cb.BenchError) as caught:
+            self.client(http).rerank_order("q", ["a", "b"], 2)
+        self.assertIn("results[] or data[]", str(caught.exception))
+
+    def test_the_request_is_the_documented_shape(self):
         http = FakeHttp(rerank_body={"results": [{"index": 1, "relevance_score": 0.9},
                                                  {"index": 0, "relevance_score": 0.1}]})
         order = self.client(http).rerank_order("which budget", ["first doc", "second doc"], 20)
@@ -462,7 +490,7 @@ class TestConfigFile(unittest.TestCase):
                  for config in configs}
         self.assertIn(("recursive", 350, 50, "mxbai-embed-large-v1"), sizes)
         for size, overlap in ((350, 50), (600, 80), (800, 100), (1200, 100)):
-            self.assertIn(("recursive", size, overlap, "bge-m3"), sizes)
+            self.assertIn(("recursive", size, overlap, "bge-m3-mlx-fp16"), sizes)
         self.assertTrue(any(config["rerank"] for config in configs),
                         "the file must include rerank variants")
         self.assertGreaterEqual(sum(1 for config in configs if config["rerank"]), 2)
@@ -480,7 +508,26 @@ class TestConfigFile(unittest.TestCase):
         for config in cb.load_configs(CONFIGS_PATH):
             by_model[config["embedder"]["model"]] = config["embedder"].get("max_input_tokens")
         self.assertEqual(by_model.get("mxbai-embed-large-v1"), 512)
-        self.assertGreaterEqual(by_model.get("bge-m3"), 8192)
+        self.assertGreaterEqual(by_model.get("bge-m3-mlx-fp16"), 8192)
+
+    def test_the_shipped_model_ids_are_the_ones_o_m_l_x_serves(self):
+        """Hermes' run proved which ids answer; a wrong one silently re-embeds everything."""
+        models = {config["embedder"]["model"] for config in cb.load_configs(CONFIGS_PATH)}
+        rerankers = {config["rerank"]["model"] for config in cb.load_configs(CONFIGS_PATH)
+                     if config["rerank"]}
+        self.assertEqual(models, {"mxbai-embed-large-v1", "bge-m3-mlx-fp16"})
+        self.assertEqual(rerankers, {"jina-reranker-v3-mlx"})
+
+    def test_the_readme_run_command_names_a_model_that_answers(self):
+        """The example command is as likely to be run as the arms themselves."""
+        readme = " ".join(json.loads(CONFIGS_PATH.read_text(encoding="utf-8"))["_readme"])
+        shipped = {config["embedder"]["model"] for config in cb.load_configs(CONFIGS_PATH)}
+        shipped |= {config["rerank"]["model"] for config in cb.load_configs(CONFIGS_PATH)
+                    if config["rerank"]}
+        named = re.findall(r"--(?:embed|rerank)-model\s+(\S+)", readme)
+        self.assertTrue(named, "the runbook shows no model id at all")
+        for model in named:
+            self.assertIn(model, shipped, f"{model} is not one of the shipped arms")
 
     def test_bad_configs_are_refused(self):
         cases = {
@@ -658,6 +705,28 @@ class TestInputs(_Fixture):
         self.assertIn("doc 2/2", str(caught.exception))
         self.assertNotIn("nowhere", str(caught.exception))
 
+    def test_a_binary_office_or_pdf_corpus_entry_is_refused_with_an_action(self):
+        for suffix in (".pdf", ".docx", ".pptx", ".xlsx", ".epub"):
+            with self.subTest(suffix=suffix):
+                (self.root / f"deck{suffix}").write_bytes(b"%PDF-1.7 compressed bytes")
+                (self.root / "corpus.json").write_text(
+                    json.dumps([str(self.root / "doc1.txt"), str(self.root / f"deck{suffix}")]),
+                    encoding="utf-8")
+                with self.assertRaises(cb.BenchError) as caught:
+                    cb.load_corpus(self.root / "corpus.json")
+                message = str(caught.exception)
+                self.assertIn(f"doc 2/2 is a binary document ({suffix})", message)
+                self.assertIn("extract it to .txt first", message)
+                self.assertNotIn("deck", message, "the file name must not reach the report")
+
+    def test_text_siblings_of_the_binary_types_are_accepted(self):
+        for suffix in (".txt", ".md", ".csv", ".json", ".vtt"):
+            with self.subTest(suffix=suffix):
+                path = self.root / f"notes{suffix}"
+                path.write_text("a plain text document with words in it", encoding="utf-8")
+                (self.root / "corpus.json").write_text(json.dumps([str(path)]), encoding="utf-8")
+                self.assertEqual(len(cb.load_corpus(self.root / "corpus.json")), 1)
+
     def test_probes_without_gold_evidence_are_skipped_not_scored(self):
         items, skipped = cb.load_probes([self.root / "probes.jsonl"])
         self.assertEqual([item["id"] for item in items], ["p1", "p2", "p3"])
@@ -716,7 +785,7 @@ class TestRealHttpRoundTrip(_Fixture):
                     body = {"data": [{"embedding": bag_vector(text), "index": index}
                                      for index, text in enumerate(payload["input"])]}
                 else:
-                    docs = payload.get("results") or []
+                    docs = payload.get("documents") or payload.get("results") or []
                     body = {"results": [{"index": index, "relevance_score": float(len(docs) - rank)}
                                         for rank, index in enumerate(range(len(docs)))]}
                 raw = json.dumps(body).encode("utf-8")
@@ -761,8 +830,13 @@ class TestRealHttpRoundTrip(_Fixture):
         self.assertTrue(all(entry["authorization"] == "Bearer roundtrip-key" for entry in self.server.seen))
         self.assertTrue(all(len(entry["payload"]["input"]) <= 16 for entry in self.server.seen
                             if "input" in entry["payload"]))
-        self.assertTrue(all("query" in entry["payload"] and "results" in entry["payload"]
-                            for entry in self.server.seen if "results" in entry["payload"]))
+        rerank_payloads = [entry["payload"] for entry in self.server.seen
+                           if entry["path"].endswith("/v1/rerank")]
+        self.assertTrue(rerank_payloads)
+        self.assertTrue(all(isinstance(payload["documents"], list)
+                            and all(isinstance(doc, str) for doc in payload["documents"])
+                            for payload in rerank_payloads),
+                        "oMLX takes documents as plain strings, not Jina {text: ...} objects")
         report = json.loads((self.root / "out" / "results.json").read_text(encoding="utf-8"))
         self.assertEqual(report["configs"][0]["config"], "rec")
         self.assertNotIn("roundtrip-key", (self.root / "out" / "results.md").read_text(encoding="utf-8"))

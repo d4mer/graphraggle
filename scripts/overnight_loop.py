@@ -12,16 +12,32 @@ Usage:
         --experiments experiments.json --out ~/rag-project/probe/loop \
         --max-hours 11 [--dry-run] [--resume] [--retry-errors] \
         [--draws 3] [--compare ARM_A ARM_B] [--second-judge-model MODEL] \
-        [--no-retrieval-recall] [--recall-mode mix]
+        [--no-retrieval-recall] [--recall-mode mix] [--probes-only --arm-name NAME]
 
     python3 scripts/overnight_loop.py --root ~/rag-project \
         --rejudge ~/rag-project/probe/loop
+
+    python3 scripts/overnight_loop.py --root ~/rag-project \
+        --probes-only --arm-name production-1200 --out ~/rag-project/loop-prod
 
 --rejudge is the offline mode: it re-grades answers already saved in
 <out>/<name>/answers.jsonl using nothing but the judge endpoint, rewrites those
 directories' verdicts and summaries, and writes <out>/results-rejudged.md. It
 never touches .env, docker, LightRAG, the gateway, sigma, results.md or
 state.json.
+
+--probes-only is the read-only mode: it runs the dev and held-out probes, the judge and the
+recall probe against whatever --gateway-url/--lightrag-url point at, as one pseudo-arm named by
+``--arm-name`` (default ``probes-only``), and writes nothing to the stack. There is no .env write
+or backup, no container restart or exec, no compose command, no store clear and no ingest - the
+readiness checks use HTTP only, so ``docker ps`` is never called either. It reads the target
+stack's .env for one field, the LightRAG API key, and never rewrites it. That is what makes it
+safe to score production and a second stack on the same probes and the same judge: production
+keeps serving while it is measured. It needs no ``--allow-production`` because it cannot wipe
+anything, and it is refused, naming every offending arm, if the ``--experiments`` file carries
+``"reingest": true``, non-empty ``env``/``gateway_env``/``baseline_env``, or a ``chunking`` block.
+Scores land in the same place as any other arm: ``<out>/<arm-name>/`` (answers.jsonl,
+verdicts.jsonl, summary.json), plus results.md and state.json under ``--out``.
 
 Stopping a run: use ``kill -TERM <pid>``, NOT Ctrl-C, when the process is piped
 (e.g. ``... | tee loop.log``). Ctrl-C reaches tee too, the pipe dies, and any
@@ -99,7 +115,11 @@ finding it answers:
 * Refusals and accuracy are separated (F7): ``ok%`` is kept for comparability with
   old summaries, and ``heldout answerable%`` (correct over answerable probes) plus
   ``refusal acc%`` (refused over unanswerable probes) are reported next to it. A
-  system that refuses more cannot raise accuracy.
+  system that refuses more cannot raise accuracy. The final recommendation ranks arms
+  by ``dev answerable-correct%``, not by ok+0.5*partial%: the old headline counted a
+  correct refusal as answered, so an arm that answered less could win it. The old
+  number is still printed beside the new one, and a state.json written before the new
+  key existed still ranks by the old one.
 * ``--second-judge-model`` (off by default) re-grades a deterministic sample
   (``--second-judge-fraction``, default 0.2) with another model and reports
   agreement, because the answerer and the judge are the same family (F6).
@@ -611,8 +631,13 @@ def check_env_keys(
             raise LoopConfigError(f"{where}: key {key} is not in the whitelist")
 
 
-def load_experiments(path: Path) -> dict[str, Any]:
-    """Parse and validate experiments.json, preserving file order."""
+def load_experiments(path: Path, allow_empty_experiments: bool = False
+                     ) -> dict[str, Any]:
+    """Parse and validate experiments.json, preserving file order.
+
+    ``allow_empty_experiments`` is for --probes-only, which runs one synthetic arm and so
+    has no use for the list; every other entry in the file is still validated.
+    """
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -628,7 +653,9 @@ def load_experiments(path: Path) -> dict[str, Any]:
     check_env_keys(baseline, "baseline_env")
 
     entries = raw.get("experiments")
-    if not isinstance(entries, list) or not entries:
+    if not isinstance(entries, list):
+        raise LoopConfigError("experiments must be a list")
+    if not entries and not allow_empty_experiments:
         raise LoopConfigError("experiments must be a non-empty list")
 
     experiments: list[dict[str, Any]] = []
@@ -992,6 +1019,10 @@ def judge_answer(
 
 
 # ── Scoring ─────────────────────────────────────────────────────────────────
+
+# Ranking order: the honest column first, older summaries fall back to the ones they have.
+RANKING_KEYS = ("dev_answerable_correct_pct", "dev_ok_partial_credit_pct",
+                "dev_partial_credit_pct")
 
 UNANSWERABLE = re.compile(
     r"(not in the documents|not available|not mentioned|unanswerable|no answer)",
@@ -1609,6 +1640,8 @@ class Loop:
         retrieval_recall: bool = True,
         recall_mode: str = "mix",
         compare_arms: tuple[str, str] | None = None,
+        probes_only: bool = False,
+        arm_name: str = "probes-only",
     ) -> None:
         self.root = Path(root)
         self.out = Path(out)
@@ -1657,6 +1690,9 @@ class Loop:
         # Per-arm override from the experiments file ("recall_mode": "naive").
         self.recall_mode_override: str | None = None
         self.compare_arms = compare_arms
+        # --probes-only: measure one named arm without writing anything to the stack.
+        self.probes_only = bool(probes_only)
+        self.arm_name = str(arm_name or "probes-only")
 
     # ── logging, heartbeat, state ──────────────────────────────────────────
 
@@ -2415,7 +2451,19 @@ class Loop:
         self._verify_env(set_values)
         if experiment["reingest"]:
             self._reingest(experiment)
+        return self._measure(experiment, set_values=set_values)
 
+    def _measure(self, experiment: dict[str, Any], *, set_values: dict[str, str] | None = None
+                 ) -> dict[str, Any]:
+        """Ask the probe sets, judge every answer, measure recall, write the arm's summary.
+
+        The measuring half, shared by a normal experiment (which has already rewritten
+        .env, restarted services and maybe re-ingested) and --probes-only (which has done
+        none of that). Everything it sends is a read: GET /health, POST /query for the
+        recall probe, the gateway query for the answer, and the judge endpoint.
+        """
+        set_values = dict(set_values or {})
+        name = experiment["name"]
         dev_items = self._load_probe_items(self.dev_probe_file)
         heldout_items = self._load_probe_items(self.heldout_probe_file)
         if self.recall_mode_override:
@@ -2498,10 +2546,75 @@ class Loop:
         self.save_state()
         return summary
 
+    def _run_probe_only_arm(self) -> None:
+        """--probes-only: one arm, named by --arm-name, with zero writes to the stack.
+
+        No .env write or backup, no docker call of any kind, no store clear, no ingest, no
+        compose command. Read-only by construction, which is what makes it safe to point at
+        production: it scores the stack exactly as configured, so production and a second
+        stack can be compared on the same probes and the same judge.
+        """
+        experiment = {
+            "name": self.arm_name, "env": {}, "gateway_env": {}, "reingest": False,
+            "transcript_prep": False, "chunking": None, "probe_concurrency": 1,
+            "recall_mode": "", "probes_only": True,
+        }
+        name = self.arm_name
+        self.recall_mode_override = None
+        record = self.state["experiments"].setdefault(name, {"status": "pending"})
+        self.state["current"] = name
+        record["status"] = "running"
+        self.save_state()
+        self.heartbeat()
+        self.log(f"{name}: probes-only start against lightrag={self.t.lightrag_url} "
+                 f"gateway={self.t.gateway_url} (read-only: no env write, no restart, "
+                 "no clear, no ingest)")
+        self._wait_until(self._health, timeout=SERVICE_DOWN_WAIT, interval=15,
+                         what="LightRAG /health")
+        self._wait_until(self._gateway_answers, timeout=SERVICE_DOWN_WAIT, interval=15,
+                         what=f"gateway {self.t.gateway_url}")
+        self._wait_until(self._sigma_up, timeout=SERVICE_DOWN_WAIT, interval=15,
+                         what="judge service (sigma)")
+        try:
+            summary = self._measure(experiment, set_values={})
+            record["status"] = "done"
+            record.pop("error", None)
+            if meets_success(summary["heldout"]):
+                self.state["status"] = "success"
+                self.state["stop_reason"] = f"success in {name}"
+        except StepError as exc:
+            record["status"] = "error"
+            record["error"] = str(exc)
+            self.log(f"{name}: probes-only run error: {exc}")
+        self.save_state()
+
+    def _gateway_answers(self) -> tuple[bool, Any]:
+        """Gateway readiness without docker: any HTTP answer means it is up.
+
+        ``_gateway_up`` consults docker ps, which --probes-only must never call.
+        """
+        try:
+            status, body = self.ops.http_json("GET", f"{self.t.gateway_url}/", timeout=15)
+        except Exception as exc:
+            return False, str(exc)
+        return True, {"status": status}
+
     # ── run control ────────────────────────────────────────────────────────
 
     def _prepare(self) -> None:
         self.ops.write_text_atomic(self.heartbeat_path, "")  # creates out/
+        if self.probes_only:
+            # Read-only run: .env is opened only to find the LightRAG API key. No copy,
+            # no backup, no rewrite — that is what makes it safe to point at production.
+            try:
+                self.original_env_text = self.ops.read_text(self.real_env_path)
+            except OSError:
+                self.original_env_text = ""
+            self.log("probes-only: .env read for the API key only; no env.original backup, "
+                     "no rewrite, no restart")
+            key = self._api_key()
+            self.log("LightRAG API key: present" if key else "LightRAG API key: absent (open access)")
+            return
         current = self.ops.read_text(self.real_env_path)
         if self.env_original_path.exists():
             # --resume: .env may currently hold experiment values; env.original
@@ -2548,6 +2661,9 @@ class Loop:
         self.log("baseline recovery done; the next experiment starts from the baseline config")
 
     def _run_experiments(self) -> None:
+        if self.probes_only:
+            self._run_probe_only_arm()
+            return
         consecutive_errors = 0
         needs_recovery = False
         for experiment in self.config["experiments"]:
@@ -2729,15 +2845,18 @@ class Loop:
         self.save_state()
 
     def _best_experiment(self) -> tuple[str | None, dict[str, Any]]:
-        """Rank experiments by dev ok+0.5*partial% (a correct refusal counts).
+        """Rank experiments by dev answerable-correct% — accuracy on questions that HAVE answers.
 
-        A state.json written before that key existed still ranks by the old
-        correct+0.5*partial% number, so --resume across the change works.
+        The previous ranking (ok+0.5*partial%) counted a correct refusal as answered, so an
+        arm that refused more could win without knowing more (finding F7). That column is
+        still printed and still stored, and a state.json written before
+        ``dev_answerable_correct_pct`` existed falls back to it, so --resume across the
+        change and older runs still rank.
         """
         results = self.state.get("results") or {}
 
         def score(values: dict[str, Any]) -> float:
-            for key in ("dev_ok_partial_credit_pct", "dev_partial_credit_pct"):
+            for key in RANKING_KEYS:
                 value = values.get(key)
                 if isinstance(value, (int, float)):
                     return float(value)
@@ -2746,7 +2865,7 @@ class Loop:
         ranked = sorted(
             (
                 (name, values) for name, values in results.items()
-                if "dev_ok_partial_credit_pct" in values or "dev_partial_credit_pct" in values
+                if any(isinstance(values.get(key), (int, float)) for key in RANKING_KEYS)
             ),
             key=lambda entry: (score(entry[1]), -entry[1].get("latency_p95", 0.0)),
             reverse=True,
@@ -2756,6 +2875,13 @@ class Loop:
     def _write_recommendation(self) -> None:
         baseline = self.config.get("baseline_env") or {}
         best_name, best = self._best_experiment()
+
+        def score_of(values: dict[str, Any]) -> Any:
+            for key in RANKING_KEYS:
+                if isinstance(values.get(key), (int, float)):
+                    return values[key]
+            return None
+
         self._ensure_results_header()
         lines = [
             "\n## Final state\n",
@@ -2769,21 +2895,19 @@ class Loop:
                 for key, value in (best.get("env") or {}).items()
                 if str(baseline.get(key)) != str(value)
             }
-            lines.append(f"- best experiment by dev ok+0.5*partial%: **{best_name}** "
-                         f"({best.get('dev_ok_partial_credit_pct', best.get('dev_partial_credit_pct'))}%, "
-                         f"p95 {best.get('latency_p95')} s)")
-            # The ranking metric still counts a correct refusal, because every older
-            # run's number does. Say plainly what that number is not: accuracy on the
-            # questions that have answers (F7), which is the one that moves when an
-            # arm actually retrieves better.
-            honest = best.get("dev_answerable_correct_pct")
+            lines.append(f"- best experiment by dev answerable-correct%: **{best_name}** "
+                         f"({score_of(best)}%, p95 {best.get('latency_p95')} s)")
+            # The old headline is kept next to it, because every older run's numbers are
+            # written that way (finding F7: it counted a correct refusal as answered, so a
+            # system that refuses more looked more accurate).
+            old_headline = best.get("dev_ok_partial_credit_pct", best.get("dev_partial_credit_pct"))
+            if isinstance(old_headline, (int, float)):
+                lines.append(f"- for comparability with earlier runs: dev ok+0.5*partial% was "
+                             f"{old_headline}% — that figure counts a correct refusal as "
+                             f"answered, which is why the ranking no longer uses it")
             refusals = best.get("refusal_accuracy_pct")
-            if isinstance(honest, (int, float)):
-                tail = f"; answerable-only accuracy was {honest}%"
-                if isinstance(refusals, (int, float)):
-                    tail += f" and unanswerable probes were refused {refusals}% of the time"
-                lines.append("- that ranking counts a correct refusal as answered, so read it "
-                             "with the split columns" + tail)
+            if isinstance(refusals, (int, float)):
+                lines.append(f"- unanswerable probes were refused {refusals}% of the time")
             if diff:
                 lines.append("- recommended env diff (NOT applied — apply by hand if you agree):")
                 lines.extend(f"  - `{key}={value}`" for key, value in sorted(diff.items()))
@@ -3025,6 +3149,33 @@ def rejudge(
     return 0
 
 
+def probes_only_refusal(config: dict[str, Any]) -> str | None:
+    """Why --probes-only cannot be combined with this experiments file, or None if it can.
+
+    --probes-only promises the stack will not be touched. An experiments file that carries
+    env keys or reingest:true is a promise to touch it, so the combination is refused rather
+    than silently reduced to the read-only parts — the operator may believe they are
+    measuring an arm that was never applied.
+    """
+    problems: list[str] = []
+    if config.get("baseline_env"):
+        problems.append("baseline_env is not empty (that would rewrite .env)")
+    for experiment in config.get("experiments") or []:
+        name = str(experiment.get("name") or "?")
+        if experiment.get("reingest"):
+            problems.append(f"{name}: reingest:true would clear and refill the store")
+        for key in ("env", "gateway_env"):
+            if experiment.get(key):
+                problems.append(f"{name}: {key} would rewrite .env")
+        if experiment.get("chunking"):
+            problems.append(f"{name}: chunking only applies to an ingest this run will not do")
+    if not problems:
+        return None
+    return ("--probes-only is read-only, but the experiments file asks for writes: "
+            + "; ".join(problems) + ". Point --experiments at a file with no env/reingest, "
+            "or drop it entirely")
+
+
 def build_plan_lines(config: dict[str, Any]) -> list[str]:
     """Human-readable plan, used by --dry-run and at the start of a real run."""
     lines = ["plan:"]
@@ -3133,6 +3284,18 @@ def main(argv: list[str] | None = None) -> int:
              "returned (it costs one extra LightRAG query per probe per draw)",
     )
     parser.add_argument(
+        "--probes-only", action="store_true",
+        help="read-only mode: run the dev and held-out probes, the judge and the recall probe "
+             "against the current --gateway-url/--lightrag-url as one pseudo-arm named by "
+             "--arm-name, and write NOTHING to the stack - no .env write or backup, no "
+             "container restart or exec, no store clear, no ingest, no compose command. "
+             "Safe against production because it cannot change it; refused if the "
+             "experiments file carries env keys or reingest:true",
+    )
+    parser.add_argument("--arm-name", default="probes-only", metavar="NAME",
+                       help="the arm name --probes-only writes into results.md "
+                            "(default: probes-only)")
+    parser.add_argument(
         "--recall-mode", default="mix",
         help="LightRAG query mode for the retrieval-recall probe (default mix, the mode the "
              "production bridge sends)",
@@ -3161,14 +3324,25 @@ def main(argv: list[str] | None = None) -> int:
             dev_probe=dev_probe, heldout_probe=heldout_probe,
         )
 
-    if not arguments.experiments or not arguments.out:
-        parser.error("--experiments and --out are required unless --rejudge is given")
+    if arguments.probes_only and not arguments.out:
+        parser.error("--probes-only needs --out")
+    if not arguments.probes_only and (not arguments.experiments or not arguments.out):
+        parser.error("--experiments and --out are required unless --rejudge or "
+                     "--probes-only is given")
 
-    try:
-        config = load_experiments(Path(arguments.experiments))
-    except LoopConfigError as exc:
-        print(f"refusing to run: {exc}", file=sys.stderr)
-        return 3
+    config: dict[str, Any] = {"baseline_env": {}, "experiments": []}
+    if arguments.experiments:
+        try:
+            config = load_experiments(Path(arguments.experiments),
+                                      allow_empty_experiments=arguments.probes_only)
+        except LoopConfigError as exc:
+            print(f"refusing to run: {exc}", file=sys.stderr)
+            return 3
+    if arguments.probes_only:
+        refusal = probes_only_refusal(config)
+        if refusal:
+            print(f"refusing to run: {refusal}", file=sys.stderr)
+            return 3
 
     # Names are checked before docker or HTTP is touched, so a typo costs nothing.
     for label, spec in (("--dev-probes", dev_probe), ("--heldout-probes", heldout_probe)):
@@ -3179,13 +3353,20 @@ def main(argv: list[str] | None = None) -> int:
     # The store this run clears is the store it points at. A run that lands on the
     # production LightRAG and requests reingest wipes production, so it now needs
     # an explicit --allow-production. Checked before any request or docker call.
-    guard_refusal = worker_guard_refusal(target)
-    if guard_refusal:
-        print(f"refusing to run: {guard_refusal}", file=sys.stderr)
-        return 3
-
-    refusal = production_wipe_refusal(target, config)
-    if refusal:
+    if arguments.probes_only:
+        # Nothing to guard: this run cannot reingest, cannot restart and cannot rewrite
+        # .env, so the production-wipe and worker guards do not apply. It is still read
+        # from the production stack, so the target is printed rather than assumed.
+        print(f"probes-only: read-only against lightrag={target.lightrag_url} "
+              f"gateway={target.gateway_url}; arm name={arguments.arm_name!r}; no .env write, "
+              "no docker, no clear, no ingest", file=sys.stderr)
+    else:
+        guard_refusal = worker_guard_refusal(target)
+        if guard_refusal:
+            print(f"refusing to run: {guard_refusal}", file=sys.stderr)
+            return 3
+        refusal = production_wipe_refusal(target, config)
+    if not arguments.probes_only and refusal:
         if arguments.allow_production:
             print(f"WARNING: production reingest approved by --allow-production ({refusal})", file=sys.stderr)
         elif arguments.dry_run:
@@ -3213,6 +3394,8 @@ def main(argv: list[str] | None = None) -> int:
         retrieval_recall=arguments.retrieval_recall,
         recall_mode=arguments.recall_mode,
         compare_arms=tuple(arguments.compare) if arguments.compare else None,
+        probes_only=arguments.probes_only,
+        arm_name=arguments.arm_name,
     )
     # file names only, never their contents
     loop.log(f"probe files: dev={dev_probe} heldout={heldout_probe}")

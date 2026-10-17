@@ -12,7 +12,7 @@
     "    --out ~/rag-project/probe/chunk-bench \\",
     "    --configs docs/ops/loop/chunk-embed-bench-configs.json \\",
     "    --embed-url http://127.0.0.1:8080 --api-key-env OMLX_API_KEY \\",
-    "    --rerank-url http://127.0.0.1:8080 --rerank-model jina-reranker-v3 \\",
+    "    --rerank-url http://127.0.0.1:8080 --rerank-model jina-reranker-v3-mlx \\",
     "    --compare mxbai-recursive-350 current-1200-100-mxbai",
     "The script refuses an --embed-url or --rerank-url on port 9621 (LightRAG) or 8020",
     "(gateway): it talks to the model server, never to the stack under production use.",
@@ -24,9 +24,14 @@
     "(8192-token window, served by oMLX) is the upgrade option, tested here at the same",
     "sizes so the embedder and the chunk size are separate questions.",
     "",
-    "Set the model ids to exactly what oMLX reports for each endpoint. \"bge-m3\" is the",
-    "family name, not necessarily the served id; if the served id differs, edit these arms",
-    "before running, because the embedding cache key includes the model name.",
+    "These are the ids oMLX actually serves, as Hermes confirmed by running this script:",
+    "mxbai-embed-large-v1, bge-m3-mlx-fp16, jina-reranker-v3-mlx. Keep them exact: the",
+    "embedding cache key includes the model name, so a wrong id is a silent re-embed of the",
+    "whole corpus rather than an error.",
+    "",
+    "The rerank request body is the Cohere shape (documents as plain strings). oMLX answers",
+    "HTTP 422 to the Jina shape (results of {text: ...}), which is what the first scratch run",
+    "hit; the response is read from results[] or data[] either way.",
     "",
     "Sanity check before trusting anything: the corpus is 108 chunks at 1200/100 in",
     "production (Hermes' count). current-1200-100-mxbai should land within a few percent of",
@@ -74,7 +79,7 @@
       "_note": "Same chunking as 1A, different embedder: isolates the model from the chunk size.",
       "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
-      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 8192},
       "rerank": null
     },
     {
@@ -82,7 +87,7 @@
       "_note": "BGE-M3 can actually see these, so the size curve is meaningful: 600, 800 and 1200 are unreadable by mxbai and fully readable here.",
       "chunker": {"strategy": "recursive", "chunk_token_size": 600, "overlap": 80,
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
-      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 8192},
       "rerank": null
     },
     {
@@ -90,7 +95,7 @@
       "_note": "Middle of the size curve.",
       "chunker": {"strategy": "recursive", "chunk_token_size": 800, "overlap": 100,
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
-      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 8192},
       "rerank": null
     },
     {
@@ -98,7 +103,7 @@
       "_note": "Production chunk size with an embedder that fits it. If this beats 350, chunk size was never the problem - the embedder window was.",
       "chunker": {"strategy": "recursive", "chunk_token_size": 1200, "overlap": 100,
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
-      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
+      "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 8192},
       "rerank": null
     },
     {
@@ -107,15 +112,15 @@
       "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
       "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
-      "rerank": {"model": "jina-reranker-v3", "top_n_in": 40}
+      "rerank": {"model": "jina-reranker-v3-mlx", "top_n_in": 40}
     },
     {
       "name": "bge-m3-recursive-350+rerank",
       "_note": "Reranker on the upgrade path. Compare against bge-m3-recursive-350 to price the reranker alone.",
       "chunker": {"strategy": "recursive", "chunk_token_size": 350, "overlap": 50,
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
-      "embedder": {"model": "bge-m3", "max_input_tokens": 8192},
-      "rerank": {"model": "jina-reranker-v3", "top_n_in": 40}
+      "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 8192},
+      "rerank": {"model": "jina-reranker-v3-mlx", "top_n_in": 40}
     }
   ]
 }

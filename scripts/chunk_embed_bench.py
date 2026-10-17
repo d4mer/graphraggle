@@ -61,8 +61,9 @@ Usage
         --configs docs/ops/loop/chunk-embed-bench-configs.json \
         --compare mxbai-recursive-350 current-1200-100-mxbai
 
-Endpoints are OpenAI-shaped ``POST {url}/v1/embeddings`` and Jina-shaped ``POST
-{url}/v1/rerank``. Embeddings are cached on disk keyed by sha256(model + prefix + text),
+Endpoints are OpenAI-shaped ``POST {url}/v1/embeddings`` and Cohere-shaped ``POST
+{url}/v1/rerank`` (``documents`` as strings — oMLX answers 422 to the Jina body; Hermes
+proved it). Responses are read tolerously across the vendor envelopes. Embeddings are cached on disk keyed by sha256(model + prefix + text),
 so reruns and added configs are free.
 
 A URL pointing at a production port (9621 LightRAG, 8020 gateway) is refused before any
@@ -107,6 +108,13 @@ from overnight_loop import (  # noqa: E402
 PRODUCTION_BLOCKED_PORTS = frozenset({9621, 8020})
 
 TOP_K_DEFAULTS = (5, 10, 20, 40)
+
+# A corpus list assembled for the ingest worker also holds office and PDF files whose text
+# LightRAG extracts for you. This script has no extractor, so reading one would embed a blob
+# of binary and rank it against real text.
+BINARY_CORPUS_SUFFIXES = frozenset({
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".epub", ".odt", ".rtf",
+})
 EMBED_BATCH_MAX = 16
 HTTP_RETRIES = 3
 CHUNKERS = ("fixed_token", "recursive")
@@ -584,13 +592,15 @@ class ModelClient:
         return [vector for vector in out if vector is not None]
 
     def rerank_order(self, query: str, documents: Sequence[str], top_n: int) -> list[int]:
-        """Return candidate indices best-first using a Jina-shaped /v1/rerank.
+        """Return candidate indices best-first using oMLX's /v1/rerank.
 
-        The request body is Jina's documented shape (``query``, ``results`` of ``{"text":
-        ...}``, ``top_n``). The response is read tolerantly: ``results[].index`` with
-        ``relevance_score``, or a bare list of scores. oMLX's exact rerank contract is
-        UNVERIFIED from this repo, so an unusable body is an explicit error rather than a
-        silent no-op.
+        The request body is the COHERE shape - model, query, ``documents`` as a list of
+        strings, top_n - because that is what oMLX accepts. Hermes proved it the hard way:
+        the Jina shape (``"results": [{"text": ...}]``) comes back HTTP 422, so sending
+        another vendor's documented body would have made every rerank config look like a
+        broken reranker. The response is read tolerantly (``results[]`` or ``data[]`` with
+        ``index`` + ``relevance_score``/``score``, or a bare score list); anything else is an
+        explicit failure rather than a silent no-rerank number.
         """
         if not self.rerank_url:
             raise BenchError("a rerank config needs --rerank-url")
@@ -598,7 +608,7 @@ class ModelClient:
             "model": self.rerank_model,
             "query": query,
             "top_n": min(top_n, len(documents)),
-            "results": [{"text": document} for document in documents],
+            "documents": list(documents),
         }
         started = time.monotonic()
         body = self._post_retry(f"{self.rerank_url}/v1/rerank", payload, "rerank")
@@ -606,8 +616,8 @@ class ModelClient:
         self.rerank_calls += 1
         scored = _rerank_scores(body, len(documents))
         if scored is None:
-            raise BenchError("rerank response had no usable scores (expected "
-                             "results[].index/relevance_score)")
+            raise BenchError("rerank response had no usable scores: expected results[] or "
+                             "data[] with index + relevance_score, or a scores list")
         order = sorted(range(len(documents)), key=lambda index: -scored[index])
         return order
 
@@ -632,10 +642,17 @@ def _embedding_vectors(body: Any, expected: int) -> list[list[float]]:
 
 
 def _rerank_scores(body: Any, count: int) -> list[float] | None:
-    """Scores per candidate from a rerank response, or None if unusable."""
+    """Scores per candidate from a rerank response, or None if unusable.
+
+    Vendors disagree about the envelope, not the content: Cohere/oMLX answer in ``results``,
+    OpenAI-style servers in ``data``. Both are read, and each entry may carry
+    ``relevance_score`` or ``score``, or be a bare number.
+    """
     if not isinstance(body, dict):
         return None
     results = body.get("results")
+    if not isinstance(results, list):
+        results = body.get("data")
     scores: list[float] = [float("-inf")] * count
     if isinstance(results, list):
         seen = 0
@@ -688,6 +705,14 @@ def load_corpus(paths_file: Path) -> list[str]:
     for position, entry in enumerate(entries, start=1):
         if not isinstance(entry, str) or not entry.strip():
             raise BenchError(f"corpus entry {position}/{len(entries)} is not a file path")
+        suffix = Path(entry).suffix.lower()
+        if suffix in BINARY_CORPUS_SUFFIXES:
+            raise BenchError(
+                f"corpus doc {position}/{len(entries)} is a binary document ({suffix}). "
+                "This script reads text only: extract it to .txt first (the ingest worker "
+                "does this for LightRAG; pdftotext or pandoc do it here). Reading it raw "
+                "would embed a compressed container and report a confident number about "
+                "garbage.")
         try:
             raw = Path(entry).read_bytes()
         except OSError:
