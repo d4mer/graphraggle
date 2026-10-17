@@ -1,6 +1,6 @@
 # Hermes brief: confirming ingest of chunk size 350 on stack2 (and comparison with production)
 
-**Status: DRAFT, NOT APPROVED (tarball `chunkrun4` is built and shipped; needs the operator's written go).** Stack2 only for any write.
+**Status: APPROVED by the operator in writing on 2026-10-17 (all steps, including the single held-out scoring). Cutover is NOT approved.** Stack2 only for any write.
 Production is only READ via `--probes-only` (queries, no writes). Never `--allow-production`.
 
 ## Why
