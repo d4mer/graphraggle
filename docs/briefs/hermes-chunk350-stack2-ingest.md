@@ -1,7 +1,6 @@
 # Hermes brief: confirming ingest of chunk size 350 on stack2 (and comparison with production)
 
-**Status: DRAFT, NOT APPROVED. The tools tarball (`chunkrun4`) is not built yet: the lead
-fills in its sha256 after the worker's fixes are reviewed.** Stack2 only for any write.
+**Status: DRAFT, NOT APPROVED (tarball `chunkrun4` is built and shipped; needs the operator's written go).** Stack2 only for any write.
 Production is only READ via `--probes-only` (queries, no writes). Never `--allow-production`.
 
 ## Why
@@ -12,7 +11,7 @@ extraction at 350-token chunks, mix mode, answers) once, on the real corpus, so 
 production over without a second ingest.
 
 ## Steps
-1. Tools: `~/rag-project/docs/chunkrun4.tgz` (sha256 <FILL>, commit <FILL>), verify, extract
+1. Tools: `~/rag-project/docs/chunkrun4.tgz` (sha256 `baa70e74f6e2be067844850f647542242ffa72a722fe2e7bbc515aa13ed0d231`, commit 4642925, manifest `chunkrun4-MANIFEST.txt`), verify, extract
    to `scratch/chunkrun4`. Confirm in the LightRAG image's env.example that the chunk env names
    are `CHUNK_SIZE` and `CHUNK_OVERLAP_SIZE` (report; stop if not).
 2. Pre-flight: production counts (processed/all = 10:10, gateway ingested 10), disk >= 20 GB,
