@@ -3560,6 +3560,89 @@ class TestChunk350ConfirmingExperimentFile(unittest.TestCase):
             self.assertIn(flag, readme, f"the stack2 command is missing {flag!r}")
 
 
+
+class TestStructureChunkingExperimentKey(_Case):
+    """The loop ingests through the SAME chunker the worker ships."""
+
+    TABLE = ("Quarterly numbers\n\n| Region | Q1 | Q2 |\n|---|---|---|\n"
+             + "\n".join(f"| north {index} | {index * 3} | {index * 5} |"
+                         for index in range(1, 9))
+             + "\n\nNorth grew every quarter of the year on the same headcount.\n")
+
+    def _run_with(self, key: dict | None) -> dict:
+        (self.root / "doc1.txt").write_text(self.TABLE, encoding="utf-8")
+        experiment = {"name": "S1", "env": {}, "reingest": True}
+        if key is not None:
+            experiment["structure_chunking"] = key
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                handle_signals=False, print_fn=lambda line: None).run()
+        bodies = [payload for url, payload in self.ops.payloads_seen
+                  if url.endswith("/documents/text")]
+        self.assertEqual(len(bodies), 1)
+        return bodies[0]
+
+    def test_absent_key_leaves_the_request_body_as_it_was(self):
+        body = self._run_with(None)
+        self.assertEqual(set(body), {"text", "file_source"})
+        self.assertEqual(body["text"], self.TABLE)
+
+    def test_the_key_sends_delimited_text_and_the_fixed_token_params(self):
+        body = self._run_with({"budget_tokens": 120, "header_tokens": 20})
+        params = body["chunking"]
+        self.assertEqual(params["strategy"], "fixed_token")
+        self.assertIs(params["params"]["split_by_character_only"], True,
+                      "a real bool: that image 422s on a bool-as-int")
+        self.assertEqual(params["params"]["chunk_token_size"], 120)
+        delimiter = params["params"]["split_by_character"]
+        self.assertNotIn(delimiter, self.TABLE, "the delimiter is ours, not the corpus's")
+        parts = [part for part in body["text"].split(delimiter) if part]
+        self.assertGreater(len(parts), 1, "the text was cut where the plan said")
+        self.assertIn("[Doc: doc1 | Part 1/", parts[0])
+        self.assertIn("[Doc: doc1 | Part 2/", parts[1])
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("structure_chunking doc 1/1: kind=table", log)
+        self.assertIn("pieces=", log)
+        self.assertIn("tokenizer=", log)
+
+    def test_headers_false_is_honoured_end_to_end(self):
+        body = self._run_with({"budget_tokens": 120, "headers": False})
+        self.assertNotIn("[Doc:", body["text"])
+        self.assertIn("split_by_character", body["chunking"]["params"])
+
+    def test_the_spec_defaults_and_types_are_checked_at_startup(self):
+        self.assertIsNone(ol.structure_chunking_spec({}, "A"))
+        self.assertIsNone(ol.structure_chunking_spec({"structure_chunking": False}, "A"))
+        self.assertEqual(ol.structure_chunking_spec({"structure_chunking": True}, "A"),
+                         {"budget_tokens": ol.DEFAULT_BUDGET_TOKENS,
+                          "header_tokens": ol.DEFAULT_HEADER_TOKENS, "headers": True})
+        spec = ol.structure_chunking_spec(
+            {"structure_chunking": {"budget_tokens": 300, "header_tokens": 10,
+                                    "headers": False}}, "A")
+        self.assertEqual(spec, {"budget_tokens": 300, "header_tokens": 10, "headers": False})
+        for bad in ({"structure_chunking": 5},
+                    {"structure_chunking": {"budget_tokens": "350"}},
+                    {"structure_chunking": {"budget_tokens": 10}},
+                    {"structure_chunking": {"header_tokens": -1}},
+                    {"structure_chunking": {"headers": "shuffled"}},
+                    {"structure_chunking": {"overlap": 50}}):
+            with self.subTest(spec=bad):
+                with self.assertRaises(ol.LoopConfigError):
+                    ol.structure_chunking_spec(bad, "A")
+
+    def test_it_cannot_be_combined_with_a_chunking_block(self):
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            ol.structure_chunking_spec({"structure_chunking": True,
+                                        "chunking": {"strategy": "fixed_token",
+                                                     "params": {"chunk_token_size": 400}}}, "A")
+        self.assertIn("both choose where the cuts fall", str(caught.exception))
+
+    def test_the_plan_line_shows_the_arm_is_chunking(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "S1", "env": {}, "reingest": False,
+             "structure_chunking": {"budget_tokens": 350}}]})
+        lines = ol.build_plan_lines(config)
+        self.assertTrue(any("structure_chunking" in line for line in lines), lines)
 class TestChunk350ArmOnStack2(_Case):
     """Run the shipped C350 arm the way the brief will run it, against scripted docker/HTTP."""
 

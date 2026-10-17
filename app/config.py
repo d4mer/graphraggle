@@ -60,6 +60,26 @@ class Settings(BaseSettings):
         default=200, alias="TRANSCRIPT_PREP_HEADER_EVERY_TOKENS"
     )
 
+    # Structure-aware pre-chunking (app/structure_chunker.py): our code chooses every
+    # cut, and the request tells LightRAG to cut ONLY at those markers (fixed_token +
+    # split_by_character_only). Default false, exactly like TRANSCRIPT_PREP_ENABLED:
+    # with it off the submitted text and request body are what they are today. The
+    # dedupe content hash is still taken from the original file bytes, so chunking
+    # can never change a document's identity.
+    structure_chunking_enabled: bool = Field(default=False,
+                                             alias="STRUCTURE_CHUNKING_ENABLED")
+    # Body + header, in the module's conservative token estimate. 350 is what the
+    # offline benchmark picked (docs/ops/runs/chunk-embed-bench.md): small enough for
+    # mxbai's real 512-token window, big enough to stay coherent.
+    structure_chunking_budget_tokens: int = Field(
+        default=350, alias="STRUCTURE_CHUNKING_BUDGET_TOKENS")
+    # The context header is capped separately so a long section path can never eat the
+    # body's room: fields are dropped (path, date, speakers, title last) until it fits.
+    structure_chunking_header_tokens: int = Field(
+        default=25, alias="STRUCTURE_CHUNKING_HEADER_TOKENS")
+    structure_chunking_headers: bool = Field(default=True,
+                                             alias="STRUCTURE_CHUNKING_HEADERS")
+
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
     rerank_binding_api_key: Optional[str] = Field(default=None, alias="RERANK_BINDING_API_KEY")

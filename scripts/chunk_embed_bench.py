@@ -57,9 +57,15 @@ Usage
         [--probes probe/solvay-heldout-v1.jsonl] \
         --out probe/chunk-bench --embed-url http://localhost:8080 \
         --embed-model mxbai-embed-large-v1 --rerank-url http://localhost:8080 \
-        --rerank-model jina-reranker-v3 --api-key-env OMLX_API_KEY \
+        --rerank-model jina-reranker-v3-mlx --api-key-env OMLX_API_KEY \
         --configs docs/ops/loop/chunk-embed-bench-configs.json \
         --compare mxbai-recursive-350 current-1200-100-mxbai
+
+A third chunker, ``"strategy": "structure"``, hands the document to the shipped
+``app.structure_chunker`` (tables split by row with the header repeated, turns cut at
+turn boundaries, deterministic ``[Doc: ... | Part k/n]`` headers). ``headers:
+"shuffled"`` is the placebo arm: same tokens, wrong attachment, so a win can be
+attributed to the information rather than to the extra words.
 
 Endpoints are OpenAI-shaped ``POST {url}/v1/embeddings`` and Cohere-shaped ``POST
 {url}/v1/rerank`` (``documents`` as strings — oMLX answers 422 to the Jina body; Hermes
@@ -117,7 +123,7 @@ BINARY_CORPUS_SUFFIXES = frozenset({
 })
 EMBED_BATCH_MAX = 16
 HTTP_RETRIES = 3
-CHUNKERS = ("fixed_token", "recursive")
+CHUNKERS = ("fixed_token", "recursive", "structure")
 
 
 class BenchError(Exception):
@@ -343,7 +349,45 @@ def chunk_document(text: str, spec: dict[str, Any], tokenizer: Any) -> list[str]
     if strategy == "recursive":
         separators = list(spec.get("separators") or DEFAULT_SEPARATORS)
         return recursive_chunks(text, size, overlap, separators, tokenizer)
+    if strategy == "structure":
+        return structure_chunks(text, spec)
     raise BenchError(f"unknown chunker strategy {strategy!r} (expected one of {CHUNKERS})")
+
+
+def structure_chunks(text: str, spec: dict[str, Any]) -> list[str]:
+    """The SHIPPED structure-aware chunker, not an imitation of it.
+
+    This calls ``app.structure_chunker.chunk_document`` - the same function the worker
+    calls behind ``STRUCTURE_CHUNKING_ENABLED`` and the loop calls behind the
+    ``structure_chunking`` experiment key - so a benchmark win is a statement about
+    code that runs in production. ``filename`` is deliberately empty: the corpus is
+    addressed by position here, and a file name is never allowed into a chunk, an
+    embedding input or a report. The consequence is honest and belongs in the report:
+    the header carries only ``[Section: ... | Part k/n]``, so these numbers are a LOWER
+    BOUND for what the ingest achieves, which also gets title and date from the name.
+    """
+    module = _structure_module()
+    plan = module.chunk_document(
+        text,
+        filename="",
+        budget_tokens=int(spec.get("budget_tokens") or spec.get("chunk_token_size") or 350),
+        header_tokens=int(spec.get("header_tokens") or 25),
+        headers=spec.get("headers", True),
+    )
+    return [piece.render() for piece in plan.pieces]
+
+
+def _structure_module() -> Any:
+    """Import app.structure_chunker from a script (repo root onto sys.path)."""
+    try:
+        from app import structure_chunker as module    # noqa: PLC0415
+        return module
+    except ImportError:
+        repo_root = str(_SCRIPT_DIR.parent)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from app import structure_chunker as module    # noqa: PLC0415
+        return module
 
 
 # ── configs file ────────────────────────────────────────────────────────────
@@ -387,6 +431,20 @@ def load_configs(path: Path) -> list[dict[str, Any]]:
         if overlap >= size:
             raise BenchError(f"config {name}: chunker.overlap must be smaller than "
                              f"chunk_token_size ({overlap} >= {size})")
+        budget = chunker.get("budget_tokens")
+        if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool)
+                                   or budget < 32):
+            raise BenchError(f"config {name}: chunker.budget_tokens must be an int >= 32")
+        header_tokens = chunker.get("header_tokens")
+        if header_tokens is not None and (not isinstance(header_tokens, int)
+                                          or isinstance(header_tokens, bool)
+                                          or header_tokens < 0):
+            raise BenchError(f"config {name}: chunker.header_tokens must be a non-negative int")
+        headers = chunker.get("headers")
+        if headers is not None and not (isinstance(headers, bool)
+                                        or (isinstance(headers, str) and headers == "shuffled")):
+            raise BenchError(f"config {name}: chunker.headers must be true, false or "
+                             '\"shuffled\" (the placebo)')
         separators = chunker.get("separators")
         if separators is not None and (
                 not isinstance(separators, list)
@@ -425,6 +483,9 @@ def load_configs(path: Path) -> list[dict[str, Any]]:
                 "chunk_token_size": int(size),
                 "overlap": int(overlap),
                 **({"separators": [str(item) for item in separators]} if separators else {}),
+                **({"budget_tokens": int(budget)} if budget is not None else {}),
+                **({"header_tokens": int(header_tokens)} if header_tokens is not None else {}),
+                **({"headers": headers} if headers is not None else {}),
             },
             "embedder": {
                 "model": str(embedder["model"]),

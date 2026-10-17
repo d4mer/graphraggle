@@ -21,6 +21,12 @@ from .state_store import (
     upsert_document,
     update_document_state,
 )
+from .structure_chunker import (
+    DEFAULT_BUDGET_TOKENS,
+    DEFAULT_HEADER_TOKENS,
+    chunk_document,
+    render_for_lightrag,
+)
 from .transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
 from .validation import validate_file
 
@@ -214,6 +220,58 @@ def prepare_transcript_payload(path: Path, text: str) -> tuple[str, dict[str, An
         "transcript_prep_labels_parsed": result.labels_parsed,
         "transcript_prep_labels_rejected": result.labels_rejected,
         "transcript_prep_labels_unparseable": result.labels_unparseable,
+    }
+
+
+def prepare_structure_payload(
+    path: Path, text: str
+) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
+    """Optional structure-aware chunking, behind ``STRUCTURE_CHUNKING_ENABLED``.
+
+    Returns ``(payload, chunking_params, worker_metadata)``. When the flag is off the
+    payload comes back byte-identical with no params, so the request body is exactly
+    what it is today. When it is on, :mod:`app.structure_chunker` chooses every cut and
+    the params tell LightRAG to cut ONLY there (``fixed_token`` +
+    ``split_by_character_only``) - the mechanism 1.5.7 offers instead of a custom
+    chunker, which it does not accept.
+
+    Nothing here can damage a document: if the planner raises, or produces no pieces,
+    the ORIGINAL text is returned with the reason recorded, and the request goes out
+    without chunking params. The dedupe hash is taken from the file bytes before this
+    call, so chunking can never change a document's identity. Metadata is counts and
+    names only - no piece text, no corpus words - exactly as transcript_prep records.
+    """
+    if not settings.structure_chunking_enabled:
+        return text, None, {}
+    try:
+        plan = chunk_document(
+            text,
+            filename=path.name,
+            budget_tokens=int(settings.structure_chunking_budget_tokens or DEFAULT_BUDGET_TOKENS),
+            header_tokens=int(settings.structure_chunking_header_tokens or DEFAULT_HEADER_TOKENS),
+            headers=bool(settings.structure_chunking_headers),
+        )
+        if plan.empty:
+            raise ValueError("chunk plan had no pieces")
+        payload, params = render_for_lightrag(plan)
+    except Exception as exc:  # the ingest must never depend on this module
+        return text, None, {
+            "structure_chunking": "failed",
+            "structure_chunking_reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+    return payload, params, {
+        "structure_chunking": "applied",
+        "structure_chunking_kind": plan.kind_detected,
+        "structure_chunking_pieces": len(plan.pieces),
+        "structure_chunking_budget_tokens": plan.stats.get("budget_tokens"),
+        "structure_chunking_tokens_p50": plan.stats.get("tokens_p50"),
+        "structure_chunking_tokens_p95": plan.stats.get("tokens_p95"),
+        "structure_chunking_tokens_max": plan.stats.get("tokens_max"),
+        "structure_chunking_dropped_lines": plan.stats.get("dropped_running_lines", 0),
+        "structure_chunking_repeated_words": plan.stats.get("repeated_words", 0),
+        "structure_chunking_tokenizer": plan.stats.get("tokenizer"),
+        "structure_chunking_warnings": list(plan.warnings),
+        "structure_chunking_reason": None,
     }
 
 
@@ -572,11 +630,19 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
     detected_encoding = None
     text_payload = None
     prep_updates: dict[str, Any] = {}
+    structure_params: dict[str, Any] | None = None
+    structure_updates: dict[str, Any] = {}
     if path.suffix.lower() in TEXT_EXTENSIONS:
         try:
             text_payload, detected_encoding = read_text_with_fallbacks(path)
             text_payload = normalize_text_submission_payload(text_payload)
             text_payload, prep_updates = prepare_transcript_payload(path, text_payload)
+            # Order matters: transcript_prep labels turns and inserts its headers,
+            # then the structure chunker decides where the cuts fall in that text.
+            # Binary uploads (.pdf/.docx) never reach here: LightRAG parses those.
+            text_payload, structure_params, structure_updates = prepare_structure_payload(
+                path, text_payload
+            )
         except Exception as exc:
             await update_document_state(
                 str(path),
@@ -681,16 +747,22 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
         # Recorded before the HTTP call so both the success upsert and the failure
         # write-backs carry it: "was this document submitted prepared?"
         warnings_json = merge_warning_metadata(warnings_json, worker_updates=prep_updates)
+    if structure_updates:
+        # Same reason, one step later: "was this document submitted pre-chunked, and
+        # what did the plan look like?" Counts and names only, never text.
+        warnings_json = merge_warning_metadata(warnings_json, worker_updates=structure_updates)
 
     try:
         if text_payload is not None:
-            resp = await client.post_json(
-                "/documents/text",
-                {
-                    "text": text_payload,
-                    "file_source": str(path),
-                },
-            )
+            body: dict[str, Any] = {
+                "text": text_payload,
+                "file_source": str(path),
+            }
+            if structure_params is not None:
+                # With the flag off this key is absent, so the request body is
+                # byte-identical to what it was before the feature existed.
+                body["chunking"] = structure_params
+            resp = await client.post_json("/documents/text", body)
         else:
             resp = await client.post_file("/documents/upload", str(path))
     except Exception as exc:

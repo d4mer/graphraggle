@@ -61,6 +61,16 @@ worker, so without this key an experiment cannot measure what the
 ``TRANSCRIPT_PREP_ENABLED`` worker would send. Default false: file text is posted
 unchanged, exactly as before.
 
+An experiment may also carry ``"structure_chunking": {"budget_tokens": 350,
+"header_tokens": 25, "headers": true}`` to chunk each corpus file with
+``app.structure_chunker`` - the shipped structure-aware pre-chunker behind the worker's
+``STRUCTURE_CHUNKING_ENABLED`` - and post the result with the ``fixed_token`` +
+``split_by_character_only`` params it produced. In other words: our code chooses every
+cut, and LightRAG is told to cut only there. The key is validated at startup (types,
+bounds, unknown keys) and cannot be combined with ``chunking``: an arm that sends two
+instructions about where the cuts fall answers nothing. Absent, the request body is
+byte-identical to what this driver posted before the key existed.
+
 An experiment may also carry ``"chunking": {"strategy": ..., "params": {...}}``, the
 per-request chunker LightRAG 1.5.7 accepts on ``/documents/text``. Strategies and
 param keys are checked structurally at startup (LightRAG itself answers an unknown
@@ -173,6 +183,12 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from app.structure_chunker import (
+    DEFAULT_BUDGET_TOKENS,
+    DEFAULT_HEADER_TOKENS,
+    chunk_document as structure_chunk_document,
+    render_for_lightrag,
+)
 from app.transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
 
 # ── Configuration surface ───────────────────────────────────────────────────
@@ -703,6 +719,7 @@ def load_experiments(path: Path, allow_empty_experiments: bool = False
                     f"experiment {name}: chunking.params for {strategy}: " + "; ".join(problems)
                 )
             chunking = {"strategy": strategy, "params": params}
+        structure_chunking = structure_chunking_spec(entry, name)
         if entry.get("recall_mode") is not None and not isinstance(entry["recall_mode"], str):
             raise LoopConfigError(f"experiment {name}: recall_mode must be a string")
         experiments.append({
@@ -717,6 +734,11 @@ def load_experiments(path: Path, allow_empty_experiments: bool = False
             # Experiment-level chunker override; None means the request body is
             # byte-identical to what this driver posted before the key existed.
             "chunking": chunking,
+            # Experiment-level structure-aware pre-chunking (app/structure_chunker.py):
+            # the loop chunks the text itself and posts the delimiter markers plus the
+            # fixed_token/split_by_character_only params. None (the default) leaves the
+            # request body exactly as it was before the key existed.
+            "structure_chunking": structure_chunking,
             "probe_concurrency": concurrency,
             # Which LightRAG mode the retrieval-recall probe asks for the context in.
             # The metric itself is on unless --no-retrieval-recall is given; this only
@@ -2076,6 +2098,7 @@ class Loop:
         *,
         transcript_prep: bool = False,
         chunking: dict[str, Any] | None = None,
+        structure_chunking: dict[str, Any] | None = None,
         doc_label: str = "doc",
     ) -> float:
         started = self.ops.now()
@@ -2103,6 +2126,28 @@ class Loop:
                     f"rejected {prepared.labels_rejected} (unparseable "
                     f"{prepared.labels_unparseable})"
                 )
+        if structure_chunking:
+            # Experiment-level key "structure_chunking": the SAME function the worker
+            # calls behind STRUCTURE_CHUNKING_ENABLED, so an arm measures the shipped
+            # path and not a driver's imitation of it.
+            plan = structure_chunk_document(
+                text,
+                filename=path.name,
+                budget_tokens=structure_chunking["budget_tokens"],
+                header_tokens=structure_chunking["header_tokens"],
+                headers=structure_chunking["headers"],
+            )
+            text, params = render_for_lightrag(plan)
+            chunking = params
+            self.log(
+                f"structure_chunking {doc_label}: kind={plan.kind_detected} "
+                f"pieces={len(plan.pieces)} tokens p50/p95/max="
+                f"{plan.stats.get('tokens_p50')}/{plan.stats.get('tokens_p95')}/"
+                f"{plan.stats.get('tokens_max')} dropped_lines="
+                f"{plan.stats.get('dropped_running_lines', 0)} repeated_words="
+                f"{plan.stats.get('repeated_words', 0)} tokenizer={plan.stats.get('tokenizer')}"
+                + (f" warnings={','.join(plan.warnings)}" if plan.warnings else "")
+            )
         payload: dict[str, Any] = {"text": text, "file_source": str(path)}
         if chunking:
             # Experiment-level key "chunking": a per-request chunker for LightRAG
@@ -2145,6 +2190,7 @@ class Loop:
         seconds_per_doc: list[float] = []
         prep = bool(experiment.get("transcript_prep"))
         chunking = experiment.get("chunking")
+        structure = experiment.get("structure_chunking")
         paths = self._corpus_paths()
         total = len(paths)
         for index, path in enumerate(paths, 1):
@@ -2152,8 +2198,9 @@ class Loop:
             # paths (the operator's transcript names are themselves sensitive).
             doc_label = f"doc {index}/{total}"
             seconds = self._attempt(
-                lambda p=path, q=prep, c=chunking, d=doc_label:
-                self._insert_one(p, transcript_prep=q, chunking=c, doc_label=d),
+                lambda p=path, q=prep, c=chunking, r=structure, d=doc_label:
+                self._insert_one(p, transcript_prep=q, chunking=c, structure_chunking=r,
+                                 doc_label=d),
                 what=f"insert {doc_label}",
                 attempts=2,
             )
@@ -2557,7 +2604,7 @@ class Loop:
         experiment = {
             "name": self.arm_name, "env": {}, "gateway_env": {}, "reingest": False,
             "transcript_prep": False, "chunking": None, "probe_concurrency": 1,
-            "recall_mode": "", "probes_only": True,
+            "recall_mode": "", "probes_only": True, "structure_chunking": None,
         }
         name = self.arm_name
         self.recall_mode_override = None
@@ -3176,6 +3223,47 @@ def probes_only_refusal(config: dict[str, Any]) -> str | None:
             "or drop it entirely")
 
 
+def structure_chunking_spec(entry: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """Validate an experiment's ``structure_chunking`` key, or None when absent.
+
+    Shape: ``{"budget_tokens": 350, "header_tokens": 25, "headers": true}`` - every
+    field optional, all types checked here rather than in the middle of an ingest.
+    It cannot be combined with ``chunking``: both choose the cut list, and an arm that
+    sends two instructions says nothing about which one the result came from.
+    """
+    raw = entry.get("structure_chunking")
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise LoopConfigError(f"experiment {name}: structure_chunking must be an object, "
+                              "true or false")
+    spec: dict[str, Any] = {"budget_tokens": DEFAULT_BUDGET_TOKENS,
+                            "header_tokens": DEFAULT_HEADER_TOKENS, "headers": True}
+    for key, floor in (("budget_tokens", 32), ("header_tokens", 0)):
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+                raise LoopConfigError(f"experiment {name}: structure_chunking.{key} must be "
+                                      f"an int >= {floor}")
+            spec[key] = int(value)
+    if "headers" in raw:
+        headers = raw["headers"]
+        if not isinstance(headers, bool):
+            raise LoopConfigError(f"experiment {name}: structure_chunking.headers must be "
+                                  "true or false")
+        spec["headers"] = bool(headers)
+    unknown = sorted(set(raw) - set(spec))
+    if unknown:
+        raise LoopConfigError(f"experiment {name}: structure_chunking has unknown keys: "
+                              + ", ".join(unknown))
+    if entry.get("chunking"):
+        raise LoopConfigError(f"experiment {name}: structure_chunking and chunking cannot be "
+                              "combined - both choose where the cuts fall")
+    return spec
+
+
 def build_plan_lines(config: dict[str, Any]) -> list[str]:
     """Human-readable plan, used by --dry-run and at the start of a real run."""
     lines = ["plan:"]
@@ -3191,6 +3279,7 @@ def build_plan_lines(config: dict[str, Any]) -> list[str]:
             f"reingest={experiment['reingest']} probe_concurrency={experiment['probe_concurrency']}"
             + (f" chunking={experiment['chunking']['strategy']}" if experiment.get("chunking") else "")
             + (" transcript_prep" if experiment.get("transcript_prep") else "")
+            + (" structure_chunking" if experiment.get("structure_chunking") else "")
         )
     return lines
 

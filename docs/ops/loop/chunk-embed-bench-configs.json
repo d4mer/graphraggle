@@ -24,6 +24,20 @@
     "(8192-token window, served by oMLX) is the upgrade option, tested here at the same",
     "sizes so the embedder and the chunk size are separate questions.",
     "",
+    "The four 'structure-*' arms call app/structure_chunker.chunk_document — the shipped",
+    "pre-chunker the worker uses behind STRUCTURE_CHUNKING_ENABLED and the loop uses via",
+    "the structure_chunking experiment key — so a win here transfers to ingest by",
+    "construction. Their budget_tokens (350) is body PLUS the context header, counted in",
+    "that module's own conservative estimate, which is a little stricter than this",
+    "script's tokenizer; chunk token columns are therefore slightly under the budget.",
+    "One honest caveat: the benchmark passes an empty filename (documents are addressed",
+    "position, and a corpus file name must never reach a chunk, an embedding input or a",
+    "report), so those headers carry only [Section: ... | Part k/n] and not the title and",
+    "date the ingest gets. Treat structure-* recall as a lower bound for ingest.",
+    "structure-350-shuffled is a placebo, not a bug: same words, wrong attachment. If it",
+    "scores the same as structure-350, the header is not doing the work and the argument",
+    "for it collapses.",
+    "",
     "These are the ids oMLX actually serves, as Hermes confirmed by running this script:",
     "mxbai-embed-large-v1, bge-m3-mlx-fp16, jina-reranker-v3-mlx. Keep them exact: the",
     "embedding cache key includes the model name, so a wrong id is a silent re-embed of the",
@@ -121,6 +135,37 @@
                   "separators": ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]},
       "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 8192},
       "rerank": {"model": "jina-reranker-v3-mlx", "top_n_in": 40}
+    },
+    {
+      "name": "structure-350",
+      "_note": "The shipped structure-aware chunker (app/structure_chunker.py, the same function behind STRUCTURE_CHUNKING_ENABLED): cuts at turns, sections and table rows, table header row repeated on every piece of a split table, deterministic context header. budget_tokens is body+header.",
+      "chunker": {"strategy": "structure", "budget_tokens": 350, "header_tokens": 25,
+                  "headers": true},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": null
+    },
+    {
+      "name": "structure-350+rerank",
+      "_note": "Same chunker with the reranker the stack already runs: this is the arm that matches the offline benchmark's winner shape (small coherent pieces + jina reorder).",
+      "chunker": {"strategy": "structure", "budget_tokens": 350, "header_tokens": 25,
+                  "headers": true},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": {"model": "jina-reranker-v3-mlx", "top_n_in": 40}
+    },
+    {
+      "name": "structure-350-nohdr",
+      "_note": "No context header at all: prices the header itself against structure-350.",
+      "chunker": {"strategy": "structure", "budget_tokens": 350, "headers": false},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": null
+    },
+    {
+      "name": "structure-350-shuffled",
+      "_note": "Placebo: the same headers, attached to the WRONG pieces. A real win must beat this, not merely beat nohdr — if the gain were just extra tokens, a wrong header would work as well.",
+      "chunker": {"strategy": "structure", "budget_tokens": 350, "header_tokens": 25,
+                  "headers": "shuffled"},
+      "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+      "rerank": null
     }
   ]
 }
