@@ -45,3 +45,25 @@ must use the window, not a 512 cap.
 ## Done when
 Full suite green in a bare environment and the control unchanged; counts reported. Hand back lists files,
 the BGE-M3 tokenizer behaviour you could/could not verify, and anything unverified.
+
+## AMENDMENT (operator, 2026-10-18) - NO CHUNK-SIZE CAP. Supersedes item 1's budget default and item 2's merge target.
+The operator wants a dynamic method that does NOT restrict chunk size: the document decides.
+- Remove the configured piece budget as a design constant. The ONLY hard limit is the embedder window:
+  BGE-M3 = 8192 tokens (BGE-M3 tokenizer), minus a safety margin (setting, default ~7500). A unit is
+  split only when it cannot fit that window, at the best INTERNAL boundary in this order: sub-heading,
+  paragraph, table row (header repeated), turn change; never by token count alone.
+- Natural units: a whole section (heading + its content), a whole table, a run of turns of one topic.
+- Merge floor, not a cap: pieces below a minimum (setting, default ~150 tokens) merge into the adjacent
+  unit (a heading never stands alone). This fixes the 596-piece PDF without limiting the maximum.
+- Transcripts / flat text with no headings (including the monolithic and unrecognised-label ones): add
+  topic-shift segmentation. Embed windows of turns/sentences with BGE-M3 via the existing oMLX embedder
+  client, cut where adjacent-window similarity drops (TextTiling-style: depth-score minima, threshold a
+  setting), so each chunk is one topic of whatever length. Needs a deterministic fallback with no embedder
+  call (cut at turn boundaries near the window limit) used when the embedder is unreachable, and the
+  fallback is recorded in the metadata. Embedder calls happen in the worker, not LightRAG; keep them
+  batched and bounded; cache by sha256(text).
+- chunk_token_size sent to LightRAG per document = largest piece + margin (already so); assert it.
+- Tests: a 40k-token flat transcript with 5 synthetic topics (distinct vocabularies) cuts near the topic
+  changes into 5 pieces of unequal size; a 7000-token section stays ONE piece; a 12000-token section
+  splits at its sub-headings; a heading-only line merges forward. Report which parts you could not verify
+  offline (real BGE-M3 similarity behaviour).
