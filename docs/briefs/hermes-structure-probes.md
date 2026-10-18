@@ -1,4 +1,4 @@
-# Hermes brief: structure probes and a real-document check of the pre-chunker (read-only)
+# Hermes brief: structure probes (Part 1 now; Part 2 pre-chunker check later) - read-only
 
 **Status: requested by the operator on 2026-10-18 ("brief the worker and Hermes").** Read-only on
 production: no `.env` edit, no restart, no ingest, no store change, nothing written to production
@@ -31,20 +31,10 @@ Each: 15 to 20 probes (target 8 PDF, 8 DOCX; if the documents cannot support tha
   count; drop any probe that fails.
 - Do not report any question, quote or file name. Report ids, counts and per-document spread only.
 
-## Part 2: run the shipped pre-chunker on the real text copies (counts only)
-After the worker hand-back is committed (the lead will tell you the commit and ship a tarball), OR now
-using the pre-chunker already on branch `context-chunking` at commit `1e93d9a` (tarball chunkrun4 plus
-an updated one if the lead sends it): call `app.structure_chunker.chunk_document` on each of the 10 text
-copies with `filename=""`, `budget_tokens=350`, and report per document, masked:
-- kind detected; piece count; piece token p50/p90/max (cl100k) and in mxbai WordPiece tokens (use the
-  model's tokenizer from the oMLX model directory or HF cache; say which);
-- pieces over 512 WordPiece tokens (count);
-- for doc05 (DOCX) and doc07 (PDF): table rows split across pieces, table pieces carrying the repeated
-  header row, running header/footer lines dropped (count of lines and of distinct lines), warnings;
-- how many of the structure and dev/held-out probe evidence quotes are still found verbatim in the
-  concatenated pieces (normalised). List ids that are lost; this is the "lost text" check.
-- same table for fixed 350/50 (cl100k token window) for comparison.
-Run it in a scratch directory with `python -I`. No network.
+## Part 2: DEFERRED - do not start
+Running the shipped pre-chunker on the 10 text copies (counts only) needs a fresh tarball of the
+`context-chunking` branch with the benchmark fixes. The lead will send it with a follow-up message and
+the exact checks. Stop after Part 1 and report.
 
 ## Hard rules
 - Read-only on production and on `source_docs/`, `uploads/`, `lightrag_store/`. No ingest, no restart.

@@ -1,99 +1,89 @@
-# Worker context — graphraggle dev-worker
+# worker — session context (rewritten 2026-10-17 18:10 local)
 
-Last rewrite: after delivering qitem-20261015133902-cf21b1c5 (multi-stack loop flags).
-Earlier per-item history is in git (`git log --oneline` on `master` and `chunking`); this file
-keeps only live state, load-bearing facts and open threads.
+## Queue state
 
-## Current state — queue empty, nothing owned
+`rig queue list --owned` → `[]`. Nothing in my inbox to claim. The last row,
+**`qitem-20261017170723-9123db5e`** ("Structure-aware pre-chunker on context-chunking
+branch") is **handed-off to `orch-lead@graphraggle`** (terminal for me, since 18:06Z).
+Full handoff note is in the row (`rig queue show qitem-20261017170723-9123db5e --full --json`).
+Watchdog `parked-owner-consumer` job `01M4AYEG0WK885GGJPDGRNVGD5` may still fire; on a wake,
+check `rig queue list --owned` / `inbox-pending dev-worker@graphraggle` and if empty, report
+that the row is handed off and wait.
 
-Last item: **qitem-20261015133902-cf21b1c5** (multi-stack loop flags) — verified and committed by
-the lead as **7d74feb** on branch `chunking`; lead explicitly kept `--lightrag-service`. No
-further work on it. Queue is empty (`rig queue list` -> 0 rows); the
-`parked-owner-consumer` watchdog (job 01M4AYEG0WK885GGJPDGRNVGD5) is parked on the handoff. If it
-fires and the queue is still empty, say so honestly and park again — do not invent work.
+## Where the work is
 
-Worktrees: `/home/maverick/work/graphraggle-chunking` = branch `chunking`, HEAD **7d74feb**, clean
-working tree, suite **776 passed, 2 warnings, 16 subtests**. `/home/maverick/work/graphraggle` =
-branch `master` (4741cab + this context commit), suite 698. Shared venv:
-`/home/maverick/work/graphraggle/.venv`. Chunking-program work happens in the **worktree**;
-release-line docs work happens in **master**. I never `git push`.
+- **Worktree:** `/home/maverick/work/graphraggle-ctx`, branch **`context-chunking`** (from
+  `chunking` @ `4642925`). Left **uncommitted on purpose** — the lead commits and pushes; I
+  never push. `git status`: M `app/config.py`, M `app/worker.py`, M `scripts/overnight_loop.py`,
+  M `scripts/chunk_embed_bench.py`, M `docs/ops/loop/chunk-embed-bench-configs.json`,
+  M `tests/test_overnight_loop.py`, NEW `app/structure_chunker.py` (1164 lines),
+  NEW `tests/test_structure_chunker.py` (~800 lines), NEW `docs/ops/loop/README.md`.
+- Main checkout `/home/maverick/work/graphraggle` is on `master`; research/plan docs and this
+  file live there. Venv is the main checkout's `.venv`.
+- Snapshot of every touched file: `/tmp/ctx_snap/` (aggregate sha `3ba6e30e9525…`), used to
+  prove the sabotage controls were restored byte-identical.
 
-What 7d74feb contains (for later reference): `Target` fields `worker_container` / `compose_file` /
-`compose_project` / `lightrag_service`; `--worker-container NAME` (default production
-`rag-ingest-worker`, `none` skips the guard, `none` refused by `worker_guard_refusal()` when the
-RESOLVED LightRAG URL is production); `--compose-file`/`--compose-project` on every compose call;
-`tests/conftest.py` socket guard on ports 9621/8020; 16 new loop tests + 4 guard tests; the
-`experiments-chunking.json` `_readme` run line and wipe warning.
+## Test status
 
-## Load-bearing rules I learned the hard way
+Bare env, socket guard live:
+`.venv/bin/python -m pytest tests/ -q` → **944 passed, 2 warnings, 134 subtests in ~4.8s**.
+Branch baseline at `4642925` was 889 passed / 69 subtests; I added 55 tests (+65 subtests).
+Control round: 13 in-place reversions of the new behaviour → **50 failed, 290 passed**, then
+restored sha256-identical and green again.
 
-1. **A test must never open a socket to production.** Patching module constants only works if
-   the code reads them at call time; a default frozen at import time aimed the overnight-loop
-   suite at localhost:9621 / 127.0.0.1:8020 for hours. Hence the conftest guard; keep new
-   network-y drivers resolved at construction (`Target.__post_init__` with `None` sentinels).
-2. Prove controls by reverting `scripts/` (and `app/`), not the tests.
-3. Never enable `COMPANY_AWARE_DEDUPE` without a fresh cross-company leak probe — the
-   `cross_company_not_indexed` guard is dead code in `app/graphraggle/ingest.py`
-   (`_find_duplicate` runs before the branch).
-4. The overnight loop's `--reingest` wipes the LightRAG store; `--allow-production` is required
-   when the *resolved* URL is production, and `--dry-run` warns instead of refusing.
-5. `docs/` files are hand-maintained markdown with an index + a "Last reviewed" line: bump the
-   month, add one line, don't restructure.
-6. `app/config.py` builds `settings` at import; tests rely on `tests/conftest.py` env defaults.
+## What shipped in this item (so I can answer follow-ups without re-reading 1200 lines)
 
-## LightRAG 1.5.7 chunker reference (Hermes-confirmed, from the image)
+`app/structure_chunker.py` is pure (no I/O/clock/random/settings) and imports only stdlib +
+`app.transcript_prep` (`_parse_turn`, `_leading_parenthetical`, `_classify_paren_label`,
+`_is_noise`, `_metadata_from_name`, `_HEADER_RE`) so there is exactly ONE transcript parser.
+`chunk_document(text, filename=, budget_tokens=350, header_tokens=25,
+headers=True|False|"shuffled", kind="auto") -> ChunkPlan`; `render_for_lightrag(plan) ->
+(text, chunking_params)` with `{"strategy":"fixed_token","params":{"chunk_token_size":budget,
+"split_by_character":<from DELIMITER_CANDIDATES, \x1e first>,"split_by_character_only":True}}`
+(names verified against the 1.5.7 wheel; real bool, never 1).
+Rules: transcript turns whole → sentences → clauses → words; headings (`#`, `1.2.3`, short
+ALL-CAPS) → section path; tables (pipe/tab/columnar) whole → by row repeating header+rule →
+by cell repeating the row key → a cell only by words; captions on the first piece; lists with
+lead-in; furniture = short fragment + no sentence punctuation + not a turn/heading/bullet/table
+line + ≥3 repeats (counted in `stats.dropped_running_lines`); plain = paragraphs → sentences →
+words. Header `[Doc: … | Date: … | Section: A / B | Part k/n]`, drop order path → date →
+speakers → title, part marker always survives. Budget covers header (reserved before packing).
+Token count: tiktoken if importable else conservative overcount `max(chars/3.6, ws-units)` —
+tiktoken is NOT installed here, so all local numbers are overcounts (safe direction).
 
-Shared: `chunk_token_size`. `fixed_token` adds `chunk_overlap_token_size`, `split_by_character(_only)`;
-`recursive_character` adds overlap + `separators` (list[str], ≤64 items, ≤256 chars each);
-`paragraph_semantic` adds overlap + `drop_references`; `semantic_vector` has **no overlap key** and
-adds `breakpoint_threshold_type` (sentence|paragraph|semantic_similarity), `breakpoint_threshold_amount`,
-`buffer_size` (≤10). `sentence_split_regex` is env-only — rejected by the API. Defaults the running
-production container reports: fixed_token, 1200/100. Strategy values include `custom`.
+Integration: `STRUCTURE_CHUNKING_{ENABLED,BUDGET_TOKENS,HEADER_TOKENS,HEADERS}` in
+`app/config.py`; `prepare_structure_payload()` in `app/worker.py` runs **after**
+`prepare_transcript_payload()`, adds the `chunking` key only when enabled, keeps the dedupe
+hash on original bytes, records provenance as counts/names in `warnings_json`, falls back to
+untouched text + reason on failure. Loop: per-arm `"structure_chunking": {...}`
+(`ol.structure_chunking_spec` validator, refused together with `"chunking"`, no whitelist
+change needed since nothing new goes into `.env`, `--probes-only` untouched). Bench:
+`"chunker": {"strategy":"structure", ...}` importing the shipped module (test asserts
+byte-identical pieces), grid arms `structure-350`, `structure-350+rerank`,
+`structure-350-nohdr`, `structure-350-shuffled` (recursive-350 already existed).
 
-## Chunking program state (branch `chunking`)
+Two hazards the sabotage round found and that are now fixed + tested: (a) the block scan must
+always consume a line (a disabled branch made it loop forever on `# Heading`) —
+`test_no_input_shape_can_stall_the_scan`; (b) furniture vs headings: structure lines are exempt,
+otherwise a repeated heading deleted a section path.
 
-Committed by the lead: `b535792` transcript prep (`app/transcript_prep.py`, config flags,
-worker + loop `transcript_prep` block), `b7fe10f` real `(Label)` dialect + per-request chunking
-arms (`Target`, `CHUNKING_PARAM_KEYS`, `chunking_param_problems()`, `production_wipe_refusal()`,
-doc-position logs, `docs/ops/loop/experiments-chunking.json` with C0/P1/C2/C1/P2 — C0 and P1 are
-the mandatory A/B). The program still needs **real transcript labels**:
-`grep -cE '^\([A-Z][A-Za-z0-9 ._-]{1,24}\)' source_docs/Transcripts/*/*.txt`.
+## Open threads for the lead (do not act on these unasked)
 
-## Standing out-of-brief findings (lead's call)
+1. The **stack2 endpoint contradiction**: `docs/ops/loop/experiments-chunk350.json` `_readme`
+   uses 127.0.0.1:9622 / gateway 8021 / project `rag-chunk2` / container `lightrag-server2`,
+   while `experiments-chunking.json` and `docs/ops/second-instance.md` describe 9631/8030 /
+   project `stack2`. Flagged twice; needs one decision.
+2. Unmeasured assumption: that LightRAG cuts ONLY at the delimiter (`split_by_character_only`)
+   and that the store ends up with exactly my pieces — needs one real ingest + a chunk count.
+3. No `experiments-structure-chunking.json` loop file yet (bench grid has the A/B/C/D arms);
+   one JSON away if the lead wants ingest-arms.
+4. Bench grid is now 21 configs and the bench has no per-config selector — only a `--configs`
+   file. A trimmed file is the cheap way to run just the structure arms.
 
-1. Stale podman/ports facts in `docs/01,02,03,04,06,09,10,12`,
-   `docs/quick-reference.md`, `docs/README.md`, `docs/lightrag-webui-guide.md`,
-   `docs/ops/rollback-and-containment.md`, `scripts/install_rag_stack.sh`.
-2. `docs/07-openwebui-guide.md:180` says query mode defaults to `hybrid`; the code
-   default is `mix`.
-3. Repo `compose.yml` has no chromadb service though production runs `rag-chromadb`.
-4. HyperQwen endpoints use `192.168.1.195`; docs say the oMLX is `192.168.1.190:1234`.
-5. Docs still say "binary docs ingest through `/documents/upload`" — stale for
-   `.pptx` (packet-27) and for `source_docs` files (packet-25).
-6. `run()`'s generic `except Exception` turns any internal bug into run status
-   `fatal` with exit 2 and only a `self.log` line (invisible when `print_fn` is
-   silenced). It hid a test-harness `NameError` for me twice.
+## Habits that keep this seat honest
 
-### Added while on the chunking branch (2026-10-15)
-
-7. `POST /documents/text` failures map to **409**, not 410: `app/api.py` catches
-   `HTTPException` before `except Exception`, so the `status_code=410` branch in
-   `_handle_lightrag_error` is unreachable. One `raise HTTPException(410, ...)` remains at
-   `app/api.py:1061`.
-8. `/upload` calls `rag.ainsert(rag.scan_env)` with no `chunk_*` kwargs → binary docs keep the
-   container's chunking even under a chunking arm.
-9. `app/api.py:_apply_ollama_bridge_restart` shells `docker restart GATEWAY_CONTAINER` and
-   `app/config.py` has no env for it; the loop recreates the gateway instead. A bridge
-   `restart: true` arm against a second stack is broken until that reads an env var.
-10. `docs/04-troubleshooting.md` curl examples use `localhost:8000` / `localhost:8020/v1`;
-    production hosts the gateway on 8020 (8000 is the dev mapping).
-11. No test covers the bearer guard on `GET /ingest/status` (added in `3284cc5`, 2026-05-05).
-12. `chunking_param_problems()` cannot validate `strategy: custom` keys (unreported contract) and
-    never sees `sentence_split_regex` (env-only). LightRAG's 422 is the backstop either way.
-13. `--dev-probes` existence is checked before the target gates, so a bad-target refusal often
-    surfaces as the probe-file message first.
-14. `--lightrag-service` shipped (lead-approved): the loop used the LightRAG **container** name as
-    the compose **service** name, which is wrong in a second compose project. Defaults preserve the
-    old behaviour.
-15. `FakeOps` in the loop tests grew `names` (scripted `docker ps --format {{.Names}}`) and
-    `env_file` (which `.env` the fake reads/snapshots).
+Claim before starting; stay inside the brief; one atomic `python - <<'PY'` patch with
+`assert s.count(old) == 1` guards; snapshot before sabotage controls and verify the restore
+by sha256; run the suite in a bare env (`env -i PATH=$PATH HOME=$HOME`); patch `ol.Ops`
+(FakeOps) before ever calling `ol.main()` in a test; never send a bool as `1` in LightRAG
+params; never let a test touch 9621/8020 or docker.
