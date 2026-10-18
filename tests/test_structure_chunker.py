@@ -260,6 +260,24 @@ class TestRules(unittest.TestCase):
         self.assertEqual(" ".join(piece.body for piece in plan.pieces).count(
             "decision was finally taken"), 6)
 
+    def test_coverage_accounts_for_every_word_or_reports_the_gap(self):
+        from app.structure_chunker import ChunkPlan, Piece, coverage_gaps
+        source = "alpha beta gamma delta epsilon zeta\n"
+        full = chunk_document(source, filename="words.txt", budget_tokens=12, header_tokens=4)
+        whole = coverage_gaps(source, full)
+        self.assertEqual(whole["unaccounted_word_tokens"], 0)
+        self.assertEqual(whole["covered_pct"], 100.0)
+        # A plan that lost words must say how many, in words, and not name them.
+        leaky = ChunkPlan(pieces=[Piece(body="alpha beta", header="", kind="plain",
+                                        section_path=())], kind_detected="plain")
+        gaps = coverage_gaps(source, leaky)
+        self.assertEqual(gaps["missing_word_tokens"], 4)
+        self.assertEqual(gaps["unaccounted_word_tokens"], 4)
+        self.assertLess(gaps["covered_pct"], 100.0)
+        blob = json.dumps(gaps)
+        for leaked in ("gamma", "delta", "epsilon", "zeta"):
+            self.assertNotIn(leaked, blob, "the coverage report carries counts, never text")
+
     def test_no_input_shape_can_stall_the_scan(self):
         """A line none of the branches claims must still be consumed, not looped on.
 
@@ -557,7 +575,11 @@ os.environ.setdefault("SOURCE_DOCS_DIR", "/tmp/source_docs")
 os.environ.setdefault("UPLOADS_DIR", "/tmp/uploads")
 os.environ.setdefault("STATE_DB_PATH", "/tmp/state.db")
 
+from typing import Any                                # noqa: E402
+
 import app.worker as worker                           # noqa: E402
+from app.pdf_extract import pdftotext_available      # noqa: E402
+from tests.test_document_extract import make_docx, make_pdf  # noqa: E402
 import chunk_embed_bench as bench                     # noqa: E402
 
 
@@ -657,7 +679,9 @@ class TestWorkerWiring(unittest.TestCase):
         params = got["body"]["chunking"]
         self.assertEqual(params["strategy"], "fixed_token")
         self.assertTrue(params["params"]["split_by_character_only"])
-        self.assertEqual(params["params"]["chunk_token_size"], 120)
+        # chunk_token_size is NOT the budget: it must clear the largest piece, or LightRAG
+        # is free to re-cut the pieces we chose (see the fit-check tests below).
+        self.assertGreaterEqual(params["params"]["chunk_token_size"], 120)
         self.assertIn(params["params"]["split_by_character"], got["text"])
         self.assertIn("[Doc: numbers 2026 04 | Part 1/3]", got["text"],
                          "the header is built from the file name, title only here")
@@ -716,6 +740,265 @@ class TestWorkerWiring(unittest.TestCase):
                         "a .pdf must still go through /documents/upload")
         self.assertEqual(self.post_json.await_count, 0,
                          "the extractor route is a separate decision, not this one")
+
+
+class TestBinaryRoutes(unittest.TestCase):
+    """PDF, DOCX and PPTX reach LightRAG pre-cut, or they reach it as they do today.
+
+    Every failure mode has to land on the upload route with a recorded reason: a parser bug
+    may change how a document is chunked, never whether it is ingested.
+    """
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.docs = self.root / "source_docs"
+        self.docs.mkdir(parents=True)
+        self.store = _FakeStore()
+        self.post_json = AsyncMock(return_value={"track_id": "trk-1"})
+        self.post_file = AsyncMock(return_value={"track_id": "trk-1"})
+        patcher = patch.multiple(
+            worker.settings,
+            source_docs_dir=str(self.docs), uploads_dir=str(self.root / "uploads"),
+            transcript_prep_enabled=False, structure_chunking_enabled=True,
+            structure_chunking_budget_tokens=160, structure_chunking_header_tokens=20,
+            structure_chunking_headers=True, structure_chunking_max_piece_tokens=450,
+            structure_chunking_fit_margin_tokens=64,
+            structure_chunking_embed_window_tokens=512,
+            structure_chunking_embed_tokenizer_path="",
+            structure_chunking_fail_on_lost_text=False,
+            worker_pptx_extract_enabled=True, worker_pdf_extract_enabled=True,
+            worker_docx_extract_enabled=True, worker_pdf_text_backend="auto",
+            worker_pdf_max_bytes=0, worker_pdf_max_chars=0, worker_docx_max_bytes=0,
+            worker_docx_max_chars=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _submit(self, path: Path) -> dict[str, Any]:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.store.docs[str(path)] = {"path": str(path), "sha256": digest, "status": "accepted",
+                                      "company": None, "filename": path.name,
+                                      "original_filename": path.name, "warnings_json": None}
+        with patch.multiple(worker,
+                            get_document_by_path=self.store.get_document_by_path,
+                            get_documents_by_sha256=self.store.get_documents_by_sha256,
+                            update_document_state=self.store.update_document_state,
+                            upsert_document=self.store.upsert_document,
+                            increment_retry=self.store.increment_retry), \
+             patch.object(worker.client, "post_json", self.post_json), \
+             patch.object(worker.client, "post_file", self.post_file):
+            _run_async(worker.submit_file(path, "filesystem", digest))
+        return {"path": str(path), "digest": digest,
+                "json_body": self.post_json.await_args.args[1] if self.post_json.await_count else None,
+                "text_route": self.post_json.await_count, "upload_route": self.post_file.await_count,
+                "meta": self.store.meta(str(path))}
+
+    def test_a_docx_table_goes_in_pre_cut_with_the_header_repeated(self):
+        rows = [["Region", "Q1", "Q2"]] + [
+            [f"north {index}", str(index * 3), str(index * 5)] for index in range(1, 61)]
+        path = make_docx([("Heading1", "Budget detail"), ("", "Every region, every quarter.")],
+                         [rows], ["p", "p", "t"], self.docs / "budget_2026-04.docx")
+        got = self._submit(path)
+        self.assertEqual((got["upload_route"], got["text_route"]), (0, 1),
+                         "the worker parsed it, so the text route is the one that carries cuts")
+        body = got["json_body"]
+        params = body["chunking"]
+        self.assertTrue(params["params"]["split_by_character_only"])
+        delimiter = params["params"]["split_by_character"]
+        pieces = [piece for piece in body["text"].split(delimiter) if piece.strip()]
+        self.assertGreater(len(pieces), 1)
+        table_pieces = [piece for piece in pieces if "| north" in piece]
+        self.assertGreaterEqual(len(table_pieces), 2, "the 60-row table had to split")
+        for piece in table_pieces:
+            self.assertIn("Region | Q1 | Q2", piece,
+                          "every piece the table split across keeps the header row")
+        meta = got["meta"]
+        self.assertEqual(meta["structure_extract"], "worker")
+        self.assertEqual(meta["structure_extract_kind"], "docx")
+        self.assertEqual(meta["structure_chunking"], "applied")
+        self.assertEqual(meta["structure_chunking_kind"], "table")
+        self.assertLessEqual(meta["structure_chunking_tokens_max"], 160)
+        self.assertEqual(meta["structure_chunking_lost_word_tokens"], 0)
+        self.assertEqual(got["digest"], hashlib.sha256(path.read_bytes()).hexdigest(),
+                         "the dedupe hash is still the file bytes, not the parsed text")
+
+    def test_a_pdf_loses_its_page_furniture_but_keeps_every_row(self):
+        if not pdftotext_available():
+            self.skipTest("poppler's pdftotext is not installed here")
+        pages = [
+            [(72, 760, "Acme Corporation confidential"),
+             (72, 720, "1. Revenue"),
+             (72, 700, "Region        Q1         Q2"),
+             (72, 686, "north         120        150"),
+             (180, 672, "grew on the same headcount"),
+             (72, 658, "south         70         90")],
+            [(72, 760, "Acme Corporation confidential"),
+             (72, 720, "2. Costs"),
+             (72, 700, "Costs fell in the north region after the vendor renegotiation.")],
+            [(72, 760, "Acme Corporation confidential"),
+             (72, 720, "3. Risks"),
+             (72, 700, "Risks were unchanged from the previous quarter, per the register.")],
+        ]
+        path = make_pdf(pages, self.docs / "report_2026-04.pdf")
+        got = self._submit(path)
+        self.assertEqual((got["upload_route"], got["text_route"]), (0, 1))
+        text = got["json_body"]["text"]
+        self.assertNotIn("Acme Corporation confidential", text,
+                         "the running header is furniture and is counted, not submitted")
+        self.assertIn("grew on the same headcount", text, "the wrapped row stayed one row")
+        meta = got["meta"]
+        self.assertEqual(meta["structure_extract_kind"], "pdf")
+        self.assertGreaterEqual(meta["structure_chunking_dropped_lines"], 3)
+
+    def test_a_deck_takes_the_same_preparation_as_a_text_file(self):
+        try:
+            from pptx import Presentation
+        except ImportError:
+            self.skipTest("python-pptx is not installed")
+        deck = Presentation()
+        slide = deck.slides.add_slide(deck.slide_layouts[5])
+        slide.shapes.title.text = "Regions"
+        table = deck.slides[0].shapes.add_table(3, 3, 100000, 2000000, 4000000, 1000000).table
+        for column, heading in enumerate(("Region", "Q1", "Q2")):
+            table.cell(0, column).text = heading
+        for row, values in enumerate((("north", "12", "15"), ("south", "7", "9")), start=1):
+            for column, value in enumerate(values):
+                table.cell(row, column).text = value
+        path = self.docs / "deck.pptx"
+        deck.save(str(path))
+        got = self._submit(path)
+        self.assertEqual((got["upload_route"], got["text_route"]), (0, 1))
+        self.assertIn("chunking", got["json_body"],
+                      "the deck is pre-cut like every other document now")
+
+    def test_with_the_flag_off_a_pdf_is_still_uploaded_untouched(self):
+        path = self.docs / "plain.pdf"
+        path.write_bytes(b"%PDF-1.4\nnot really, but the route never reads it\n")
+        with patch.object(worker.settings, "structure_chunking_enabled", False):
+            got = self._submit(path)
+        self.assertEqual((got["upload_route"], got["text_route"]), (1, 0))
+        self.assertNotIn("structure_extract", got["meta"], "no new metadata either")
+
+    def test_a_kill_switch_on_one_type_leaves_the_other_alone(self):
+        rows = [["Region", "Q1"], ["north", "12"]]
+        docx = make_docx([("", "table")], [rows], ["p", "t"], self.docs / "one.docx")
+        with patch.object(worker.settings, "worker_docx_extract_enabled", False):
+            got = self._submit(docx)
+        self.assertEqual((got["upload_route"], got["text_route"]), (1, 0))
+
+    def test_a_scan_falls_back_to_upload_with_the_reason_recorded(self):
+        path = make_pdf([[], []], self.docs / "scan.pdf")
+        got = self._submit(path)
+        self.assertEqual((got["upload_route"], got["text_route"]), (1, 0),
+                         "the document still gets ingested; only the cuts are lost")
+        meta = got["meta"]
+        self.assertEqual(meta["structure_extract"], "fallback_upload")
+        self.assertEqual(meta["structure_extract_error"], "pdf_empty")
+        self.assertIn("no extractable text", meta["structure_extract_reason"])
+
+    def test_a_corrupt_docx_falls_back_to_upload(self):
+        path = self.docs / "broken.docx"
+        path.write_bytes(b"definitely not a zip")
+        got = self._submit(path)
+        self.assertEqual((got["upload_route"], got["text_route"]), (1, 0))
+        self.assertEqual(got["meta"]["structure_extract_error"], "docx_extract_failed")
+
+    def test_a_piece_over_the_ceiling_is_not_submitted_chunked(self):
+        path = self.docs / "monster.txt"
+        path.write_text("start " + "x" * 1200 + " end\n", encoding="utf-8")
+        with patch.object(worker.settings, "structure_chunking_max_piece_tokens", 200):
+            got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "fallback")
+        self.assertIn("MAX_PIECE_TOKENS", got["meta"]["structure_chunking_reason"])
+        self.assertNotIn("chunking", got["json_body"],
+                         "an uncut submission beats a submission that breaks the ceiling")
+
+    def test_the_window_check_uses_the_embedders_own_token_count_when_configured(self):
+        tokenizer_dir = self.root / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "vocab.txt").write_text("[CLS]\n[SEP]\n[UNK]\nthe\n", encoding="utf-8")
+        path = self.docs / "numbers.txt"
+        path.write_text("the " * 40 + "\n", encoding="utf-8")
+        with patch.multiple(worker.settings,
+                            structure_chunking_embed_tokenizer_path=str(tokenizer_dir),
+                            structure_chunking_embed_window_tokens=30):
+            got = self._submit(path)
+        meta = got["meta"]
+        self.assertEqual(meta["structure_chunking"], "fallback")
+        self.assertIn("embedder window", meta["structure_chunking_reason"])
+        self.assertIn("embedder tokens", meta["structure_chunking_fit_basis"])
+        self.assertGreater(meta["structure_chunking_embedder_tokens_max"], 30)
+        self.assertNotIn("chunking", got["json_body"])
+
+    def test_the_default_window_check_runs_on_the_conservative_estimate(self):
+        path = self.docs / "long.txt"
+        path.write_text("word " * 200 + "\n", encoding="utf-8")
+        with patch.object(worker.settings, "structure_chunking_embed_window_tokens", 120):
+            got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "fallback")
+        self.assertIn("estimate", got["meta"]["structure_chunking_fit_basis"])
+
+    def test_chunk_token_size_clears_the_largest_piece_so_nothing_is_re_cut(self):
+        path = self.docs / "table.txt"
+        lines = ["| Region | Q1 | Q2 |", "|---|---|---|"] + [
+            f"| north {index} | {index * 3} | {index * 5} |" for index in range(1, 40)]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        got = self._submit(path)
+        params = got["json_body"]["chunking"]["params"]
+        largest = got["meta"]["structure_chunking_tokens_max"]
+        self.assertGreaterEqual(params["chunk_token_size"], largest + 64,
+                                "if chunk_token_size sat at the budget, LightRAG could re-cut")
+
+    def test_a_payload_whose_cuts_do_not_round_trip_is_not_submitted_chunked(self):
+        def broken(plan, delimiter=None, *, chunk_token_size=None):
+            return ("text with no markers at all",
+                    {"strategy": "fixed_token",
+                     "params": {"chunk_token_size": 400, "split_by_character": "\x1e",
+                                "split_by_character_only": True}})
+        path = self.docs / "words.txt"
+        path.write_text("\n".join(f"row {index} records alpha beta gamma delta"
+                                   for index in range(1, 9)) + "\n", encoding="utf-8")
+        with patch.object(worker, "render_for_lightrag", broken):
+            got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "fallback")
+        self.assertIn("cut markers", got["meta"]["structure_chunking_reason"])
+        self.assertEqual(got["meta"]["structure_chunking_delimiters"], 0)
+        self.assertNotIn("chunking", got["json_body"],
+                         "no params without the matching markers in the text")
+
+    def test_a_coverage_gap_is_recorded_and_only_blocks_when_told_to(self):
+        path = self.docs / "words.txt"
+        path.write_text("alpha beta gamma delta epsilon zeta eta theta\n", encoding="utf-8")
+        def leaking(source_text, plan):
+            return {"source_word_tokens": 9, "piece_word_tokens": 9,
+                    "furniture_word_tokens": 0, "missing_word_tokens": 3,
+                    "unaccounted_word_tokens": 3, "unaccounted_distinct": 3,
+                    "covered_pct": 66.67}
+        with patch.object(worker, "coverage_gaps", leaking):
+            got = self._submit(path)
+            self.assertEqual(got["meta"]["structure_chunking_lost_word_tokens"], 3)
+            self.assertEqual(got["meta"]["structure_chunking"], "applied",
+                             "a gap is recorded by default: blocking ingest on a heuristic "
+                             "is a worse outcome than the gap")
+            with patch.object(worker.settings, "structure_chunking_fail_on_lost_text", True):
+                strict = self._submit(path)
+        self.assertEqual(strict["meta"]["structure_chunking"], "fallback")
+        self.assertIn("3 word tokens", strict["meta"]["structure_chunking_reason"])
+        self.assertNotIn("chunking", strict["json_body"])
+
+    def test_transcript_text_is_still_cut_at_turn_boundaries(self):
+        path = self.docs / "meeting.txt"
+        turns = [f"Alice: point number {index} about the quarterly budget review meeting."
+                 for index in range(1, 15)]
+        path.write_text("\n".join(turns) + "\n", encoding="utf-8")
+        got = self._submit(path)
+        meta = got["meta"]
+        self.assertEqual(meta["structure_chunking_kind"], "transcript")
+        delimiter = got["json_body"]["chunking"]["params"]["split_by_character"]
+        pieces = [piece for piece in got["json_body"]["text"].split(delimiter) if piece.strip()]
+        self.assertGreater(len(pieces), 1)
+        for piece in pieces:
+            self.assertTrue(piece.splitlines()[1].startswith("Alice:"),
+                            "a turn is never split, so a piece starts at a turn")
 
 
 # ── the benchmark arm, so the same function is measured and shipped ────────

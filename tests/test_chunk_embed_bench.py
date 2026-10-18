@@ -850,3 +850,187 @@ class TestRealHttpRoundTrip(_Fixture):
                         "--embed-url", "http://127.0.0.1:9621"])
         self.assertEqual(code, 3)
         self.assertFalse((self.root / "out2" / "results.json").exists())
+
+
+class TestEmbedderWindowMeasurement(_Fixture):
+    """The 512-token window belongs to the embedder's tokenizer, not to cl100k."""
+
+    def _tokenizer_dir(self) -> Path:
+        directory = self.root / "tok"
+        directory.mkdir()
+        (directory / "vocab.txt").write_text(
+            "[CLS]\n[SEP]\n[UNK]\n[PAD]\n[MASK]\na\nb\nthe\nboard\napproved\nnorth\nbudget\n",
+            encoding="utf-8")
+        return directory
+
+    def test_the_window_is_counted_with_the_embedders_own_vocabulary(self):
+        entry = self.mxbai("one", "recursive", 12, 0)
+        entry["embedder"]["max_input_tokens"] = 13   # just over the cl100k-style maximum
+        configs = self.configs([entry])
+        report, _http = self.run_bench(configs=configs,
+                                       extra=["--embed-tokenizer", str(self._tokenizer_dir())])
+        self.assertTrue(report["embed_tokenizer"]["loaded"])
+        self.assertEqual(report["embed_tokenizer"]["kind"], "wordpiece")
+        summary = report["configs"][0]
+        self.assertIsNotNone(summary["embedder_tokens"])
+        self.assertEqual(summary["embedder_window"], 13,
+                         "a declared window wins; the 512 default is only the fallback")
+        self.assertEqual(report["embedder_window"], 512, "the run-level guard names the default")
+        self.assertIn("wordpiece", summary["over_embedder_window_basis"])
+        self.assertGreaterEqual(summary["embedder_tokens"]["max"],
+                                summary["chunk_tokens"]["max"],
+                                "WordPiece never counts cheaper than a word count here")
+        self.assertGreater(summary["over_embedder_window_chunks"], 0,
+                           "the same chunk fits a 13-token cl100k window and busts a "
+                           "13-token embedder window: that is the whole point")
+        table = (self.root / "out" / "results.md").read_text(encoding="utf-8")
+        self.assertIn("Embedder tokenizer:", table)
+
+    def test_without_the_flag_the_report_says_the_window_test_is_a_stand_in(self):
+        configs = self.configs([self.mxbai("one", "recursive", 12, 0)])
+        report, _http = self.run_bench(configs=configs)
+        self.assertFalse(report["embed_tokenizer"]["loaded"])
+        self.assertIsNone(report["configs"][0]["embedder_tokens"])
+        self.assertIn("no --embed-tokenizer", report["configs"][0]["over_embedder_window_basis"])
+        table = (self.root / "out" / "results.md").read_text(encoding="utf-8")
+        self.assertIn("NOT LOADED", table, "the report must not let this be missed")
+
+    def test_a_tokenizer_path_that_is_not_local_is_refused_before_any_embedding(self):
+        configs = self.configs([self.mxbai("one", "recursive", 12, 0)])
+        with self.assertRaises(cb.BenchError) as caught:
+            self.run_bench(configs=configs, extra=["--embed-tokenizer", "mixedai/mxbai"])
+        self.assertIn("never downloads", str(caught.exception))
+
+
+class TestCoverageGate(_Fixture):
+    """Text the chunker ate must never be counted as a retrieval miss."""
+
+    def long_doc(self, sentences: int = 70) -> str:
+        return "\n".join(f"line {index} of the long audit report appendix"
+                         for index in range(1, sentences + 1)) + "\n"
+
+    def structure_config(self, budget: int) -> Path:
+        return self.configs([{"name": "structure-tiny",
+                              "chunker": {"strategy": "structure", "budget_tokens": budget,
+                                          "header_tokens": 8},
+                              "embedder": {"model": "mxbai-embed-large-v1",
+                                           "max_input_tokens": 512},
+                              "rerank": None}])
+
+    def probe_file_with_a_wide_quote(self, quote: str) -> Path:
+        path = self.root / "wide-probes.jsonl"
+        path.write_text(json.dumps({"id": "wide-1", "question": "what did the appendix say?",
+                                    "evidence": quote, "type": "multi-fact"}) + "\n",
+                        encoding="utf-8")
+        return path
+
+    def _run_wide(self, budget: int) -> dict[str, Any]:
+        (self.root / "doc1.txt").write_text(self.long_doc(), encoding="utf-8")
+        quote = " ".join(f"line {index} of the long audit report appendix"
+                         for index in range(11, 31))
+        probes = self.probe_file_with_a_wide_quote(quote)
+        parser = cb.build_parser()
+        args = parser.parse_args(["--corpus", str(self.root / "corpus.json"),
+                                  "--probes", str(probes),
+                                  "--out", str(self.root / "out"),
+                                  "--configs", str(self.structure_config(budget)),
+                                  "--embed-url", "http://127.0.0.1:8080"])
+        return cb.run(args, http=FakeHttp(), sleep=lambda _s: None, print_fn=lambda _l: None)
+
+    def test_a_quote_no_piece_can_hold_is_reported_as_lost_text_not_as_a_miss(self):
+        report = self._run_wide(budget=40)
+        summary = report["configs"][0]
+        self.assertTrue(summary["recall"]["lost_text_ids"])
+        self.assertEqual(summary["recall"]["located_pct"], 0.0)
+        self.assertEqual(report["lost_text"]["structure_arms"][0]["ids"], ["wide-1"])
+        self.assertTrue(report["lost_text"]["fatal"])
+
+    def test_a_budget_big_enough_to_hold_the_quote_reports_no_loss(self):
+        report = self._run_wide(budget=400)
+        self.assertEqual(report["configs"][0]["recall"]["lost_text_n"], 0)
+        self.assertFalse(report["lost_text"]["fatal"])
+
+    def test_the_lost_text_ids_reach_the_report_without_any_text(self):
+        self._run_wide(budget=40)
+        table = (self.root / "out" / "results.md").read_text(encoding="utf-8")
+        self.assertIn("LOST TEXT", table)
+        self.assertIn("wide-1", table)
+        self.assertNotIn("audit report appendix", table, "ids only, never the quote")
+
+    def test_the_exit_code_fails_the_run_unless_overridden(self):
+        argv = ["--corpus", "x", "--probes", "y", "--out", "z", "--embed-url",
+                "http://127.0.0.1:8080"]
+        canned = {"lost_text": {"fatal": True, "structure_arms": [{"config": "structure-350"}]}}
+        import unittest.mock as mock
+        with mock.patch.object(cb, "run", lambda args: canned):
+            self.assertEqual(cb.main(argv), 4)
+            self.assertEqual(cb.main(argv + ["--allow-lost-text"]), 0)
+        with mock.patch.object(cb, "run", lambda args: {"lost_text": {"fatal": False}}):
+            self.assertEqual(cb.main(argv), 0)
+
+
+class TestTextCopiesAndBudgets(_Fixture):
+    def test_a_pdf_entry_is_read_from_its_pre_extracted_copy(self):
+        (self.root / "copies").mkdir()
+        (self.root / "copies" / "one.txt").write_text("extracted table text\n", encoding="utf-8")
+        (self.root / "copies" / "manifest.json").write_text(json.dumps({"1": "one.txt"}),
+                                                            encoding="utf-8")
+        corpus = self.root / "mixed-corpus.json"
+        corpus.write_text(json.dumps([str(self.root / "deck.pdf"),
+                                      str(self.root / "doc2.txt")]), encoding="utf-8")
+        texts = cb.load_corpus(corpus, str(self.root / "copies"))
+        self.assertEqual(texts[0], "extracted table text\n")
+
+    def test_a_binary_entry_without_a_copy_is_still_refused(self):
+        corpus = self.root / "mixed-corpus.json"
+        corpus.write_text(json.dumps([str(self.root / "deck.pdf")]), encoding="utf-8")
+        with self.assertRaises(cb.BenchError) as caught:
+            cb.load_corpus(corpus)
+        self.assertIn("--text-copies-dir", str(caught.exception))
+
+    def test_a_manifest_position_with_no_file_names_the_position_not_the_path(self):
+        (self.root / "copies").mkdir()
+        (self.root / "copies" / "manifest.json").write_text(json.dumps({"1": "gone.txt"}),
+                                                            encoding="utf-8")
+        corpus = self.root / "mixed-corpus.json"
+        corpus.write_text(json.dumps([str(self.root / "deck.pdf")]), encoding="utf-8")
+        with self.assertRaises(cb.BenchError) as caught:
+            cb.load_corpus(corpus, str(self.root / "copies"))
+        self.assertIn("1/1", str(caught.exception))
+
+    def test_recall_at_token_budgets_ranks_by_tokens_not_by_chunk_count(self):
+        tiny = self.configs([self.mxbai("tiny", "recursive", 6, 0),
+                             self.mxbai("big", "fixed_token", 400, 0)])
+        report, _http = self.run_bench(configs=tiny, extra=["--budgets", "20,400"])
+        for summary in report["configs"]:
+            self.assertIn("recall@20tok", summary["recall"])
+            self.assertIn("recall@400tok", summary["recall"])
+        by_name = {summary["config"]: summary for summary in report["configs"]}
+        self.assertLessEqual(by_name["big"]["recall"]["recall@20tok"],
+                             by_name["tiny"]["recall"]["recall@20tok"],
+                             "one 400-token chunk fills a 20-token window with nothing")
+        table = (self.root / "out" / "results.md").read_text(encoding="utf-8")
+        self.assertIn("recall@20tok%", table)
+
+    def test_the_segment_table_separates_transcript_from_structure_rich_probes(self):
+        probes = self.root / "kinds.jsonl"
+        probes.write_text("\n".join([
+            json.dumps({"id": "t1", "question": "north budget?",
+                        "evidence": "The board approved the north budget",
+                        "type": "single-fact", "source_kind": "transcript"}),
+            json.dumps({"id": "s1", "question": "sample return?",
+                        "evidence": "the sample return slips by six weeks in March",
+                        "type": "single-fact", "source_kind": "table"}),
+        ]) + "\n", encoding="utf-8")
+        parser = cb.build_parser()
+        args = parser.parse_args(["--corpus", str(self.root / "corpus.json"),
+                                  "--probes", str(probes), "--out", str(self.root / "out"),
+                                  "--configs", str(self.configs([self.mxbai("one", "recursive",
+                                                                           40, 0)])),
+                                  "--embed-url", "http://127.0.0.1:8080"])
+        cb.run(args, http=FakeHttp(), sleep=lambda _s: None, print_fn=lambda _l: None)
+        table = (self.root / "out" / "results.md").read_text(encoding="utf-8")
+        self.assertIn("Recall by source kind", table)
+        self.assertIn("transcript", table)
+        self.assertIn("table + pdf + docx", table)
+        self.assertIn("n too small to compare", table, "n=1 must not read as a result")

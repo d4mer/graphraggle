@@ -93,3 +93,34 @@ All deploys are on the Thinkpad (`~/rag-project`, Docker). Rollback is always
 2. ~~The repo `compose.yml` still pins `ghcr.io/hkuds/lightrag:v1.4.15` and maps LightRAG on host port `9622`.~~ **Resolved 2026-10-11 (packet-26):** `compose.yml` now pins `v1.5.7`, maps `9621:9621`, gives LightRAG its own `INPUT_DIR`/`--input-dir`, and is covered by `tests/test_compose_config.py`.
 3. `BRIDGE_REWRITE_SEED_LL` (GRAG-41 seed) is off and undeployed.
 4. Repo changes not yet deployed (worker image is still pre-packet-18): TODO #2 lifecycle table and compare-and-set write-backs, TODO #3 upload/scan semantics, `COMPANY_AWARE_DEDUPE` (default off, see `05-known-good-config.md`), `tests/conftest.py`. Deploy is an operator decision.
+
+## 2026-10-18 — structure-aware ingest reaches PDF, DOCX and PPTX (flag-gated)
+
+`STRUCTURE_CHUNKING_ENABLED` no longer covers only the text path. When it is on, the worker
+extracts PDF (`pdftotext -layout` first, `pypdf` as fallback), DOCX (`python-docx`, with a
+stdlib OOXML reader as fallback) and PPTX (already extracted) and submits them through
+`POST /documents/text` with the `chunking` object, so `app/structure_chunker.py` chooses the
+cuts and LightRAG is told to cut only there. Table rows arrive with the header row repeated;
+PDF rows that the text layer split across 3-8 physical lines are reassembled into one row
+before chunking; repeated page headers are dropped and counted.
+
+- **This deliberately amends setup rule 4 above** ("binary/office files should continue using
+  `POST /documents/upload`") for PDF/DOCX, and only while the flag is on. Flag off: the
+  request body, the route and the state row are what they were before. The dedupe hash is
+  still `sha256` of the original file bytes, so re-chunking can never change identity.
+- Row shape change: `app/pptx_extract.py` now emits canonical pipe rows (`| a | b | c |`,
+  leading and trailing bar). `app/structure_chunker.py` reads a leading bar as a table; a
+  mid-line-only `a | b` reads as prose and loses the header-repetition protection.
+- New dependencies in `requirements.txt`: `python-docx==1.1.2`, `pypdf==5.3.0`. Both are
+  optional at run time (see fallbacks above). The pins were chosen without network access:
+  confirm they resolve on the next image build.
+- New settings are listed in `docs/ops/loop/README.md`. Every failure mode falls back to
+  today's route with the reason on the state row.
+- `scripts/chunk_embed_bench.py` gained `--embed-tokenizer` (the served embedder's own
+  window test, local files only, never downloaded), `--text-copies-dir`, `--budgets`
+  (`recall@T` by tokens) and the `LOST TEXT` gate (exit 4 for a structure arm that dropped
+  text, `--allow-lost-text` to override). Probe fields `source_kind`, `row_key`, `row_value`
+  drive the source-kind split and `row_intact%`.
+- Not verified: `chunk_token_size` ≥ largest piece is asserted per document, but what
+  LightRAG 1.5.7 does with a piece larger than `chunk_token_size` under
+  `split_by_character_only` is still an unknown (Hermes to confirm from the image source).

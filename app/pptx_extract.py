@@ -73,7 +73,7 @@ def extract_pptx_text(path: Path) -> str:
         <body paragraphs, one per line, reading order: top-to-bottom then
         left-to-right by shape position; grouped shapes are recursed into>
         [Table]
-        col1 | col2 | col3        (one line per row, cell newlines flattened)
+        | col1 | col2 | col3 |    (one line per row, cell newlines flattened)
         [Chart] <title>; <categories>; <series names>
         [Notes]
         <speaker notes>
@@ -246,7 +246,10 @@ def _table_lines(shape: Any) -> list[str]:
     for row in rows:
         cells = [_flatten_cell(cell.text) for cell in row.cells]
         if any(cells):
-            lines.append(" | ".join(cells))
+            # Canonical pipe-table row, leading and trailing bar included: app.structure_chunker
+            # recognises that shape and repeats the header row when the table splits. A
+            # mid-line-only "a | b" reads as prose to the chunker and loses that protection.
+            lines.append("| " + " | ".join(cells) + " |")
     return lines
 
 

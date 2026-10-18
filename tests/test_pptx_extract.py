@@ -137,9 +137,9 @@ class TestTables(unittest.TestCase):
     def test_table_marker_and_one_line_per_row(self):
         text = extract_pptx_text(self._deck_with_table())
         self.assertIn("[Table]", text)
-        self.assertIn("Region | Q1 | QoQ", text)
-        row_line = next(line for line in text.splitlines() if line.startswith("APAC"))
-        self.assertEqual(row_line, "APAC | 3.4M | +18% strong")
+        self.assertIn("| Region | Q1 | QoQ |", text)
+        row_line = next(line for line in text.splitlines() if line.startswith("| APAC"))
+        self.assertEqual(row_line, "| APAC | 3.4M | +18% strong |")
 
     def test_cell_newlines_do_not_split_a_row(self):
         text = extract_pptx_text(self._deck_with_table())

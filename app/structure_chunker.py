@@ -1113,6 +1113,36 @@ def body_words(plan: ChunkPlan) -> list[str]:
     return words
 
 
+def coverage_gaps(source_text: str, plan: ChunkPlan) -> dict[str, Any]:
+    """Account for every word: source = pieces + declared furniture drops + gaps.
+
+    This is the chunker's promise made checkable: it may move text and drop running
+    headers, but it may not silently lose content. The comparison is a word multiset
+    (whitespace runs containing a letter), because the chunker rewrites table spacing, adds
+    headers, and reorders nothing - so words are the stable unit, not characters.
+
+    Counts only, never text: the caller logs ``unaccounted_word_tokens``, never which words.
+    A non-zero gap means either a bug or a document shape the furniture rule misread, and
+    the caller decides whether that is worth falling back over.
+    """
+    expected = Counter(_content_words(source_text))
+    got = Counter(word for piece in plan.pieces for word in _content_words(piece.body))
+    missing = expected - got
+    missing_tokens = sum(missing.values())
+    furniture_tokens = int(plan.stats.get("dropped_running_words", 0) or 0)
+    unaccounted = max(0, missing_tokens - furniture_tokens)
+    source_tokens = sum(expected.values())
+    return {
+        "source_word_tokens": source_tokens,
+        "piece_word_tokens": sum(got.values()),
+        "furniture_word_tokens": furniture_tokens,
+        "missing_word_tokens": missing_tokens,
+        "unaccounted_word_tokens": unaccounted,
+        "unaccounted_distinct": len(missing) if unaccounted else 0,
+        "covered_pct": round(100.0 * (1.0 - unaccounted / source_tokens), 2) if source_tokens else 100.0,
+    }
+
+
 def pick_delimiter(plan: ChunkPlan, explicit: str | None = None) -> str:
     """A delimiter that cannot occur inside any piece, or a loud failure.
 

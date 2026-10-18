@@ -75,3 +75,63 @@ shipped path rather than a driver's imitation of it.
 - `COMPANY_AWARE_DEDUPE` is do-not-enable (docs/08-change-log.md, 2026-10-15). It is not in
   any file here and must not be added to one.
 - Reports and logs carry counts, positions and ids — never corpus text or file names.
+
+## Benchmark flags that decide what a number means
+
+| flag | what it changes | why it exists |
+|---|---|---|
+| `--embed-tokenizer <local dir>` | counts every chunk with the **served embedder's** vocabulary (WordPiece `vocab.txt`/`tokenizer.json`, or a Unigram `tokenizer.json`) and reports `embedder_tokens` p50/p90/p99/max plus `over_embedder_window_*` against the 512-token window **including special tokens** | cl100k is the right ruler for chunk sizes and the wrong one for the embedder window; names, numbers and STT garbles cost WordPiece more. Never downloaded: a hub id is refused with the fetch command to run yourself. If it is absent the report says `**NOT LOADED**` and the window columns are labelled as a stand-in. |
+| `--text-copies-dir <dir>` | reads a `.pdf`/`.docx` corpus entry from `<dir>/manifest.json` (position → pre-extracted text copy) instead of refusing it | 59% of the corpus is binary; Hermes already keeps extracted copies. Without the flag nothing changes. |
+| `--budgets 2000,4000,8000` | adds `recall@Ttok`: chunks are taken in rank order until the **token** total would exceed T | `recall@k` compares chunk counts; a 1200-token chunk and a 200-token chunk are not equal contributions to a context window. |
+| `--allow-lost-text` | publishes a `structure` arm that dropped text instead of exiting 4 | see below. |
+
+## Probe fields the bench reads
+
+One JSONL item per probe. `id`, `question` and gold evidence (`evidence`, or
+`evidence_turn`/`turn_id`/`evidence_ids`/`gold_span`) are required for an item to be scored
+at all. Optional, and they change the report:
+
+- `"type"` — free-form probe kind (e.g. `single-fact`, `multi-fact`, `unanswerable`). Reported
+  per arm in `by_type`.
+- `"source_kind"` — one of `transcript`, `table`, `pdf`, `docx`; default `transcript`. The
+  report prints a **separate table for transcript vs structure-rich** probes with `n` on every
+  row, and marks any row with `n < 15` as "n too small to compare".
+- `"row_key"` and `"row_value"` (strings, both needed) — the row-integrity metric: does a
+  single chunk contain **both**? Reported as `row_intact%` per arm over the probes that carry
+  them, normalised exactly like a quote. A number retrieved away from its label is not the
+  same fact.
+
+## LOST TEXT: coverage is a separate measurement from retrieval
+
+Every row carries `located` (the gold quote is in some chunk or seam), `in_source` (the quote
+is in the raw document) and `lost_text` (in the document, in **no** chunk). Per arm the report
+prints `located%` and `lost_text_ids`. For a `structure` arm a loss is a hard failure: the
+run prints the ids under `LOST TEXT` and exits 4 unless `--allow-lost-text`. A chunker that
+ate the text and a ranker that ranked it badly are different findings, and a number that mixes
+them is not evidence about either.
+
+## Structure-aware ingest: which documents get pre-cut, and what happens when a parser fails
+
+With `STRUCTURE_CHUNKING_ENABLED=true` the worker parses **PDF, DOCX and PPTX itself** and
+submits `POST /documents/text` with `chunking` (`fixed_token` + `split_by_character` +
+`split_by_character_only=true`), so the cuts come from `app/structure_chunker.py`: table rows
+with the header repeated, transcript turns, section paths. With the flag off, those files keep
+going to `POST /documents/upload` exactly as before - **including no new metadata** - because
+extracting them only to let LightRAG re-cut the text would trade one invisible cut for another.
+
+| setting | default | meaning |
+|---|---|---|
+| `WORKER_PDF_EXTRACT_ENABLED` / `WORKER_DOCX_EXTRACT_ENABLED` | true | per-type kill switch (still requires `STRUCTURE_CHUNKING_ENABLED`) |
+| `WORKER_PDF_TEXT_BACKEND` | `auto` | `auto` prefers poppler's `pdftotext -layout` (already in the image, and it reproduces column positions, which is what the row reassembly reads), then `pypdf` |
+| `WORKER_PDF_MAX_BYTES` / `_MAX_CHARS`, `WORKER_DOCX_MAX_BYTES` / `_MAX_CHARS` | 104857600 / 2000000 | byte and character guards |
+| `STRUCTURE_CHUNKING_MAX_PIECE_TOKENS` | 450 | a plan with a bigger piece is not submitted chunked |
+| `STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS` | 64 | `chunk_token_size` = largest piece + margin, so LightRAG cannot re-cut our pieces |
+| `STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS` | 512 | the served embedder's window |
+| `STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH` | empty | local tokenizer files for the fit check; never fetched |
+| `STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT` | false | make a coverage gap fall back instead of only recording it |
+
+Fallbacks are the point: a scan with no text layer, a corrupt archive, a piece over the
+ceiling, a piece over the embedder window, or an unreadable tokenizer path all put the
+document back on today's route with `structure_extract` / `structure_chunking_reason` on the
+state row. A parser bug may change how a document is chunked; it must never change whether it
+is ingested.

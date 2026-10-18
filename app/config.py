@@ -42,6 +42,25 @@ class Settings(BaseSettings):
     # Extracted text is capped before submission; the cap leaves a marker line.
     worker_pptx_max_chars: int = Field(default=2_000_000, alias="WORKER_PPTX_MAX_CHARS")
 
+    # PDF and DOCX take the same route, but only while structure chunking is on: with
+    # STRUCTURE_CHUNKING_ENABLED off they keep going to /documents/upload exactly as they
+    # do today, because extracting them and letting LightRAG re-cut the text would trade one
+    # invisible cut for another. Extraction is per-type killable so a bad parser cannot take
+    # the whole ingest down. Any extraction failure falls back to the upload route: a
+    # document is never lost to a parser.
+    worker_pdf_extract_enabled: bool = Field(default=True, alias="WORKER_PDF_EXTRACT_ENABLED")
+    worker_docx_extract_enabled: bool = Field(default=True, alias="WORKER_DOCX_EXTRACT_ENABLED")
+    # pypdf and python-docx both hold the parsed document in memory; the byte limit is the
+    # guard for the zip-bomb / huge-scan class, and the char cap bounds what is submitted.
+    worker_pdf_max_bytes: int = Field(default=104_857_600, alias="WORKER_PDF_MAX_BYTES")
+    # Which PDF text extractor to use: "auto" prefers poppler's pdftotext -layout (already in
+    # the worker image, and it reproduces column positions as spaces, which is what the row
+    # reassembly reads), then pypdf. Pin one for a reproducible experiment.
+    worker_pdf_text_backend: str = Field(default="auto", alias="WORKER_PDF_TEXT_BACKEND")
+    worker_pdf_max_chars: int = Field(default=2_000_000, alias="WORKER_PDF_MAX_CHARS")
+    worker_docx_max_bytes: int = Field(default=104_857_600, alias="WORKER_DOCX_MAX_BYTES")
+    worker_docx_max_chars: int = Field(default=2_000_000, alias="WORKER_DOCX_MAX_CHARS")
+
     # Contextual chunk headers + speaker-turn normalisation for transcript-shaped
     # text, applied to the /documents/text payload before LightRAG ever sees it
     # (app/transcript_prep.py). LightRAG cuts fixed-size token chunks, so a
@@ -79,6 +98,32 @@ class Settings(BaseSettings):
         default=25, alias="STRUCTURE_CHUNKING_HEADER_TOKENS")
     structure_chunking_headers: bool = Field(default=True,
                                              alias="STRUCTURE_CHUNKING_HEADERS")
+
+    # Hard ceiling on one piece, in the module's conservative tokens. The budget is what we
+    # aim for; this is what we refuse to submit. A piece over it means the document contains
+    # something the chunker could not split inside (one enormous cell), and submitting it
+    # would put a piece past the embedder's window, where truncation is silent.
+    structure_chunking_max_piece_tokens: int = Field(
+        default=450, alias="STRUCTURE_CHUNKING_MAX_PIECE_TOKENS")
+    # chunk_token_size in the request must be at least the largest piece, or LightRAG is
+    # allowed to re-cut our pieces and the whole exercise means nothing. The margin absorbs
+    # the difference between our conservative estimate and the server's tokenizer.
+    structure_chunking_fit_margin_tokens: int = Field(
+        default=64, alias="STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS")
+    # The served embedder's window. With no tokenizer files configured the check runs on the
+    # chunker's own conservative over-count, which is deliberately larger than reality.
+    structure_chunking_embed_window_tokens: int = Field(
+        default=512, alias="STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS")
+    # Optional local directory of the SERVED embedder's tokenizer (tokenizer.json or
+    # vocab.txt). Never fetched: app/embed_tokenizer.py refuses a hub id. When it is set,
+    # the fit check is stated in the embedder's own tokens instead of cl100k-style ones.
+    structure_chunking_embed_tokenizer_path: str = Field(
+        default="", alias="STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH")
+    # Make a coverage gap (the chunker failed to account for words that were in the source)
+    # fall back to unchunked submission instead of only recording it. Default false: the gap
+    # is a bug signal, and blocking ingest on a heuristic is a worse outcome than the bug.
+    structure_chunking_fail_on_lost_text: bool = Field(
+        default=False, alias="STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT")
 
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
