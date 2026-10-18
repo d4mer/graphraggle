@@ -61,8 +61,9 @@ worker, so without this key an experiment cannot measure what the
 ``TRANSCRIPT_PREP_ENABLED`` worker would send. Default false: file text is posted
 unchanged, exactly as before.
 
-An experiment may also carry ``"structure_chunking": {"budget_tokens": 350,
-"header_tokens": 25, "headers": true}`` to chunk each corpus file with
+An experiment may also carry ``"structure_chunking": {"max_piece_tokens": 7500,
+"min_piece_tokens": 150, "header_tokens": 25, "headers": true, "merge_until": "floor"}`` to chunk each corpus
+file with (``budget_tokens`` is still accepted as an explicit ceiling, for size arms):
 ``app.structure_chunker`` - the shipped structure-aware pre-chunker behind the worker's
 ``STRUCTURE_CHUNKING_ENABLED`` - and post the result with the ``fixed_token`` +
 ``split_by_character_only`` params it produced. In other words: our code chooses every
@@ -184,8 +185,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.structure_chunker import (
-    DEFAULT_BUDGET_TOKENS,
     DEFAULT_HEADER_TOKENS,
+    DEFAULT_MERGE_UNTIL,
+    DEFAULT_MAX_PIECE_TOKENS,
+    DEFAULT_MIN_PIECE_TOKENS,
     chunk_document as structure_chunk_document,
     render_for_lightrag,
 )
@@ -2133,11 +2136,17 @@ class Loop:
             plan = structure_chunk_document(
                 text,
                 filename=path.name,
-                budget_tokens=structure_chunking["budget_tokens"],
+                max_piece_tokens=structure_chunking["max_piece_tokens"],
+                min_piece_tokens=structure_chunking["min_piece_tokens"],
                 header_tokens=structure_chunking["header_tokens"],
                 headers=structure_chunking["headers"],
+                until_merge=structure_chunking["merge_until"],
             )
-            text, params = render_for_lightrag(plan)
+            # Same rule as the worker: tell LightRAG a size that our largest piece clears,
+            # or it is free to re-cut the pieces this plan just chose.
+            text, params = render_for_lightrag(
+                plan,
+                chunk_token_size=max(64, int(plan.stats.get("tokens_max") or 0) + 64))
             chunking = params
             self.log(
                 f"structure_chunking {doc_label}: kind={plan.kind_detected} "
@@ -3226,8 +3235,11 @@ def probes_only_refusal(config: dict[str, Any]) -> str | None:
 def structure_chunking_spec(entry: dict[str, Any], name: str) -> dict[str, Any] | None:
     """Validate an experiment's ``structure_chunking`` key, or None when absent.
 
-    Shape: ``{"budget_tokens": 350, "header_tokens": 25, "headers": true}`` - every
-    field optional, all types checked here rather than in the middle of an ingest.
+    Shape: ``{"max_piece_tokens": 7500, "min_piece_tokens": 150, "header_tokens": 25,
+    "headers": true, "merge_until": "floor"}`` - every field optional, all types checked here rather than in the
+    middle of an ingest. ``max_piece_tokens`` is a ceiling (the embedder window), not a
+    target: an arm that wants a chunk-size comparison sets it deliberately low and says so.
+    ``budget_tokens`` is accepted as the same ceiling under its old name.
     It cannot be combined with ``chunking``: both choose the cut list, and an arm that
     sends two instructions says nothing about which one the result came from.
     """
@@ -3239,22 +3251,40 @@ def structure_chunking_spec(entry: dict[str, Any], name: str) -> dict[str, Any] 
     if not isinstance(raw, dict):
         raise LoopConfigError(f"experiment {name}: structure_chunking must be an object, "
                               "true or false")
-    spec: dict[str, Any] = {"budget_tokens": DEFAULT_BUDGET_TOKENS,
-                            "header_tokens": DEFAULT_HEADER_TOKENS, "headers": True}
-    for key, floor in (("budget_tokens", 32), ("header_tokens", 0)):
+    spec: dict[str, Any] = {"max_piece_tokens": DEFAULT_MAX_PIECE_TOKENS,
+                            "min_piece_tokens": DEFAULT_MIN_PIECE_TOKENS,
+                            "header_tokens": DEFAULT_HEADER_TOKENS, "headers": True,
+                            "merge_until": DEFAULT_MERGE_UNTIL}
+    for key, floor in (("max_piece_tokens", 32), ("min_piece_tokens", 0),
+                       ("header_tokens", 0)):
         if key in raw:
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < floor:
                 raise LoopConfigError(f"experiment {name}: structure_chunking.{key} must be "
                                       f"an int >= {floor}")
             spec[key] = int(value)
+    if "budget_tokens" in raw:
+        if "max_piece_tokens" in raw:
+            raise LoopConfigError(f"experiment {name}: structure_chunking.budget_tokens and "
+                                  "max_piece_tokens are the same ceiling under two names")
+        value = raw["budget_tokens"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 32:
+            raise LoopConfigError(f"experiment {name}: structure_chunking.budget_tokens must "
+                                  "be an int >= 32")
+        spec["max_piece_tokens"] = int(value)
+    if "merge_until" in raw:
+        merge_until = str(raw["merge_until"] or "")
+        if merge_until not in ("floor", "window"):
+            raise LoopConfigError(f"experiment {name}: structure_chunking.merge_until must "
+                                  "be \"floor\" or \"window\"")
+        spec["merge_until"] = merge_until
     if "headers" in raw:
         headers = raw["headers"]
         if not isinstance(headers, bool):
             raise LoopConfigError(f"experiment {name}: structure_chunking.headers must be "
                                   "true or false")
         spec["headers"] = bool(headers)
-    unknown = sorted(set(raw) - set(spec))
+    unknown = sorted(set(raw) - set(spec) - {"budget_tokens"})
     if unknown:
         raise LoopConfigError(f"experiment {name}: structure_chunking has unknown keys: "
                               + ", ".join(unknown))

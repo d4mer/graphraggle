@@ -40,9 +40,12 @@ Token counting
 ``tiktoken`` cl100k_base when importable, otherwise a documented whitespace fallback (one
 token per whitespace-separated run). The tokenizer used is printed and stored in
 results.json — chunk token percentiles are meaningless without it. Both differ from the
-embedder's own tokenizer: mxbai is BERT WordPiece and usually counts MORE tokens on names,
-numbers and STT garbles, so 500 cl100k tokens is not proven to fit a 512-token WordPiece
-window (docs/research/decision-embed-rerank-chunk.md marks that ratio UNVERIFIED).
+embedder's own tokenizer. BGE-M3 is XLM-RoBERTa Unigram with byte fallback, and counts
+MORE tokens than cl100k on names, numbers, STT garbles and non-Latin text, so a cl100k
+figure never proves a piece fits BGE-M3's 8192-token window. Pass --embed-tokenizer with a
+LOCAL copy of BGE-M3's tokenizer.json to measure the window claim in the embedder's own
+vocabulary (docs/research/decision-embed-rerank-chunk.md marks the ratio UNVERIFIED
+without it).
 
 What never leaves this script
 -----------------------------
@@ -56,10 +59,10 @@ Usage
         --corpus probe/loop_corpus.json --probes probe/solvay-dev-v1.jsonl \
         [--probes probe/solvay-heldout-v1.jsonl] \
         --out probe/chunk-bench --embed-url http://localhost:8080 \
-        --embed-model mxbai-embed-large-v1 --rerank-url http://localhost:8080 \
+        --embed-model bge-m3-mlx-fp16 --rerank-url http://localhost:8080 \
         --rerank-model jina-reranker-v3-mlx --api-key-env OMLX_API_KEY \
         --configs docs/ops/loop/chunk-embed-bench-configs.json \
-        --compare mxbai-recursive-350 current-1200-100-mxbai
+        --compare fixed-350-50 fixed-1200-100 structure-1500
 
 A third chunker, ``"strategy": "structure"``, hands the document to the shipped
 ``app.structure_chunker`` (tables split by row with the header repeated, turns cut at
@@ -385,13 +388,20 @@ def structure_chunks(text: str, spec: dict[str, Any]) -> list[str]:
     BOUND for what the ingest achieves, which also gets title and date from the name.
     """
     module = _structure_module()
-    plan = module.chunk_document(
-        text,
-        filename="",
-        budget_tokens=int(spec.get("budget_tokens") or spec.get("chunk_token_size") or 350),
-        header_tokens=int(spec.get("header_tokens") or 25),
-        headers=spec.get("headers", True),
-    )
+    kwargs: dict[str, Any] = {"header_tokens": int(spec.get("header_tokens") or 25),
+                              "headers": spec.get("headers", True)}
+    if spec.get("merge_until"):
+        kwargs["until_merge"] = str(spec["merge_until"])
+    # A benchmark arm is ALLOWED to cap the size on purpose - that is the whole point of a
+    # size curve - but it has to say so, and the production shape is no cap at all.
+    ceiling = spec.get("max_piece_tokens")
+    if ceiling is None:
+        ceiling = spec.get("budget_tokens") or spec.get("chunk_token_size")
+    if ceiling is not None:
+        kwargs["budget_tokens"] = int(ceiling)
+    if spec.get("min_piece_tokens") is not None:
+        kwargs["min_piece_tokens"] = int(spec["min_piece_tokens"])
+    plan = module.chunk_document(text, filename="", **kwargs)
     return [piece.render() for piece in plan.pieces]
 
 
@@ -453,6 +463,19 @@ def load_configs(path: Path) -> list[dict[str, Any]]:
         if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool)
                                    or budget < 32):
             raise BenchError(f"config {name}: chunker.budget_tokens must be an int >= 32")
+        for ceiling_key, low in (("max_piece_tokens", 32), ("min_piece_tokens", 0)):
+            value = chunker.get(ceiling_key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                      or value < low):
+                raise BenchError(f"config {name}: chunker.{ceiling_key} must be an int "
+                                 f">= {low}")
+        if budget is not None and chunker.get("max_piece_tokens") is not None:
+            raise BenchError(f"config {name}: chunker.budget_tokens and max_piece_tokens are "
+                             "the same ceiling under two names")
+        merge_until = chunker.get("merge_until")
+        if merge_until is not None and str(merge_until) not in ("floor", "window"):
+            raise BenchError(f"config {name}: chunker.merge_until must be \"floor\" or "
+                             "\"window\"")
         header_tokens = chunker.get("header_tokens")
         if header_tokens is not None and (not isinstance(header_tokens, int)
                                           or isinstance(header_tokens, bool)
@@ -502,8 +525,13 @@ def load_configs(path: Path) -> list[dict[str, Any]]:
                 "overlap": int(overlap),
                 **({"separators": [str(item) for item in separators]} if separators else {}),
                 **({"budget_tokens": int(budget)} if budget is not None else {}),
+                **({"max_piece_tokens": int(chunker["max_piece_tokens"])}
+                   if chunker.get("max_piece_tokens") is not None else {}),
+                **({"min_piece_tokens": int(chunker["min_piece_tokens"])}
+                   if chunker.get("min_piece_tokens") is not None else {}),
                 **({"header_tokens": int(header_tokens)} if header_tokens is not None else {}),
                 **({"headers": headers} if headers is not None else {}),
+                **({"merge_until": str(merge_until)} if merge_until is not None else {}),
             },
             "embedder": {
                 "model": str(embedder["model"]),
@@ -1533,7 +1561,7 @@ def build_parser() -> argparse.ArgumentParser:
                                                  / "docs" / "ops" / "loop"
                                                  / "chunk-embed-bench-configs.json"))
     parser.add_argument("--embed-url", required=True, help="model server base URL")
-    parser.add_argument("--embed-model", default="mxbai-embed-large-v1")
+    parser.add_argument("--embed-model", default="bge-m3-mlx-fp16")
     parser.add_argument("--rerank-url", default="", help="rerank server base URL (optional)")
     parser.add_argument("--rerank-model", default="")
     parser.add_argument("--api-key-env", default="",

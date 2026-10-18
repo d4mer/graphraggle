@@ -543,6 +543,62 @@ class LibraryAdaptersWithFakeModules(unittest.TestCase):
         self.assertEqual(rows[-1].split(), ["footer", "line"], "page 2 is not dropped")
         self.assertTrue(any("north" in line for line in rows))
 
+    def test_the_backend_that_actually_ran_is_reported(self):
+        import sys
+        import types
+        import unittest.mock as mock
+        from app.pdf_extract import (PDF_BACKEND_LAYOUT, PDF_BACKEND_PYPDF,
+                                     extract_pdf_text_with_backend, pdftotext_available)
+        page = types.SimpleNamespace(extract_text=lambda: "Region   Q1\nnorth   12\nfooter line")
+        reader = types.SimpleNamespace(pages=[page], is_encrypted=False, decrypt=lambda _: True)
+        pypdf = types.ModuleType("pypdf")
+        pypdf.PdfReader = lambda path: reader
+        path = Path(tempfile.mkdtemp()) / "fake.pdf"
+        path.write_bytes(b"%PDF-1.4 fake")
+        with mock.patch.dict(sys.modules, {"pypdf": pypdf}), \
+             mock.patch("app.pdf_extract.pdftotext_available", lambda: False):
+            _text, used = extract_pdf_text_with_backend(path)
+        self.assertEqual(used, PDF_BACKEND_PYPDF)
+        if not pdftotext_available():
+            self.skipTest("poppler's pdftotext is not installed here")
+        real = make_pdf([[(72, 760, "1. Revenue"), (72, 720, "north         120")]],
+                        Path(tempfile.mkdtemp()) / "layout.pdf")
+        _text, used = extract_pdf_text_with_backend(real, backend="pdftotext")
+        self.assertEqual(used, PDF_BACKEND_LAYOUT)
+
+    def test_pypdf_style_text_without_column_layout_is_still_a_document(self):
+        """pypdf loses the column positions, so a wrapped cell arrives flush left.
+
+        Nothing can rejoin that reliably, and guessing would move words between rows. The
+        promise here is narrower and must hold: the text arrives whole, nothing raises, and
+        the chunker still accounts for every word.
+        """
+        import sys
+        import types
+        import unittest.mock as mock
+        from app.pdf_extract import extract_pdf_text
+        from app.structure_chunker import chunk_document, coverage_gaps
+        flat = ("1. Revenue\nRegion\nQ1\nQ2\nnorth\n120\n150\n"
+                "the north region grew on the same headcount as last year, which the "
+                "review noted twice in the same paragraph about the carrier lane.\n"
+                "2. Costs\nCosts fell after the vendor renegotiation finished for the "
+                "depot, and the carrier kept the same lane at the same rate for the term.")
+        page = types.SimpleNamespace(extract_text=lambda: flat)
+        reader = types.SimpleNamespace(pages=[page], is_encrypted=False, decrypt=lambda _: True)
+        pypdf = types.ModuleType("pypdf")
+        pypdf.PdfReader = lambda path: reader
+        with mock.patch.dict(sys.modules, {"pypdf": pypdf}), \
+             mock.patch("app.pdf_extract.pdftotext_available", lambda: False):
+            path = Path(tempfile.mkdtemp()) / "flat.pdf"
+            path.write_bytes(b"%PDF-1.4 fake")
+            text = extract_pdf_text(path)
+        self.assertEqual(" ".join(sorted(text.split())),
+                         " ".join(sorted(flat.split())),
+                         "no word is invented, moved or lost when the layout is absent")
+        plan = chunk_document(text, filename="flat.txt", max_piece_tokens=200,
+                              min_piece_tokens=40, header_tokens=20)
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
     def test_a_missing_pypdf_says_which_backends_are_missing(self):
         import sys
         import unittest.mock as mock
@@ -555,6 +611,132 @@ class LibraryAdaptersWithFakeModules(unittest.TestCase):
                 extract_pdf_text(path)
         self.assertEqual(caught.exception.error_code, PDF_LIB_MISSING)
         self.assertIn("pdftotext", str(caught.exception))
+
+
+
+class BgeM3ShapedTokenizerFiles(unittest.TestCase):
+    """The three files BGE-M3 ships, rebuilt synthetically: XLMRobertaTokenizer, Unigram.
+
+    What this proves is local parsing and counting: the vocabulary, the specials, the
+    byte-fallback path and the pre-tokenizer split. What it cannot prove is what the
+    served BGE-M3 actually does with a real 250k vocabulary - the real files are not in
+    this repository and no model server is reachable here.
+    """
+
+    WORDS = ["▁the", "▁depot", "▁carrier", "▁lane", "▁freight", "▁tariff", "▁customs",
+             "▁origin", "▁papers", "▁margin", "▁period", "▁moved", "the", "depot",
+             "carrier", "lane", "freight", "tariff", "customs", ".", ",", "!", "?",
+             "▁", "<unk>", "<s>", "</s>", "<pad>"]
+
+    def build(self, *, gz: bool = False) -> Path:
+        import gzip
+        import json
+        directory = Path(tempfile.mkdtemp())
+        byte_tokens = [[f"<0x{value:02X}>", -15.0] for value in range(256)]
+        vocab = [[token, -1.0 - index / 100.0] for index, token in enumerate(self.WORDS)]
+        vocab += byte_tokens
+        tokenizer = {
+            "version": "1.0",
+            "truncation": {"direction": "Right", "maximum_length": 8192},
+            "normalizer": {"type": "Sequence", "normalizers": [{"type": "Lowercase"}]},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"String": "()!?,;\""}, "behavior": "Isolated"},
+                {"type": "Whitespace"},
+                {"type": "PreservePattern",
+                 "pattern": {"Regex": r"\p{Han}|\p{Hangul}|\p{Hiragana}|\p{Katakana}"}}]},
+            "model": {"type": "Unigram", "unk_id": self.WORDS.index("<unk>"),
+                      "vocab": vocab, "byte_fallback": True,
+                      "unk_piece": "<unk>", "special_tokens": ["<s>", "</s>"]},
+            "added_tokens": [{"id": 1, "content": "<s>", "special": True},
+                             {"id": 2, "content": "</s>", "special": True},
+                             {"id": 3, "content": "<unk>", "special": True},
+                             {"id": 4, "content": "<pad>", "special": True}],
+        }
+        if gz:
+            with gzip.open(directory / "tokenizer.json.gz", "wt", encoding="utf-8") as handle:
+                json.dump(tokenizer, handle)
+        else:
+            (directory / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
+        (directory / "tokenizer_config.json").write_text(json.dumps(
+            {"model_max_length": 8192, "do_lower_case": True, "tokenizer_class":
+             "XLMRobertaTokenizer"}), encoding="utf-8")
+        (directory / "special_tokens_map.json").write_text(json.dumps(
+            {"bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>",
+             "pad_token": "<pad>"}), encoding="utf-8")
+        return directory
+
+    def test_the_three_files_load_as_one_unigram_tokenizer(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        self.assertEqual(tokenizer.kind, "unigram")
+        self.assertEqual(tokenizer.special_overhead, 2)
+        self.assertTrue(tokenizer.byte_fallback)
+        self.assertRegex(tokenizer.name, r"^unigram-\d+-entry-local\+2special$")
+
+    def test_a_gzipped_tokenizer_json_loads_the_same_way(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build(gz=True)))
+        self.assertEqual(tokenizer.kind, "unigram")
+        self.assertTrue(tokenizer.byte_fallback)
+
+    def test_count_includes_the_two_specials(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        self.assertEqual(tokenizer.count("depot"), len(tokenizer.segments("depot")) + 2)
+
+    def test_case_folding_follows_the_files(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        self.assertEqual(tokenizer.count("DEPOT CARRIER"), tokenizer.count("depot carrier"))
+
+    def test_an_unknown_character_costs_its_utf8_bytes_not_one_token(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        base = tokenizer.count("depot")
+        # Neither character is in this synthetic vocabulary, so byte fallback decides.
+        # The extra token over the byte count is the word-start marker the space becomes.
+        self.assertEqual(tokenizer.count("depot 企") - base, 4,
+                         "the word marker plus three UTF-8 bytes: BGE-M3 spends a byte "
+                         "token per byte on text its vocabulary cannot represent")
+        self.assertEqual(tokenizer.segments("depot 企")[-3:],
+                         ["<0xE4>", "<0xBC>", "<0x81>"])
+        self.assertEqual(tokenizer.segments("depot é")[-2:], ["<0xC3>", "<0xA9>"])
+        self.assertEqual(tokenizer.segments("depot carrier"), ["▁depot", "▁carrier"],
+                         "text the vocabulary does hold is segmented normally")
+
+    def test_punctuation_is_segmented_as_its_own_piece(self):
+        """Shape, not count: with punctuation tokens in the vocabulary the count is the
+        same either way, and saying otherwise would be a claim this test does not prove.
+        What matters is that a comma is never glued into the word in front of it."""
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        # The isolated comma carries its own word-start marker, which is one token more
+        # than XLM-R's "▁," piece: over-counting is the only safe direction here.
+        self.assertEqual(tokenizer.segments("depot, carrier"),
+                         ["▁depot", "▁", ",", "▁carrier"])
+        self.assertNotIn("depot,", tokenizer.segments("depot, carrier"))
+
+    def test_the_window_default_is_bge_m3s_window(self):
+        from app.embed_tokenizer import EMBED_WINDOW_DEFAULT, load_embed_tokenizer
+        self.assertEqual(EMBED_WINDOW_DEFAULT, 8192,
+                         "BGE-M3's real window; the retired 512-token model is why a "
+                         "1200-token chunk used to be truncated silently")
+        self.assertEqual(load_embed_tokenizer(None), None,
+                         "no tokenizer path means the conservative over-count, not a guess")
+
+    def test_the_added_specials_are_not_segmentable_text(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        self.assertNotIn("<s>", tokenizer.body)
+        self.assertNotIn("</s>", tokenizer.body)
+        self.assertNotIn("<unk>", tokenizer.body)
+
+    def test_the_byte_tokens_come_from_the_file_not_from_imagination(self):
+        from app.embed_tokenizer import load_embed_tokenizer
+        tokenizer = load_embed_tokenizer(str(self.build()))
+        self.assertEqual(tokenizer.byte_tokens.get(0xE9), "<0xE9>")
+        self.assertTrue(all(f"<0x{value:02X}>" in tokenizer.body for value in range(256)))
+
 
 
 if __name__ == "__main__":

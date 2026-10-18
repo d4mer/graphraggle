@@ -31,6 +31,9 @@ from app.structure_chunker import (              # noqa: E402
     tokenizer_name,
     token_count,
     _content_words,
+    _is_heading,
+    coverage_gaps,
+    body_words,
 )
 
 CONFIGS = _ROOT / "docs" / "ops" / "loop" / "chunk-embed-bench-configs.json"
@@ -344,6 +347,143 @@ FIXTURES = {
 }
 
 
+class TestNaturalUnitsNoCap(unittest.TestCase):
+    """The operator's shape: no chunk-size cap, the embedder window is the only ceiling.
+
+    Hermes' real-document run is the reason these exist: a 350-token cap turned one PDF
+    into 596 pieces with a median of 111 tokens, because every heading and table boundary
+    forced a cut. A section that fits the window is now handed over whole, and a page of
+    small sections welds together instead of shattering.
+    """
+
+    @staticmethod
+    def _sentences(count: int, *, topic: str = "budget") -> str:
+        words = ("allocation freight region ledger quarter margin carrier volume "
+                 "reserve tariff corridor depot intake output").split()
+        return " ".join(
+            f"{topic.title()} line {index} records the {words[index % len(words)]} figure "
+            f"for quarter {index % 4 + 1} of {2020 + index % 6}."
+            for index in range(count))
+
+    def test_a_section_that_fits_the_window_is_never_cut(self):
+        text = "# Quarterly review\n\n" + self._sentences(380) + "\n"
+        plan = chunk_document(text, filename="Review_2026-04.txt", max_piece_tokens=7500,
+                              min_piece_tokens=150)
+        self.assertEqual(len(plan.pieces), 1,
+                         "7000 tokens of one section is ONE piece: nothing may cut it")
+        self.assertGreaterEqual(plan.stats["tokens_max"], 4000,
+                                "the fixture has to be big enough to make the point")
+        self.assertLessEqual(plan.stats["tokens_max"], 7500)
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_a_section_bigger_than_the_window_splits_at_its_sub_headings(self):
+        parts = ["# Annual annex"]
+        for section in range(1, 5):
+            parts.append(f"## {section}. {['Freight', 'Intake', 'Tariffs', 'Depots'][section - 1]}")
+            parts.append(self._sentences(170, topic=["freight", "intake", "tariffs",
+                                                     "depots"][section - 1]))
+        text = "\n\n".join(parts) + "\n"
+        plan = chunk_document(text, filename="Annex_2026-04.txt", max_piece_tokens=7500,
+                              min_piece_tokens=150)
+        self.assertGreater(len(plan.pieces), 1, "the window is what forced the cut")
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, 7500)
+        bodies = [piece.body for piece in plan.pieces]
+        self.assertTrue(any(body.startswith("# Annual annex") for body in bodies),
+                        "the parent heading is not lost when its section splits")
+        for heading in ("## 2. Intake", "## 3. Tariffs", "## 4. Depots"):
+            self.assertTrue(any(body.startswith(heading) for body in bodies),
+                            f"{heading} starts a piece: the split is at the sub-heading, "
+                            "not at a token count")
+
+    def test_a_heading_never_stands_alone(self):
+        text = ("# Procurement\n\n## Scope\n\n"
+                + self._sentences(24, topic="scope")
+                + "\n\n## Approval\n\n" + self._sentences(24, topic="approval") + "\n")
+        plan = chunk_document(text, filename="Policy.txt", max_piece_tokens=700,
+                              min_piece_tokens=150)
+        for piece in plan.pieces:
+            self.assertNotEqual(len(piece.body.strip().splitlines()), 1,
+                                f"a piece is a lone heading: {piece.body!r}")
+            self.assertFalse(all(_is_heading(line) for line in piece.body.splitlines()),
+                             "a heading without its content is retrievable by nothing")
+
+    def test_a_run_of_small_sections_does_not_fragment(self):
+        parts = []
+        for section in range(1, 61):
+            parts.append(f"{section}. {['Freight', 'Intake', 'Tariffs', 'Depots', 'Wages'][section % 5]}"
+                         f" note {section}")
+            parts.append(self._sentences(7, topic=str(section)))
+        text = "\n\n".join(parts) + "\n"
+        default = chunk_document(text, filename="Notes.txt", max_piece_tokens=7500,
+                                 min_piece_tokens=150)
+        total = sum(piece.token_estimate for piece in default.pieces)
+        self.assertGreater(total, 4000, "fixture too small to model a real document")
+        self.assertEqual(default.stats["merge_until"], "floor",
+                         "the lead's call: a merge chain stops at the floor, so a piece "
+                         "stays one natural unit instead of a mixed-topic bundle")
+        self.assertLess(len(default.pieces), len(chunk_document(
+            text, filename="Notes.txt", max_piece_tokens=350, min_piece_tokens=0).pieces),
+            "the same document under Hermes' 350-token cap shatters; the floor does not")
+        for piece in default.pieces[:-1]:
+            self.assertGreaterEqual(piece.token_estimate, 150,
+                                    "no fragment is left below the floor")
+        chained = chunk_document(text, filename="Notes.txt", max_piece_tokens=7500,
+                                 min_piece_tokens=150, until_merge="window")
+        self.assertLess(len(chained.pieces), len(default.pieces),
+                        "window mode remains an opt-in that runs the chain to the window")
+        for piece in chained.pieces[:-1]:
+            self.assertGreaterEqual(piece.token_estimate, 150)
+        for plan in (default, chained):
+            self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_a_parent_section_is_one_unit_when_its_whole_extent_fits(self):
+        parts = ["# Freight annex"]
+        for child in range(1, 6):
+            parts.append(f"## {child}. {'Depot intake tariffs wages routes'.split()[child - 1]}")
+            parts.append(self._sentences(9, topic=str(child)))
+        text = "\n\n".join(parts) + "\n"
+        plan = chunk_document(text, filename="Annex.txt", max_piece_tokens=7500,
+                              min_piece_tokens=150)
+        self.assertEqual(len(plan.pieces), 1,
+                         "a parent that fits the window is its natural extent: the "
+                         "siblings under it do not become five pieces")
+        self.assertEqual(plan.stats["natural_units"], 1)
+
+    def test_a_table_that_fits_the_window_is_not_split_and_its_header_is_not_repeated(self):
+        rows = ["| Region | Q1 | Q2 | Q3 |", "|---|---|---|---|"] + [
+            f"| depot {index:02d} | {index * 3} | {index * 5} | {index * 7} |"
+            for index in range(1, 45)]
+        text = "# Order book\n\n" + "\n".join(rows) + "\n\n" + self._sentences(10) + "\n"
+        plan = chunk_document(text, filename="Orderbook_2026-04.txt", max_piece_tokens=7500,
+                              min_piece_tokens=150)
+        self.assertEqual(len(plan.pieces), 1, "44 rows under the window is one table")
+        self.assertEqual(plan.stats.get("tables_split_by_row", 0), 0,
+                         "no row splitting, so no invented repeated header")
+        self.assertEqual(plan.pieces[0].body.count("| Region | Q1 | Q2 | Q3 |"), 1)
+
+    def test_the_window_still_splits_a_table_that_cannot_fit(self):
+        rows = ["| Region | Q1 | Q2 | Q3 |", "|---|---|---|---|"] + [
+            f"| depot {index:03d} | {index * 3} | {index * 5} | {index * 7} |"
+            for index in range(1, 1201)]
+        text = "# Order book\n\n" + "\n".join(rows) + "\n"
+        plan = chunk_document(text, filename="Orderbook_Large_2026-04.txt",
+                              max_piece_tokens=7500, min_piece_tokens=150)
+        self.assertGreater(len(plan.pieces), 1)
+        self.assertGreaterEqual(plan.stats.get("tables_split_by_row", 0), 1)
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, 7500)
+            self.assertIn("| Region | Q1 | Q2 | Q3 |", piece.body,
+                          "a piece of a split table never strands a number from its columns")
+
+    def test_the_ceiling_and_the_floor_are_reported_not_guessed(self):
+        plan = chunk_document(self._sentences(60) + "\n", filename="Plain.txt",
+                              max_piece_tokens=900, min_piece_tokens=200)
+        self.assertEqual(plan.stats["max_piece_tokens"], 900)
+        self.assertEqual(plan.stats["min_piece_tokens"], 200)
+        self.assertEqual(plan.stats["merge_until"], "floor", "the production default")
+
+
 class TestInvariants(unittest.TestCase):
     """The contract, checked over every fixture at three budgets.
 
@@ -473,9 +613,10 @@ class TestHeaders(unittest.TestCase):
 
     def test_shuffled_placebo_keeps_the_words_and_moves_the_attachment(self):
         honest = chunk_document(HEADINGS, filename="Procurement_2026-03-15.md",
-                                budget_tokens=120, header_tokens=40)
+                                max_piece_tokens=80, min_piece_tokens=20, header_tokens=40)
         placebo = chunk_document(HEADINGS, filename="Procurement_2026-03-15.md",
-                                 budget_tokens=120, header_tokens=40, headers="shuffled")
+                                 max_piece_tokens=80, min_piece_tokens=20, header_tokens=40,
+                                 headers="shuffled")
         self.assertEqual([_content_words(piece.body) for piece in honest.pieces],
                          [_content_words(piece.body) for piece in placebo.pieces],
                          "the placebo may not change any body")
@@ -635,7 +776,8 @@ class TestWorkerWiring(unittest.TestCase):
             uploads_dir=str(self.root / "uploads"),
             transcript_prep_enabled=False,
             structure_chunking_enabled=False,
-            structure_chunking_budget_tokens=120,
+            structure_chunking_max_piece_tokens=70,
+            structure_chunking_min_piece_tokens=20,
             structure_chunking_header_tokens=20,
             structure_chunking_headers=True,
         )
@@ -683,8 +825,10 @@ class TestWorkerWiring(unittest.TestCase):
         # is free to re-cut the pieces we chose (see the fit-check tests below).
         self.assertGreaterEqual(params["params"]["chunk_token_size"], 120)
         self.assertIn(params["params"]["split_by_character"], got["text"])
-        self.assertIn("[Doc: numbers 2026 04 | Part 1/3]", got["text"],
-                         "the header is built from the file name, title only here")
+        self.assertIn("[Doc: numbers 2026 04 | Part 1/", got["text"],
+                      "the header is built from the file name, title only here")
+        self.assertIn("Part 2/", got["text"],
+                      "the cap is below the document's natural units, so it cuts")
         row = self.store.docs[got["path"]]
         self.assertEqual(row["sha256"], got["digest"],
                          "the dedupe hash stays the ORIGINAL file bytes")
@@ -760,10 +904,11 @@ class TestBinaryRoutes(unittest.TestCase):
             worker.settings,
             source_docs_dir=str(self.docs), uploads_dir=str(self.root / "uploads"),
             transcript_prep_enabled=False, structure_chunking_enabled=True,
-            structure_chunking_budget_tokens=160, structure_chunking_header_tokens=20,
-            structure_chunking_headers=True, structure_chunking_max_piece_tokens=450,
+            structure_chunking_max_piece_tokens=160,
+            structure_chunking_min_piece_tokens=20, structure_chunking_header_tokens=20,
+            structure_chunking_headers=True,
             structure_chunking_fit_margin_tokens=64,
-            structure_chunking_embed_window_tokens=512,
+            structure_chunking_embed_window_tokens=8192,
             structure_chunking_embed_tokenizer_path="",
             structure_chunking_fail_on_lost_text=False,
             worker_pptx_extract_enabled=True, worker_pdf_extract_enabled=True,
@@ -869,6 +1014,26 @@ class TestBinaryRoutes(unittest.TestCase):
         self.assertEqual((got["upload_route"], got["text_route"]), (0, 1))
         self.assertIn("chunking", got["json_body"],
                       "the deck is pre-cut like every other document now")
+
+    def test_the_pdf_backend_that_ran_is_on_the_row(self):
+        import sys
+        import types
+        import unittest.mock as mock
+        page = types.SimpleNamespace(extract_text=lambda: "1. Revenue\nnorth   120   150\n"
+                                     "the north region grew on the same headcount while the "
+                                     "carrier kept the lane open for the whole term again.")
+        reader = types.SimpleNamespace(pages=[page], is_encrypted=False, decrypt=lambda _: True)
+        pypdf = types.ModuleType("pypdf")
+        pypdf.PdfReader = lambda path: reader
+        with patch.object(worker.settings, "worker_pdf_text_backend", "pypdf"), \
+             mock.patch.dict(sys.modules, {"pypdf": pypdf}), \
+             mock.patch("app.pdf_extract.pdftotext_available", lambda: False):
+            make_pdf([[(72, 760, "1. Revenue")]], self.docs / "flat_2026-04.pdf")
+            got = self._submit(self.docs / "flat_2026-04.pdf")
+        meta = got["meta"]
+        self.assertEqual(meta["structure_extract"], "worker")
+        self.assertEqual(meta["structure_extract_backend"], "pypdf",
+                         "the row has to say which reader produced the text")
 
     def test_with_the_flag_off_a_pdf_is_still_uploaded_untouched(self):
         path = self.docs / "plain.pdf"
@@ -1007,13 +1172,17 @@ class TestBenchmarkStrategy(unittest.TestCase):
     def test_the_grid_carries_the_structure_arms(self):
         configs = bench.load_configs(CONFIGS)
         by_name = {config["name"]: config for config in configs}
-        for name in ("structure-350", "structure-350+rerank", "structure-350-nohdr",
-                     "structure-350-shuffled"):
+        for name in ("structure-700", "structure-700-nohdr", "structure-700-shuffled",
+                     "structure-1500", "structure-1500-nohdr", "structure-1500-shuffled"):
             self.assertIn(name, by_name, f"the grid is missing {name}")
-        self.assertEqual(by_name["structure-350"]["chunker"]["strategy"], "structure")
-        self.assertEqual(by_name["structure-350"]["chunker"]["budget_tokens"], 350)
-        self.assertIs(by_name["structure-350-nohdr"]["chunker"]["headers"], False)
-        self.assertEqual(by_name["structure-350-shuffled"]["chunker"]["headers"], "shuffled")
+        self.assertEqual(by_name["structure-1500"]["chunker"]["strategy"], "structure")
+        self.assertEqual(by_name["structure-1500"]["chunker"]["max_piece_tokens"], 1500)
+        self.assertEqual(by_name["structure-1500"]["chunker"]["min_piece_tokens"], 150)
+        self.assertIs(by_name["structure-1500-nohdr"]["chunker"]["headers"], False)
+        self.assertEqual(by_name["structure-1500-shuffled"]["chunker"]["headers"], "shuffled")
+        self.assertNotIn("mxbai-embed-large-v1",
+                         {config["embedder"]["model"] for config in configs},
+                         "the grid must not re-introduce the retired embedder")
 
     def test_the_structure_strategy_routes_to_the_shipped_module(self):
         tokenizer = bench.WhitespaceTokenizer()
@@ -1052,6 +1221,340 @@ class TestBenchmarkStrategy(unittest.TestCase):
         with self.assertRaises(bench.BenchError) as caught:
             bench.chunk_document("text", {"strategy": "custom"}, bench.WhitespaceTokenizer())
         self.assertIn("structure", str(caught.exception))
+
+
+
+
+class TestWindowNotACap(unittest.TestCase):
+    """The shipped defaults: the window is the ceiling, the floor is the only target."""
+
+    def test_the_constants_say_what_the_operator_asked_for(self):
+        from app.config import settings
+        from app.embed_tokenizer import EMBED_WINDOW_DEFAULT
+        from app.structure_chunker import (DEFAULT_MAX_PIECE_TOKENS,
+                                          DEFAULT_MIN_PIECE_TOKENS, DEFAULT_MERGE_UNTIL)
+        self.assertEqual(EMBED_WINDOW_DEFAULT, 8192)
+        self.assertEqual(int(settings.structure_chunking_embed_window_tokens), 8192)
+        self.assertLess(DEFAULT_MAX_PIECE_TOKENS, EMBED_WINDOW_DEFAULT,
+                        "the piece window is the embedder window minus a safety margin")
+        self.assertEqual(DEFAULT_MIN_PIECE_TOKENS, 150, "a floor, not a size target")
+        self.assertEqual(DEFAULT_MERGE_UNTIL, "floor")
+        self.assertEqual(int(settings.structure_chunking_min_piece_tokens), 150)
+        self.assertEqual(int(settings.structure_chunking_max_piece_tokens),
+                         DEFAULT_MAX_PIECE_TOKENS)
+
+
+class TestTranscriptLabelShapes(unittest.TestCase):
+    """Who speaks, recognised by how OFTEN a label repeats - not by how the file wraps.
+
+    The corpus contains minutes written as one line per agenda item and transcripts
+    labelled "(Name)" or "Name 12:34". A line-anchored parser calls all of those prose,
+    and prose is what gets no speaker turn boundaries at all.
+    """
+
+    WINDOW = 600
+    FLOOR = 120
+
+    def plan(self, text: str, **kwargs):
+        return chunk_document(text, filename="Minutes_2026-04.txt",
+                              max_piece_tokens=self.WINDOW,
+                              min_piece_tokens=self.FLOOR, **kwargs)
+
+    def minutes_line(self, vocabularies: list[list[str]], turns: int = 12) -> str:
+        parts: list[str] = []
+        for index, topic in enumerate(vocabularies):
+            for turn in range(turns):
+                word = topic[turn % len(topic)]
+                other = topic[(turn + 1) % len(topic)]
+                speaker = "Ana" if index % 2 == 0 else "Liang"
+                parts.append(f"{speaker}: the {word} position sits against {other} for "
+                             f"period {turn}, and the {word} margin moved twice while the "
+                             f"{other} desk kept the same note.")
+        return " ".join(parts)
+
+    def test_minutes_written_as_one_line_are_a_transcript_not_one_great_paragraph(self):
+        text = self.minutes_line([["freight", "carrier", "lane"],
+                                  ["tariff", "customs", "origin"]])
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript")
+        self.assertGreater(len(plan.pieces), 1)
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, self.WINDOW)
+
+    def test_splitting_the_line_loses_no_word(self):
+        text = self.minutes_line([["freight", "carrier"], ["tariff", "customs"]])
+        plan = self.plan(text)
+        gaps = coverage_gaps(text, plan)
+        self.assertEqual(gaps["unaccounted_word_tokens"], 0, gaps)
+
+    def test_parenthesised_labels_with_a_colon_are_turns(self):
+        lines = []
+        for index in range(14):
+            name = "Ana" if index % 2 == 0 else "Liang"
+            lines.append(f"({name}): the depot carrier lane {index} was reviewed and the "
+                         f"freight margin for period {index} moved twice in the same week.")
+        plan = self.plan("\n".join(lines))
+        self.assertEqual(plan.kind_detected, "transcript")
+        self.assertIn("Ana", [piece for piece in plan.pieces] and
+                      [name for name in ("Ana", "Liang")
+                       if name in "\n".join(piece.body for piece in plan.pieces)])
+
+    def test_a_name_and_timestamp_label_is_a_turn(self):
+        lines = []
+        for index in range(14):
+            name = "Ana" if index % 2 == 0 else "Liang"
+            lines.append(f"{name} {index:02d}:{index:02d}")
+            lines.append(f"The depot carrier lane {index} was reviewed and the freight "
+                         f"margin for period {index} moved twice in the same week, and the "
+                         f"customs desk kept the same note about the origin papers.")
+        plan = self.plan("\n".join(lines))
+        self.assertEqual(plan.kind_detected, "transcript")
+
+    def test_prose_that_uses_colons_freely_is_still_prose(self):
+        paragraphs = []
+        for index in range(12):
+            paragraphs.append(
+                f"The report for period {index}: the freight numbers were flat, and the "
+                f"review: nothing changed in the depot lane, despite the note: we asked "
+                f"twice about the carrier tariff, and the answer: the customs desk holds "
+                f"the origin papers until the broker files them again this quarter.")
+        plan = self.plan("\n\n".join(paragraphs))
+        self.assertNotEqual(plan.kind_detected, "transcript")
+
+    def test_the_inline_splitter_adds_no_fake_turns_to_a_key_value_list(self):
+        # KNOWN, REPORTED: a capitalised key/value list ("Vendor: depot 0. Cost: 1200.") is
+        # already read as a one-voice transcript by transcript_prep's long-standing bars,
+        # and this chunker mirrors those bars on purpose. That pre-existing false positive
+        # is the lead's call to change; what this test pins is that the new mid-line label
+        # shape does not make it worse - no extra turns, and no invented second voice.
+        lines = [f"Vendor: depot {index}. Cost: {1000 + index}. Term: 24 months of service "
+                 f"at the same site, and the vendor: the carrier keeps the lane open."
+                 for index in range(12)]
+        text = "\n".join(lines)
+        plan = self.plan(text)
+        # No word is invented or duplicated by the label scan, and none is lost.
+        self.assertEqual(len(body_words(plan)), len(text.split()))
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, self.WINDOW)
+
+
+
+
+class TestHermesTranscriptShapes(unittest.TestCase):
+    """The five shapes a real run could not classify. Invented text; shapes only.
+
+    What the general name grammar cannot know, the file says: two labels heading the
+    lines, strictly alternating, is a transcript whatever the words are. Stage
+    directions alternate just as happily and are still not people.
+    """
+
+    WINDOW = 600
+    FLOOR = 120
+
+    def plan(self, text: str, **kwargs):
+        kwargs.setdefault("max_piece_tokens", self.WINDOW)
+        kwargs.setdefault("min_piece_tokens", self.FLOOR)
+        return chunk_document(text, filename="Call_2026-04-11.txt", **kwargs)
+
+    def alternating(self, first: str, second: str, lines: int = 40,
+                    words: int = 18) -> str:
+        out: list[str] = []
+        for index in range(lines):
+            label = first if index % 2 == 0 else second
+            topic = ["freight", "tariff", "carrier", "customs", "depot"][index % 5]
+            filler = " ".join(f"{topic}_{index}_{word}" for word in range(words))
+            out.append(f"({label}) {filler}")
+        return "\n".join(out) + "\n"
+
+    def test_a_pronoun_pair_that_alternates_is_a_transcript(self):
+        text = self.alternating("They", "You")
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript")
+        self.assertGreater(len(plan.pieces), 1)
+        gaps = coverage_gaps(text, plan)
+        self.assertEqual(gaps["unaccounted_word_tokens"], 0, gaps)
+
+    def test_a_three_letter_and_a_five_letter_label_pair(self):
+        for pair in (("They", "You"), ("You", "There"), ("She", "Their")):
+            with self.subTest(labels=pair):
+                plan = self.plan(self.alternating(*pair, lines=24))
+                self.assertEqual(plan.kind_detected, "transcript")
+
+    def test_a_real_name_paired_with_a_pronoun_parses_wholly(self):
+        text = self.alternating("Ana", "They", lines=24)
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript")
+        bodies = "\n".join(piece.body for piece in plan.pieces)
+        self.assertIn("(Ana)", bodies)
+        self.assertIn("(They)", bodies)
+
+    def test_stage_directions_are_never_rescued_by_alternation(self):
+        for pair in (("Cross-talk", "Inaudible"), ("Background noise", "Silence"),
+                     ("Laughter", "Applause")):
+            with self.subTest(labels=pair):
+                plan = self.plan(self.alternating(*pair, lines=24))
+                self.assertNotEqual(plan.kind_detected, "transcript",
+                                    "an alternating stage marker is still not a speaker")
+
+    def test_prose_that_happens_to_open_with_a_pronoun_in_parentheses_stays_prose(self):
+        paragraphs = [
+            f"(they said the depot carrier lane {index} would hold, and the tariff on the "
+            f"freight side moved twice while the customs desk kept the same note about the "
+            f"origin papers that the broker filed for the carrier again) and the review "
+            f"closed with the same figure for period {index}."
+            for index in range(12)]
+        plan = self.plan("\n\n".join(paragraphs))
+        self.assertNotEqual(plan.kind_detected, "transcript")
+
+    def test_two_giant_labelled_turns_are_turns_and_are_split_inside(self):
+        # The monolithic shape: the whole meeting in two lines, label once at the head.
+        first = "(They) " + " ".join(
+            f"freight_{index} carrier lane depot tariff customs origin" for index in range(200))
+        second = "(You) " + " ".join(
+            f"wage_{index} shift roster depot freight carrier tariff margin"
+            for index in range(200))
+        text = first + "\n" + second + "\n"
+        self.assertGreater(len(first), 2500)
+        plan = self.plan(text, max_piece_tokens=300)
+        self.assertEqual(plan.kind_detected, "transcript",
+                         "two labelled turns of any length are a transcript")
+        self.assertGreater(len(plan.pieces), 2, "each turn had to be split inside")
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, 300)
+        gaps = coverage_gaps(text, plan)
+        self.assertEqual(gaps["unaccounted_word_tokens"], 0, gaps)
+
+    def test_one_giant_unlabelled_block_is_not_claimed_as_a_transcript(self):
+        text = " ".join(f"freight_{index} carrier lane depot tariff" for index in range(400))
+        plan = self.plan(text, max_piece_tokens=300)
+        self.assertNotEqual(plan.kind_detected, "transcript")
+        self.assertGreater(len(plan.pieces), 1, "it is still cut, just not as turns")
+
+
+
+class TestTopicPassInTheWorker(unittest.TestCase):
+    """The topic pass runs in the worker, and the state row says which kind of cut happened."""
+
+    VOCABULARIES = [["freight", "carrier", "lane"], ["tariff", "duty", "customs"],
+                    ["wage", "shift", "roster"]]
+
+    class Embedder:
+        def __init__(self, vocabularies):
+            self.vocabularies = vocabularies
+            self.asks = 0
+
+        def __call__(self, texts):
+            self.asks += 1
+            return [[1.0 if set(text.lower().split()) & set(topic) else 0.0
+                     for topic in self.vocabularies] for text in texts]
+
+    def transcript(self) -> str:
+        lines: list[str] = []
+        for index, topic in enumerate(self.VOCABULARIES):
+            for turn in range(14):
+                word = topic[turn % len(topic)]
+                other = topic[(turn + 1) % len(topic)]
+                lines.append(f"(Speaker {index % 2}) The {word} position sits against "
+                             f"{other} for period {turn}, and the {word} margin moved "
+                             f"twice while the {other} desk kept the same note.")
+        return "\n".join(lines) + "\n"
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.docs = self.root / "source_docs"
+        self.docs.mkdir(parents=True)
+        self.store = _FakeStore()
+        self.post_json = AsyncMock(return_value={"track_id": "trk-1"})
+        self.post_file = AsyncMock(return_value={"track_id": "trk-1"})
+        patcher = patch.multiple(
+            worker.settings,
+            source_docs_dir=str(self.docs), uploads_dir=str(self.root / "uploads"),
+            transcript_prep_enabled=False, structure_chunking_enabled=True,
+            structure_chunking_max_piece_tokens=1200,
+            structure_chunking_min_piece_tokens=150,
+            structure_chunking_merge_until="floor",
+            structure_chunking_header_tokens=20, structure_chunking_headers=True,
+            structure_chunking_fit_margin_tokens=64,
+            structure_chunking_embed_window_tokens=8192,
+            structure_chunking_embed_tokenizer_path="",
+            structure_chunking_fail_on_lost_text=False,
+            structure_chunking_embed_url="", structure_chunking_embed_model="bge-m3-mlx-fp16",
+            structure_chunking_embed_api_key_env="OMLX_API_KEY",
+            structure_chunking_embed_batch=4, structure_chunking_embed_timeout_seconds=5.0,
+            structure_chunking_topic_threshold=0.30,
+            structure_chunking_topic_units_per_window=3,
+            structure_chunking_topic_max_windows=100,
+            worker_pptx_extract_enabled=True, worker_pdf_extract_enabled=True,
+            worker_docx_extract_enabled=True, worker_pdf_text_backend="auto",
+            worker_pdf_max_bytes=0, worker_pdf_max_chars=0, worker_docx_max_bytes=0,
+            worker_docx_max_chars=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _submit(self, name: str, content: str) -> dict[str, Any]:
+        path = self.docs / name
+        path.write_text(content, encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.store.docs[str(path)] = {"path": str(path), "sha256": digest, "status": "accepted",
+                                      "company": None, "filename": name,
+                                      "original_filename": name, "warnings_json": None}
+        with patch.multiple(worker,
+                            get_document_by_path=self.store.get_document_by_path,
+                            get_documents_by_sha256=self.store.get_documents_by_sha256,
+                            update_document_state=self.store.update_document_state,
+                            upsert_document=self.store.upsert_document,
+                            increment_retry=self.store.increment_retry), \
+             patch.object(worker.client, "post_json", self.post_json), \
+             patch.object(worker.client, "post_file", self.post_file):
+            _run_async(worker.submit_file(path, "filesystem", digest))
+        return {"path": str(path),
+                "json_body": self.post_json.await_args.args[1]
+                if self.post_json.await_count else None,
+                "meta": self.store.meta(str(path))}
+
+    def test_no_embedder_url_is_recorded_and_the_fallback_is_used(self):
+        got = self._submit("Meeting_2026-04-11.txt", self.transcript())
+        meta = got["meta"]
+        self.assertIn("STRUCTURE_CHUNKING_EMBED_URL",
+                      meta["structure_chunking_topic_note"] or "")
+        self.assertIsNone(meta.get("structure_chunking_topic_method"),
+                          "no topic pass ran: the row must not claim one")
+        self.assertEqual(meta["structure_chunking"], "applied")
+
+    def test_the_configured_embedder_cuts_the_flat_transcript_by_topic(self):
+        embedder = self.Embedder(self.VOCABULARIES)
+        with patch.object(worker, "topic_embedder_for_plan",
+                          return_value=(embedder, None)):
+            got = self._submit("Meeting_2026-04-11.txt", self.transcript())
+        meta = got["meta"]
+        self.assertEqual(meta["structure_chunking_topic_method"], "embedder")
+        self.assertGreaterEqual(meta["structure_chunking_topic_boundaries"], 2,
+                                "three topics, two cuts at minimum")
+        self.assertGreaterEqual(embedder.asks, 1, "the call happened in the worker")
+        body = got["json_body"]
+        delimiter = body["chunking"]["params"]["split_by_character"]
+        self.assertGreater(len([part for part in body["text"].split(delimiter) if part]), 2)
+
+    def test_the_merge_mode_is_on_the_row(self):
+        got = self._submit("Policy_2026-04.txt",
+                           "# Scope\n\n" + "\n\n".join(
+                               f"Para {index}: the {word} figure moved in the review."
+                               for index, word in enumerate(["freight", "tariff", "wage"]))
+                           + "\n")
+        self.assertEqual(got["meta"]["structure_chunking_merge_until"], "floor")
+
+    def test_an_embedder_that_raises_still_ingests_the_document(self):
+        def broken(texts):
+            raise RuntimeError("model server is down")
+        with patch.object(worker, "topic_embedder_for_plan", return_value=(broken, None)):
+            got = self._submit("Meeting_2026-04-11.txt", self.transcript())
+        meta = got["meta"]
+        self.assertEqual(meta["structure_chunking"], "applied",
+                         "an unreachable model server changes how we cut, not whether we ship")
+        self.assertEqual(meta["structure_chunking_topic_method"],
+                         "fallback(embedder-unreachable)")
+
 
 
 if __name__ == "__main__":

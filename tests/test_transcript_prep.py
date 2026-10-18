@@ -982,5 +982,155 @@ class TestPrepCountsReachTheWorkerRow(unittest.TestCase):
 
 
 
+
+class InlineLabelShapes(unittest.TestCase):
+    """Labels in the MIDDLE of a line: the monolithic-minutes shape."""
+
+    MINUTES = ("Ana: we renewed the depot lease for another two years. Liang: freight moved "
+               "twice and the carrier kept the same lane. Ana: then the tariff question came "
+               "back, and the customs desk asked for the origin papers again. Liang: the "
+               "papers are with the broker already.")
+
+    def test_a_single_line_of_minutes_becomes_turns(self):
+        segments = prep.split_inline_turns(self.MINUTES)
+        self.assertIsNotNone(segments)
+        self.assertEqual(len(segments), 4)
+        self.assertTrue(all(segment.startswith(("Ana:", "Liang:")) for segment in segments))
+
+    def test_the_segments_are_exact_substrings_so_no_word_moves(self):
+        segments = prep.split_inline_turns(self.MINUTES)
+        self.assertEqual(" ".join(self.MINUTES.split()),
+                         " ".join(" ".join(segments).split()))
+        for segment in segments:
+            self.assertIn(segment, self.MINUTES)
+
+    def test_parenthesised_minutes_split_too(self):
+        line = ("(Ana) we renewed the depot lease for two more years. (Liang) freight moved "
+                "twice and the carrier kept the lane. (Ana) the tariff came back at the review.")
+        segments = prep.split_inline_turns(line)
+        self.assertIsNotNone(segments)
+        self.assertEqual(len(segments), 3)
+
+    def test_prose_that_happens_to_use_colons_is_left_alone(self):
+        shapes = {
+            "prose": ("The report: the numbers were flat, and the review: nothing changed at "
+                      "all this quarter, despite the note: we asked twice about it."),
+            "key_values": ("Cost: 12000. Note: the vendor: depot nine, and the term: 24 "
+                           "months of service for the same site."),
+            "mid_sentence": ("We agreed that freight: the carrier would hold the lane, and "
+                             "that customs: the broker would file on time for the depot."),
+            "one_voice": ("Ana: we renewed the depot lease for another two years, and Ana: we "
+                          "kept the carrier on the same lane again this year, and Ana: the "
+                          "tariff stayed flat afterwards for two more years."),
+        }
+        for label, text in shapes.items():
+            with self.subTest(shape=label):
+                self.assertIsNone(prep.split_inline_turns(text))
+
+    def test_a_short_line_is_never_split(self):
+        self.assertIsNone(prep.split_inline_turns("Ana: here. Liang: there."))
+
+    def test_a_label_must_not_eat_the_words_in_front_of_the_colon(self):
+        # "two years. Liang:" is the trap: a three-word name pattern reads "years. Liang"
+        # as the speaker and swallows the sentence.
+        line = ("Ana: we renewed the depot lease for another two years. Liang: freight moved "
+                "twice and the carrier kept the same lane again this quarter, and Ana: the "
+                "tariff came back at the review of the customs papers.")
+        segments = prep.split_inline_turns(line)
+        self.assertTrue(all(segment.split(":")[0] in ("Ana", "Liang")
+                            for segment in segments or [""]))
+
+    def test_the_colon_after_a_parenthesised_name_is_punctuation_not_a_word(self):
+        parsed = prep._parse_turn("(Ana): we renewed the depot lease.")
+        self.assertIsNotNone(parsed)
+        speaker, body, style = parsed
+        self.assertEqual((speaker, style), ("Ana", "paren"))
+        self.assertEqual(body, "we renewed the depot lease.")
+
+    def test_a_bare_timestamp_label_is_a_turn(self):
+        parsed = prep._parse_turn("Ana 12:34")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], "Ana")
+
+
+
+
+class TestPerDocumentSpeakerSet(unittest.TestCase):
+    """A name grammar is per-word; the speaker set is per-document.
+
+    Hermes' unclassified transcripts use "(They)" / "(You)" / "(There)" at line starts,
+    strictly alternating. The words must stay rejected in general - "(they) said" is a
+    sentence fragment - and be accepted in the file that behaves like a transcript.
+    """
+
+    def lines(self, first: str, second: str, count: int = 12) -> list[str]:
+        return [f"({first if index % 2 == 0 else second}) the depot carrier lane {index} "
+                f"held while the freight tariff moved twice in the customs review"
+                for index in range(count)]
+
+    def test_an_alternating_pronoun_pair_is_a_speaker_set(self):
+        self.assertEqual(prep.speaker_set_from_alternation(self.lines("They", "You")),
+                         frozenset({"they", "you"}))
+
+    def test_a_real_name_paired_with_a_pronoun_rescues_only_the_pronoun(self):
+        sequence = prep.paren_label_sequence(self.lines("Ana", "They"))
+        kinds = {label: kind for label, kind, _chars in sequence}
+        self.assertEqual(kinds["ana"], "ok")
+        self.assertEqual(kinds["they"], "non-speaker")
+        self.assertEqual(prep.speaker_set_from_alternation(self.lines("Ana", "They")),
+                         frozenset({"ana", "they"}))
+
+    def test_stage_directions_alternating_are_not_people(self):
+        for pair in (("Cross-talk", "Inaudible"), ("Background noise", "Silence")):
+            with self.subTest(labels=pair):
+                self.assertEqual(prep.speaker_set_from_alternation(self.lines(*pair)),
+                                 frozenset())
+
+    def test_no_pattern_no_rescue(self):
+        cases = {
+            "too few": self.lines("They", "You", 3),
+            "one voice repeating": ["(They) a", "(They) b", "(They) c", "(They) d"],
+            "three labels": ["(They) a", "(You) b", ("(There) c"), "(They) d",
+                             "(You) e", "(There) f", "(They) g", "(You) h"],
+            "no parens at all": ["the depot lane held", "and the tariff moved"],
+        }
+        for label, lines in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(prep.speaker_set_from_alternation(lines), frozenset())
+
+    def test_the_preparer_then_reads_the_pronoun_transcript(self):
+        text = "\n".join(self.lines("They", "You")) + "\n"
+        result = prep.prepare_transcript(text, filename="Call_2026-04-11.txt")
+        self.assertTrue(result.detected, result.reason)
+        self.assertIn("They", result.speakers)
+        self.assertIn("You", result.speakers)
+        def without_headers(body: str) -> str:
+            return "\n".join(line for line in body.splitlines()
+                              if line.strip() and not prep._HEADER_RE.match(line.strip()))
+        self.assertEqual(" ".join(prep.word_tokens(without_headers(text))),
+                         " ".join(prep.word_tokens(without_headers(result.text))),
+                         "the headers are added; no word of the meeting is changed")
+
+    def test_the_prose_with_parenthetical_pronouns_is_still_not_a_transcript(self):
+        text = "\n\n".join(
+            f"(they said the depot carrier lane {index} would hold, and the tariff moved) "
+            f"the review closed with the same figure twice for period {index}."
+            for index in range(10))
+        result = prep.prepare_transcript(text, filename="notes.txt")
+        self.assertFalse(result.detected, result.reason)
+
+    def test_a_monolithic_pair_of_giant_turns_gets_a_speaker_set(self):
+        first = "(They) " + " ".join(f"freight_{index} carrier depot tariff"
+                                     for index in range(200))
+        second = "(You) " + " ".join(f"wage_{index} shift roster margin"
+                                     for index in range(200))
+        self.assertGreater(len(first), 2500)
+        self.assertEqual(prep.monolithic_speaker_set([first, second]),
+                         frozenset({"they", "you"}))
+        self.assertEqual(prep.monolithic_speaker_set([first[:400], second[:400]]),
+                         frozenset(), "short lines are not a monolithic transcript")
+
+
+
 if __name__ == "__main__":
     unittest.main()

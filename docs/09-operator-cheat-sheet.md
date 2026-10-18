@@ -174,6 +174,6 @@ curl -s http://localhost:8000/ingest/status \
 ## Known-Good Values
 
 ```bash
-EMBEDDING_MODEL=mxbai-embed-large-v1
+EMBEDDING_MODEL=bge-m3-mlx-fp16   # the only embedder since 2026-10-18
 RERANK_MODEL=jina-reranker-v3-mlx
 ```

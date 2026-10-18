@@ -72,6 +72,12 @@ class PdfExtractError(Exception):
         self.error_code = error_code
 
 
+# The two PDF readers, named in the state row. "-layout" is spelled out because it is the
+# flag that matters, not the program.
+PDF_BACKEND_LAYOUT = "pdftotext-layout"
+PDF_BACKEND_PYPDF = "pypdf"
+
+
 def _indent_of(line: str) -> int:
     expanded = line.replace("\t", "    ")
     return len(expanded) - len(expanded.lstrip(" "))
@@ -192,8 +198,13 @@ def _extract_with_pypdf(path: Path) -> str:
     return "\n\n".join(pages)
 
 
-def extract_pdf_text(path: Path, *, backend: str = "auto") -> str:
-    """Text of a PDF with logical rows reassembled. Raises PdfExtractError.
+def extract_pdf_text_with_backend(path: Path, *, backend: str = "auto") -> tuple[str, str]:
+    """Text of a PDF with logical rows reassembled, plus the backend that produced it.
+
+    The backend is a fact about the result, not an implementation detail: the row
+    reassembly reads the column positions only ``pdftotext -layout`` reproduces (Hermes'
+    run: 803 rows rejoined with poppler, 0 with pypdf), so a state row that does not say
+    which one ran cannot explain why two PDFs chunked differently.
 
     Backend order, and it matters: ``pdftotext -layout`` reproduces the column positions as
     spaces, which is what the row reassembly reads, and poppler-utils is already in the
@@ -205,15 +216,15 @@ def extract_pdf_text(path: Path, *, backend: str = "auto") -> str:
         raise PdfExtractError(f"unknown PDF text backend {requested!r} "
                               "(auto, pdftotext or pypdf)", error_code=PDF_EXTRACT_FAILED)
     if requested == "pypdf":
-        body = _extract_with_pypdf(path)
+        body, used = _extract_with_pypdf(path), PDF_BACKEND_PYPDF
     elif requested == "pdftotext":
         if not pdftotext_available():
             raise PdfExtractError("pdftotext is not on PATH", error_code=PDF_LIB_MISSING)
-        body = _run_pdftotext(path)
+        body, used = _run_pdftotext(path), PDF_BACKEND_LAYOUT
     elif pdftotext_available():
-        body = _run_pdftotext(path)
+        body, used = _run_pdftotext(path), PDF_BACKEND_LAYOUT
     else:
-        body = _extract_with_pypdf(path)
+        body, used = _extract_with_pypdf(path), PDF_BACKEND_PYPDF
     raw_hints = body.count("\f") + 1
     body = _PAGE_BREAK.sub("\n", body)
     joined = join_wrapped_rows(clean_extracted_text(body))
@@ -222,16 +233,29 @@ def extract_pdf_text(path: Path, *, backend: str = "auto") -> str:
         # only thing that can do better here, so this is a fallback signal, not a failure.
         raise PdfExtractError(f"PDF has no extractable text layer ({raw_hints} pages of "
                               "output, no characters of text)", error_code=PDF_EMPTY)
-    return joined
+    return joined, used
 
 
-def extract_pdf_payload(path: Path, *, max_bytes: int = 0, max_chars: int = 0,
-                        backend: str = "auto") -> str:
-    """Byte-guard, extract, normalise and cap. Same shape as the PPTX route."""
+def extract_pdf_text(path: Path, *, backend: str = "auto") -> str:
+    """The text only. See :func:`extract_pdf_text_with_backend` for the backend."""
+    return extract_pdf_text_with_backend(path, backend=backend)[0]
+
+
+def extract_pdf_payload_with_backend(path: Path, *, max_bytes: int = 0, max_chars: int = 0,
+                                     backend: str = "auto") -> tuple[str, str]:
+    """Byte-guard, extract, normalise and cap, and say which backend ran."""
     if max_bytes:
         size = path.stat().st_size
         if size > max_bytes:
             raise PdfExtractError(
                 f"PDF too large to extract: {size} bytes exceeds the configured limit",
                 error_code=PDF_EXTRACT_FAILED)
-    return cap_extracted_text(extract_pdf_text(path, backend=backend), int(max_chars) or None)
+    text, used = extract_pdf_text_with_backend(path, backend=backend)
+    return cap_extracted_text(text, int(max_chars) or None), used
+
+
+def extract_pdf_payload(path: Path, *, max_bytes: int = 0, max_chars: int = 0,
+                        backend: str = "auto") -> str:
+    """Byte-guard, extract, normalise and cap. Same shape as the PPTX route."""
+    return extract_pdf_payload_with_backend(path, max_bytes=max_bytes, max_chars=max_chars,
+                                            backend=backend)[0]

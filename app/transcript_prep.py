@@ -169,7 +169,7 @@ _NON_SPEAKER_LABELS = frozenset({
 # parenthetical, not a speaker. Counted as content, never as a speaker label.
 _NON_SPEAKER_PARENS = frozenset({
     "inaudible", "unintelligible", "unclear", "silence", "pause", "laughter",
-    "applause", "crosstalk", "overlap", "background noise", "noise", "music",
+    "applause", "crosstalk", "cross-talk", "overlap", "background noise", "noise", "music",
     "off mic", "on mic", "unknown", "unknown speaker", "speaker unknown",
     "see above", "see below", "above", "below", "optional", "continued",
     "continues", "cont", "footnote", "ibid", "sic", "emphasis", "original",
@@ -261,6 +261,94 @@ def _is_noise(line: str) -> bool:
     return any(pattern.match(line) for pattern in _NOISE_PATTERNS)
 
 
+# ── labels INSIDE a line: the monolithic-minutes shape ─────────────────────
+# Some minutes files are one line per meeting, or one line per agenda item: the whole
+# discussion sits in a single paragraph and the only thing marking a change of voice is
+# a label in the middle of it ("Ana: we renewed the depot. Liang: freight moved twice.
+# Ana: then the tariff."). A line-anchored parser sees one unlabelled line and calls the
+# document prose. These helpers find labels wherever they sit, so detection can count
+# them by FREQUENCY rather than by line count.
+
+# One word, capitalised: the line-anchored parser's three-word name is safe at the start
+# of a line, but in mid-sentence it eats the words in front of the colon ("two years.
+# Liang:" reads as a name). A missed two-word speaker name costs a label; an eaten
+# sentence costs the document its meaning.
+_INLINE_NAME = r"[^\W\d_][\w'\u2019\-]*"
+_INLINE_COLON_LABEL = re.compile(
+    rf"(?:^|(?<=[\s(\[{{}}\u2014\u2013-]))(?P<name>{_INLINE_NAME})[ \t]*:[ \t]+")
+_INLINE_PAREN_LABEL = re.compile(
+    rf"(?:^|(?<=\s))\([ \t]*(?P<name>{_INLINE_NAME})[ \t]*\)[ \t]+")
+
+# A line shorter than this is not a minutes paragraph; splitting it risks cutting prose
+# that merely contains a colon ("Cost: 12000 EUR" is a line, not a meeting).
+_INLINE_MIN_LINE_CHARS = 80
+# Fewer than this many labels in one line is a coincidence, not a transcript.
+_INLINE_MIN_LABELS = 2
+
+
+def _inline_label_name(raw: str) -> str | None:
+    """Accept a mid-line label only if it is name-shaped, capitalised and not furniture.
+
+    The capital is not vanity: it is what separates "Liang: freight moved" from
+    "the review: nothing changed", and prose is the corpus we must not rewrite.
+    """
+    name = _clean_name(raw)
+    if name is None:
+        return None
+    if not name[0].isupper():
+        return None
+    if any(word.lower() in _STOPWORD_LABELS for word in name.split()):
+        return None
+    crossref = _CROSSREF_LABEL.fullmatch(name)
+    if crossref and crossref.group(2) and crossref.group(1).rstrip(".").lower() in _CROSSREF_NOUNS:
+        return None                      # "Figure 3: ..." is a caption, not a voice
+    return name
+
+
+def inline_label_positions(line: str) -> list[tuple[int, str]]:
+    """Where speaker labels START inside ``line`` (including at its head), in order.
+
+    Both dialects are scanned: ``Name:`` and ``(Name)``. Overlapping candidates keep
+    the earlier start. Nothing here decides whether the line is a transcript; it only
+    reports label-shaped positions.
+    """
+    found: dict[int, str] = {}
+    for pattern in (_INLINE_COLON_LABEL, _INLINE_PAREN_LABEL):
+        for match in pattern.finditer(line):
+            name = _inline_label_name(match.group("name"))
+            if name is None:
+                continue
+            body = line[match.end():]
+            if not body or body[0].isspace():
+                continue
+            found.setdefault(match.start("name"), name)
+    return sorted(found.items())
+
+
+def split_inline_turns(line: str) -> list[str] | None:
+    """Break ONE line carrying several speaker labels into one segment per label.
+
+    Returns ``None`` when the line should be left alone - too short, too few labels,
+    or only one voice repeating (a repeated word followed by a colon is how prose and
+    key-value text look, not how a meeting reads). The segments are EXACT substrings of
+    the input, so the words survive the trip in order and unchanged.
+    """
+    positions = inline_label_positions(line)
+    if len(line) < _INLINE_MIN_LINE_CHARS or len(positions) < _INLINE_MIN_LABELS:
+        return None
+    if len({name.lower() for _pos, name in positions}) < 2:
+        return None
+    segments: list[str] = []
+    starts = [position for position, _name in positions]
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(line)
+        segment = line[start:end].rstrip()
+        if segment.strip():
+            segments.append(segment)
+    return segments or None
+
+
+# ── name cleaning ─────────────────────────────────────────────────────────
 def _clean_name(raw: str) -> str | None:
     name = " ".join(raw.strip().split())
     if not name or len(name) > 40:
@@ -298,8 +386,10 @@ def _leading_parenthetical(line: str) -> tuple[str, str] | None:
             depth -= 1
             if depth == 0:
                 rest = line[position + 1:]
-                if rest and not rest[0].isspace():
-                    return None      # "(word)word" is a token, not a label
+                # "(Ana) text" and "(Ana): text" are both labels - the colon is the
+                # speaker marker a person types by hand. "(Ana)word" is a token.
+                if rest and not rest[0].isspace() and not rest.startswith(":"):
+                    return None
                 return line[offset + 1:position], rest.strip()
     return None                      # unbalanced: not our shape
 
@@ -334,7 +424,111 @@ def _name_like_part(part: str) -> bool:
     return all(_word_is_name_like(word) or word.isdigit() for word in words)
 
 
-def _classify_paren_label(raw: str) -> tuple[str | None, str]:
+# ── this document's own speaker set ───────────────────────────────────────
+# A name grammar can be right about the corpus and wrong about one file. The shape
+# Hermes found: every line opens with "(They)" or "(You)" - ordinary function words
+# the general grammar must reject, because in prose "(they) said" is a sentence
+# fragment and not a speaker. What makes them speakers here is not the word, it is
+# the BEHAVIOUR: two labels, each heading many lines, strictly alternating down the
+# document like a transcript reads. Stage directions never do that.
+#
+# So the rejection is per-word and the acceptance is per-document, and the
+# acceptance needs evidence: exactly two labels, at least ``min_occurrences`` labelled
+# lines, no two consecutive turns the same voice, and period-two alternation.
+_MIN_ALTERNATING_LABELS = 4
+_STAGE_MARKER_WORDS = _NON_SPEAKER_PARENS | _NON_SPEAKER_LABELS
+
+
+def paren_label_sequence(lines: Sequence[str]) -> list[tuple[str, str, int]]:
+    """``(label, kind, line_chars)`` for every line that OPENS with a parenthetical.
+
+    ``kind`` comes from :func:`_classify_paren_label` with no document knowledge, so
+    this is the evidence the per-document passes read, not their conclusion. The line
+    length rides along because a 9,000-token line that opens with "(They)" is a turn,
+    while "(they) said" in a paragraph is not.
+    """
+    sequence: list[tuple[str, str, int]] = []
+    for raw in lines:
+        line = raw.rstrip()
+        candidate = _leading_parenthetical(line)
+        if candidate is None:
+            continue
+        label = " ".join(candidate[0].strip().split()).lower()
+        if not label:
+            continue
+        sequence.append((label, _classify_paren_label(candidate[0])[1], len(line)))
+    return sequence
+
+
+def speaker_set_from_alternation(lines: Sequence[str],
+                                 *, min_occurrences: int = _MIN_ALTERNATING_LABELS
+                                 ) -> frozenset[str]:
+    """Labels that act like speakers in THIS document, even where the words say otherwise.
+
+    Returns the two labels when the paren-labelled lines alternate between exactly two
+    of them, each appearing at least twice, with no label repeated in consecutive
+    turns. Anything stage-direction-shaped is refused outright: "(Cross-talk)",
+    "(Inaudible)" and "(Background noise)" alternate just as happily and are still not
+    people. Labels that already parse are included in the pattern (that is what lets a
+    real name pair with a pronoun) but are not rescued, because they need no rescue.
+    """
+    sequence = paren_label_sequence(lines)
+    if len(sequence) < max(2, int(min_occurrences)):
+        return frozenset()
+    labels = [label for label, _kind, _chars in sequence]
+    distinct = set(labels)
+    if len(distinct) != 2:
+        return frozenset()
+    if any(labels[index] == labels[index + 1] for index in range(len(labels) - 1)):
+        return frozenset()                              # a run of one voice: not alternating
+    if any(labels[index] != labels[index + 2] for index in range(len(labels) - 2)):
+        return frozenset()                              # period two, or no pattern claimed
+    if distinct & _STAGE_MARKER_WORDS:
+        return frozenset()
+    rescued = {label for label, kind, _chars in sequence if kind != "ok"}
+    if not rescued:
+        return frozenset()                              # nothing needed rescuing
+    if any(len(label.split()) > 2 or len(label) > 24 for label in distinct):
+        return frozenset()
+    return frozenset(distinct)
+
+
+# A line at least this long is not a paragraph of prose; it is a turn somebody wrote
+# as one block, and the label at its head is the only structure the file has.
+_MONOLITHIC_LINE_CHARS = 2500
+
+
+def monolithic_speaker_set(lines: Sequence[str],
+                           *, min_line_chars: int = _MONOLITHIC_LINE_CHARS) -> frozenset[str]:
+    """The two labels heading whole 9,000-token lines: a meeting, one turn per line.
+
+    The alternation pass above needs four labelled lines to see a pattern. A file with
+    two lines cannot produce four, and leaving its only structure unread is the worse
+    error: an unlabelled 9,000-token block has no boundary at all, so the chunker has
+    to cut it blind. Two lines, both opening with a short parenthesised label, both
+    enormous, neither voice twice in a row, and no stage markers: that is a transcript
+    written badly, not prose.
+    """
+    sequence = paren_label_sequence(lines)
+    long_pairs = [(label, kind) for label, kind, chars in sequence
+                  if chars >= int(min_line_chars)]
+    if len(long_pairs) < 2:
+        return frozenset()
+    labels = [label for label, _kind in long_pairs]
+    if len(set(labels)) != 2:
+        return frozenset()
+    if any(labels[index] == labels[index + 1] for index in range(len(labels) - 1)):
+        return frozenset()
+    if set(labels) & _STAGE_MARKER_WORDS:
+        return frozenset()
+    if any(len(label.split()) > 2 or len(label) > 24 for label in set(labels)):
+        return frozenset()
+    return frozenset(labels)
+
+
+def _classify_paren_label(raw: str,
+                          accepted: frozenset[str] = frozenset()
+                          ) -> tuple[str | None, str]:
     """Validate a ``(Label)`` prefix, returning ``(label or None, kind)``.
 
     ``kind`` is ``"ok"``, ``"non-speaker"`` (stage direction, enumeration,
@@ -349,6 +543,10 @@ def _classify_paren_label(raw: str) -> tuple[str | None, str]:
     lowered = label.lower()
     if lowered in _NON_SPEAKER_LABELS or lowered in _NON_SPEAKER_PARENS:
         return None, "non-speaker"
+    if lowered in accepted:
+        # This document's own speaker set (see speaker_set_from_alternation): the word
+        # is ordinary, the behaviour is a transcript.
+        return label, "ok"
     # "(a)", "(1)", "(i)", "(iii)": an enumeration or a bare marker.
     if len(label) < 2 or not re.match(r"[^\W\d_]", label):
         return None, "non-speaker"
@@ -387,7 +585,8 @@ def _classify_paren_label(raw: str) -> tuple[str | None, str]:
     return label, "ok"
 
 
-def _parse_turn(line: str) -> tuple[str, str, str] | None:
+def _parse_turn(line: str,
+                accepted: frozenset[str] = frozenset()) -> tuple[str, str, str] | None:
     """Return ``(speaker, body, style)`` when the line starts a speaker turn.
 
     ``style`` is ``"paren"`` for ``(Ana) text`` and ``"colon"`` for the
@@ -397,9 +596,11 @@ def _parse_turn(line: str) -> tuple[str, str, str] | None:
     candidate = _leading_parenthetical(line.rstrip())
     if candidate is not None:
         inner, rest = candidate
-        name, kind = _classify_paren_label(inner)
+        name, kind = _classify_paren_label(inner, accepted)
         if name is not None:
-            return name, rest, "paren"
+            # "(Ana): text" - the colon a person types after a parenthesised name is
+            # punctuation, not the first word of what they said.
+            return name, rest[1:].lstrip() if rest.startswith(":") else rest, "paren"
     for pattern in _TURN_PATTERNS:
         match = pattern.match(line.rstrip())
         if not match:
@@ -565,6 +766,7 @@ def prepare_transcript(
     # Idempotency: drop headers this module inserted, then regenerate them.
     lines = [line for line in lines if not _HEADER_RE.match(line.rstrip())]
 
+    accepted = speaker_set_from_alternation(lines)
     turns: list[_Turn] = []
     label_lines = 0
     paren_label_lines = 0
@@ -581,7 +783,7 @@ def prepare_transcript(
         nonempty += 1
         if re.match(rf"^\s*{_TS}[ \t]*-->[ \t]*{_TS}\s*$", line):
             cue_lines += 1
-        parsed = _parse_turn(line)
+        parsed = _parse_turn(line, accepted)
         if parsed is not None:
             speaker, body, style = parsed
             label_lines += 1
@@ -596,7 +798,7 @@ def prepare_transcript(
             continue
         candidate = _leading_parenthetical(line)
         if candidate is not None:
-            kind = _classify_paren_label(candidate[0])[1]
+            kind = _classify_paren_label(candidate[0], accepted)[1]
             if kind != "ok":
                 rejected_labels += 1      # every paren line that is not a speaker
             if kind == "unparseable":

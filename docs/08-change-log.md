@@ -12,7 +12,7 @@ ghcr.io/hkuds/lightrag:v1.5.7   # was v1.4.15; production moved on 2026-10-09 an
 2. Correct embedding model is:
 
 ```bash
-EMBEDDING_MODEL=mxbai-embed-large-v1
+EMBEDDING_MODEL=mxbai-embed-large-v1   # SUPERSEDED 2026-10-18: see the BGE-M3 entry below
 ```
 
 3. Text files must ingest via LightRAG `POST /documents/text`
@@ -124,3 +124,52 @@ before chunking; repeated page headers are dropped and counted.
 - Not verified: `chunk_token_size` ≥ largest piece is asserted per document, but what
   LightRAG 1.5.7 does with a piece larger than `chunk_token_size` under
   `split_by_character_only` is still an unknown (Hermes to confirm from the image source).
+
+## 2026-10-18 — BGE-M3 is the only embedder; chunk size has no cap, the window does
+
+mxbai-embed-large-v1 is retired from defaults, docs, tests and the benchmark configs. BGE-M3
+(`bge-m3-mlx-fp16`, dense 1024-dim, real window 8192 tokens) is the only embedder the stack
+names. The older 512-token window is what made 1200-token chunks fail silently, so the
+configuration is stated in terms of the window instead of a size target.
+
+- **No chunk-size cap.** `STRUCTURE_CHUNKING_MAX_PIECE_TOKENS` (7500 = window − margin) is the
+  only ceiling and the only reason to cut. A piece is a natural unit — a whole section, a whole
+  table, a run of turns on one topic — split only when it cannot fit the window, and then at its
+  best internal boundary (sub-heading → paragraph → table row with the header repeated → turn →
+  sentence), never at a token count. `chunk_token_size` sent to LightRAG is
+  `largest piece + margin`, asserted per document, upload fallback otherwise.
+- **Merge floor, not a target.** `STRUCTURE_CHUNKING_MIN_PIECE_TOKENS` (150) welds a too-small
+  unit to its neighbour, which is what fixes the 596-piece PDF without limiting the maximum. A
+  heading never stands alone; a section heading rides on its first content, including before a
+  large table. `STRUCTURE_CHUNKING_MERGE_UNTIL=floor` (default) keeps one natural unit per
+  piece; `window` chains small neighbours to the window and is the benchmark's comparison knob.
+- **Topic-shift segmentation** for flat text and transcripts (`STRUCTURE_CHUNKING_EMBED_URL`):
+  windows of turns/sentences embedded with BGE-M3, cut at TextTiling depth minima. The call
+  lives in `app/topic_embedder.py` — batched, bounded per document, cached by
+  sha256(model+text), and it refuses the LightRAG (9621) and gateway (8020) ports. With no URL,
+  or an unreachable server, the deterministic fallback cuts at unit boundaries near the window
+  and `structure_chunking_topic_method` records which happened.
+- **Transcript labels found by repeated behaviour, not line count**: `(Name)`, `(Name):`,
+  `Name 12:34`, bracketed timestamps, and labels inside one long line (a monolithic minutes
+  file is split into turns before anything is counted). A parenthesised label that alternates
+  strictly with one other label — or heads two enormous lines — is a speaker even when the word
+  is a pronoun (`(They)` / `(You)` across 40 lines), which is the shape five real transcripts
+  were using. Stage directions are never rescued. A turn longer than the window is split inside
+  the turn.
+- **PDF backend is recorded** as `structure_extract_backend` (`pdftotext-layout` or `pypdf`),
+  because row reassembly depends on the column positions only `pdftotext -layout` reproduces
+  (Hermes' run: 803 rows rejoined with poppler, 0 with pypdf). `poppler-utils` is therefore a
+  Containerfile/image dependency worth pinning — escalated to the lead.
+- **`app/embed_tokenizer.py` reads BGE-M3's own files** (`tokenizer.json`,
+  `tokenizer_config.json`, `special_tokens_map.json`): Unigram vocabulary, `added_tokens`
+  specials, the XLM-R pre-tokenizer punctuation split, and byte fallback, so a character the
+  vocabulary cannot represent costs its three UTF-8 byte tokens instead of one — the case most
+  likely to be silently truncated. Local files only; nothing is ever downloaded.
+- Benchmark configs are BGE-M3 only: `fixed-350-50` and `fixed-1200-100` as references, and
+  `structure` arms at 700/1500 with headers true/false/shuffled. The mxbai arms are gone.
+- Not verified offline: real BGE-M3 similarity behaviour (the threshold 0.30 was set on synthetic
+  vocabularies, so the first real run should print the depth distribution before it is moved);
+  the topic pass against the served oMLX embedder; `tokenizer.json` handling against the real
+  249,997-entry BGE-M3 vocabulary (synthetic XLM-R-shaped files only — Hermes' load of the real
+  files reported `unigram-249997-entry-local+2special`); and what LightRAG does with an oversize
+  piece under `split_by_character_only`.

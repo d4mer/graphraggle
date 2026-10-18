@@ -121,11 +121,13 @@ class _Fixture(unittest.TestCase):
         path.write_text(json.dumps({"configs": entries}), encoding="utf-8")
         return path
 
-    def mxbai(self, name: str, strategy: str, size: int, overlap: int, **extra: Any) -> dict[str, Any]:
+    def arm(self, name: str, strategy: str, size: int, overlap: int, **extra: Any) -> dict[str, Any]:
+        """One benchmark arm. The declared window is the one UNDER TEST (often a deliberately
+        tight one), not BGE-M3's real 8192."""
         return {"name": name,
                 "chunker": {"strategy": strategy, "chunk_token_size": size, "overlap": overlap,
                             **extra},
-                "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+                "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 512},
                 "rerank": None}
 
     def args(self, *, configs: Path, out: str = "out", extra: list[str] | None = None):
@@ -133,7 +135,7 @@ class _Fixture(unittest.TestCase):
         argv = ["--corpus", str(self.root / "corpus.json"), "--probes", str(self.root / "probes.jsonl"),
                 "--out", out if Path(out).is_absolute() else str(self.root / out),
                 "--configs", str(configs), "--embed-url", "http://127.0.0.1:8080",
-                "--embed-model", "mxbai-embed-large-v1"]
+                "--embed-model", "bge-m3-mlx-fp16"]
         argv += extra or []
         return parser.parse_args(argv)
 
@@ -356,7 +358,7 @@ class TestEmbeddingClient(unittest.TestCase):
     def client(self, http: FakeHttp, *, sleep: Any = None, cache: cb.EmbedCache | None = None,
                retries: int = cb.HTTP_RETRIES) -> cb.ModelClient:
         return cb.ModelClient(http=http, embed_url="http://127.0.0.1:8080",
-                              embed_model="mxbai", rerank_url="http://127.0.0.1:8080",
+                              embed_model="bge-m3", rerank_url="http://127.0.0.1:8080",
                               rerank_model="jina", api_key="s3cret",
                               cache=cache or self.cache, sleep=sleep or (lambda _s: None),
                               retries=retries)
@@ -371,18 +373,18 @@ class TestEmbeddingClient(unittest.TestCase):
         texts = ["same text"]
         http = FakeHttp()
         client = self.client(http)
-        client.embed(texts, model="mxbai")
+        client.embed(texts, model="bge-m3")
         self.assertEqual(http.embed_calls, 1)
-        client.embed(texts, model="mxbai")
+        client.embed(texts, model="bge-m3")
         self.assertEqual(http.embed_calls, 1, "a rerun must not re-embed")
         self.assertEqual(self.cache.hits, 1)
-        client.embed(texts, model="bge-m3")
+        client.embed(texts, model="bge-m3-mlx-fp16")
         self.assertEqual(http.embed_calls, 2, "a different model is a different vector")
-        client.embed(texts, model="mxbai", prefix="query: ")
+        client.embed(texts, model="bge-m3", prefix="query: ")
         self.assertEqual(http.embed_calls, 3, "a different prefix is a different input")
-        for name in (self.cache.path_for(self.cache.key("mxbai", "", "same text")).name,):
+        for name in (self.cache.path_for(self.cache.key("bge-m3", "", "same text")).name,):
             self.assertNotIn("same", name)
-        body = json.loads(self.cache.path_for(self.cache.key("mxbai", "", "same text"))
+        body = json.loads(self.cache.path_for(self.cache.key("bge-m3", "", "same text"))
                           .read_text(encoding="utf-8"))
         self.assertEqual(set(body), {"model", "dim", "vector"})
 
@@ -430,7 +432,7 @@ class TestRerankClient(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
 
     def client(self, http: FakeHttp) -> cb.ModelClient:
-        return cb.ModelClient(http=http, embed_url="http://127.0.0.1:8080", embed_model="mxbai",
+        return cb.ModelClient(http=http, embed_url="http://127.0.0.1:8080", embed_model="bge-m3",
                               rerank_url="http://127.0.0.1:8080", rerank_model="jina", api_key="",
                               cache=cb.EmbedCache(self.tmp / "cache"), sleep=lambda _s: None)
 
@@ -481,19 +483,33 @@ class TestConfigFile(unittest.TestCase):
         names = [config["name"] for config in configs]
         self.assertEqual(len(names), len(set(names)))
         by_name = {config["name"]: config for config in configs}
-        current = next(config for name, config in by_name.items() if "1200" in name and "mxbai" in name)
+        # The two blind-cutting references, kept so a structure arm has something to beat.
+        current = by_name["fixed-1200-100"]
         self.assertEqual(current["chunker"]["strategy"], "fixed_token")
         self.assertEqual(current["chunker"]["chunk_token_size"], 1200)
         self.assertEqual(current["chunker"]["overlap"], 100)
+        self.assertNotIn("mxbai", json.dumps(configs).lower(),
+                         "mxbai arms are gone: BGE-M3 is the only embedder (2026-10-18)")
+        self.assertEqual({config["embedder"]["model"] for config in configs},
+                         {"bge-m3-mlx-fp16"})
         sizes = {(config["chunker"]["strategy"], config["chunker"]["chunk_token_size"],
                   config["chunker"]["overlap"], config["embedder"]["model"])
                  for config in configs}
-        self.assertIn(("recursive", 350, 50, "mxbai-embed-large-v1"), sizes)
-        for size, overlap in ((350, 50), (600, 80), (800, 100), (1200, 100)):
-            self.assertIn(("recursive", size, overlap, "bge-m3-mlx-fp16"), sizes)
-        self.assertTrue(any(config["rerank"] for config in configs),
-                        "the file must include rerank variants")
-        self.assertGreaterEqual(sum(1 for config in configs if config["rerank"]), 2)
+        self.assertIn(("recursive", 350, 50, "bge-m3-mlx-fp16"), sizes,
+                      "the old recommended size stays as the second reference point")
+        # The shipped pre-chunker, at two caps and with the header honest, absent and wrong.
+        for cap in (700, 1500):
+            names = [name for name, config in by_name.items()
+                     if config["chunker"]["strategy"] == "structure"
+                     and config["chunker"].get("max_piece_tokens") == cap]
+            self.assertGreaterEqual(len(names), 3, f"cap {cap} needs headers on/off/placebo")
+            for name in names:
+                self.assertEqual(by_name[name]["chunker"].get("min_piece_tokens"), 150,
+                                 "the merge floor is part of the shape being measured")
+        headers = {by_name[name]["chunker"].get("headers") for name in by_name
+                   if by_name[name]["chunker"]["strategy"] == "structure"}
+        self.assertEqual(headers, {True, False, "shuffled"},
+                         "no placebo arm means no proof the header is doing work")
 
     def test_the_separator_list_is_the_one_the_decision_memo_asks_for(self):
         configs = cb.load_configs(CONFIGS_PATH)
@@ -507,16 +523,18 @@ class TestConfigFile(unittest.TestCase):
         by_model: dict[str, Any] = {}
         for config in cb.load_configs(CONFIGS_PATH):
             by_model[config["embedder"]["model"]] = config["embedder"].get("max_input_tokens")
-        self.assertEqual(by_model.get("mxbai-embed-large-v1"), 512)
-        self.assertGreaterEqual(by_model.get("bge-m3-mlx-fp16"), 8192)
+        self.assertEqual(list(by_model), ["bge-m3-mlx-fp16"],
+                         "BGE-M3 is the only embedder; a retired model in the grid is a "
+                         "silent re-embed of the corpus, not an error")
+        self.assertGreaterEqual(by_model["bge-m3-mlx-fp16"], 8192)
 
     def test_the_shipped_model_ids_are_the_ones_o_m_l_x_serves(self):
         """Hermes' run proved which ids answer; a wrong one silently re-embeds everything."""
         models = {config["embedder"]["model"] for config in cb.load_configs(CONFIGS_PATH)}
         rerankers = {config["rerank"]["model"] for config in cb.load_configs(CONFIGS_PATH)
                      if config["rerank"]}
-        self.assertEqual(models, {"mxbai-embed-large-v1", "bge-m3-mlx-fp16"})
-        self.assertEqual(rerankers, {"jina-reranker-v3-mlx"})
+        self.assertEqual(models, {"bge-m3-mlx-fp16"})
+        self.assertTrue(rerankers <= {"jina-reranker-v3-mlx"})
 
     def test_the_readme_run_command_names_a_model_that_answers(self):
         """The example command is as likely to be run as the arms themselves."""
@@ -526,8 +544,9 @@ class TestConfigFile(unittest.TestCase):
                     if config["rerank"]}
         named = re.findall(r"--(?:embed|rerank)-model\s+(\S+)", readme)
         self.assertTrue(named, "the runbook shows no model id at all")
+        served = shipped | {"jina-reranker-v3-mlx"}
         for model in named:
-            self.assertIn(model, shipped, f"{model} is not one of the shipped arms")
+            self.assertIn(model, served, f"{model} is not an id oMLX answers to")
 
     def test_bad_configs_are_refused(self):
         cases = {
@@ -545,6 +564,10 @@ class TestConfigFile(unittest.TestCase):
             "separators not strings": [{"name": "a", "chunker": {"strategy": "recursive",
                                                                  "separators": [1, 2]},
                                         "embedder": {"model": "m"}}],
+            "merge_until not floor or window": [{"name": "a", "chunker": {
+                "strategy": "structure", "chunk_token_size": 300, "overlap": 0,
+                "budget_tokens": 300, "merge_until": "both"},
+                "embedder": {"model": "m"}}],
         }
         for why, entries in cases.items():
             with self.subTest(why):
@@ -554,11 +577,53 @@ class TestConfigFile(unittest.TestCase):
                     cb.load_configs(path)
 
 
+
+class TestEmbedderDefaults(unittest.TestCase):
+    """The retired embedder must not survive as a default anywhere."""
+
+    def required(self) -> list[str]:
+        return ["--corpus", "x.json", "--probes", "p.jsonl", "--out", "out",
+                "--embed-url", "http://127.0.0.1:8080"]
+
+    def test_the_cli_defaults_to_bge_m3(self):
+        args = cb.build_parser().parse_args(self.required())
+        self.assertEqual(args.embed_model, "bge-m3-mlx-fp16")
+        self.assertEqual(args.embed_tokenizer or "", "")
+
+    def test_no_parser_default_names_the_retired_model(self):
+        for action in cb.build_parser()._actions:
+            self.assertNotIn("mxbai", str(action.default or ""))
+            self.assertNotIn("mxbai", str(action.choices or ""))
+
+
+class TestStructureArmKnobsReachTheChunker(unittest.TestCase):
+    """A benchmark arm is only comparable if it reaches the shipped chunker unchanged."""
+
+    def small_sections(self) -> str:
+        return "\n\n".join(
+            f"## Section {index}\n\nThe depot carrier lane {index} held while the freight "
+            f"tariff moved twice in the customs review of the origin papers."
+            for index in range(24))
+
+    def test_merge_until_is_passed_through_to_the_chunker(self):
+        text = self.small_sections()
+        floor = cb.structure_chunks(text, {"max_piece_tokens": 700, "min_piece_tokens": 150,
+                                           "headers": False, "merge_until": "floor"})
+        window = cb.structure_chunks(text, {"max_piece_tokens": 700, "min_piece_tokens": 150,
+                                            "headers": False, "merge_until": "window"})
+        self.assertGreater(len(floor), len(window),
+                           "window packing chains neighbours, floor keeps one unit per piece")
+        self.assertEqual(" ".join(" ".join(floor).split()),
+                         " ".join(" ".join(window).split()),
+                         "the two arms differ in where they cut, never in what they carry")
+
+
+
 class TestEndToEndRun(_Fixture):
     def two_configs(self) -> Path:
         return self.configs([
-            self.mxbai("fixed-1200", "fixed_token", 1200, 100),
-            self.mxbai("recursive-12", "recursive", 12, 4),
+            self.arm("fixed-1200", "fixed_token", 1200, 100),
+            self.arm("recursive-12", "recursive", 12, 4),
         ])
 
     def test_a_run_scores_every_config_and_reports_what_it_used(self):
@@ -581,7 +646,7 @@ class TestEndToEndRun(_Fixture):
         self.assertLessEqual(recursive["chunk_tokens"]["max"], 12)
 
     def test_small_chunks_pay_for_themselves_in_seam_counts(self):
-        tiny = self.configs([self.mxbai("tiny", "recursive", 6, 0)])
+        tiny = self.configs([self.arm("tiny", "recursive", 6, 0)])
         report, _http = self.run_bench(configs=tiny)
         summary = report["configs"][0]
         self.assertGreater(summary["chunks_total"], 8)
@@ -593,7 +658,7 @@ class TestEndToEndRun(_Fixture):
         configs = self.configs([
             {"name": "rr", "chunker": {"strategy": "recursive", "chunk_token_size": 12,
                                        "overlap": 0},
-             "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+             "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 512},
              "rerank": {"model": "jina-reranker-v3", "top_n_in": 4}}])
         report, http = self.run_bench(
             configs=configs, http=FakeHttp(rerank_reverses=True),
@@ -606,7 +671,7 @@ class TestEndToEndRun(_Fixture):
         self.assertTrue(all(row["reranked"] for row in report["per_probe"]["rr"]))
 
     def test_reports_carry_no_question_chunk_or_file_text(self):
-        configs = self.configs([self.mxbai("one", "recursive", 12, 4)])
+        configs = self.configs([self.arm("one", "recursive", 12, 4)])
         out = self.root / "out"
         self.run_bench(configs=configs)
         report_text = (out / "results.json").read_text(encoding="utf-8")
@@ -620,24 +685,24 @@ class TestEndToEndRun(_Fixture):
         self.assertIn("| config | chunks |", table_text)
 
     def test_chunks_bigger_than_the_embedder_window_are_counted(self):
-        configs = self.configs([self.mxbai("over", "fixed_token", 20, 0)])
+        configs = self.configs([self.arm("over", "fixed_token", 20, 0)])
         report, _http = self.run_bench(configs=configs)
         summary = report["configs"][0]
         self.assertEqual(summary["chunk_tokens"]["max"], 20)
         self.assertEqual(summary["over_embedder_window_chunks"], 0)
         self.assertEqual(summary["over_embedder_window_pct"], 0.0)
-        tight = self.mxbai("tight", "fixed_token", 20, 0)
+        tight = self.arm("tight", "fixed_token", 20, 0)
         tight["embedder"]["max_input_tokens"] = 12
         configs = self.configs([tight])
         report, _http = self.run_bench(configs=configs)
         self.assertGreater(report["configs"][0]["over_embedder_window_chunks"], 0)
 
     def test_a_second_run_is_all_cache_hits_and_adds_a_config_for_free(self):
-        configs = self.configs([self.mxbai("first", "recursive", 12, 0)])
+        configs = self.configs([self.arm("first", "recursive", 12, 0)])
         _report, http = self.run_bench(configs=configs)
         first_calls = http.embed_calls
-        configs2 = self.configs([self.mxbai("first", "recursive", 12, 0),
-                                 self.mxbai("same-chunker", "recursive", 12, 0)])
+        configs2 = self.configs([self.arm("first", "recursive", 12, 0),
+                                 self.arm("same-chunker", "recursive", 12, 0)])
         report, http2 = self.run_bench(configs=configs2)
         self.assertEqual(http2.embed_calls, 0, "identical inputs are already cached")
         self.assertGreater(first_calls, 0)
@@ -664,7 +729,7 @@ class TestEndToEndRun(_Fixture):
         configs = self.configs([{"name": "rr",
                                  "chunker": {"strategy": "recursive", "chunk_token_size": 20,
                                              "overlap": 0},
-                                 "embedder": {"model": "mxbai"},
+                                 "embedder": {"model": "bge-m3"},
                                  "rerank": {"model": "jina", "top_n_in": 5}}])
         http = FakeHttp()
         args = self.args(configs=configs)
@@ -811,14 +876,14 @@ class TestRealHttpRoundTrip(_Fixture):
 
         configs = self.configs([
             {"name": "rec", "chunker": {"strategy": "recursive", "chunk_token_size": 12, "overlap": 3},
-             "embedder": {"model": "mxbai-embed-large-v1", "max_input_tokens": 512},
+             "embedder": {"model": "bge-m3-mlx-fp16", "max_input_tokens": 512},
              "rerank": {"model": "jina-reranker-v3", "top_n_in": 3}}])
         os.environ["BENCH_ROUNDTRIP_KEY"] = "roundtrip-key"
         try:
             code = cb.main([
                 "--corpus", str(self.root / "corpus.json"), "--probes", str(self.root / "probes.jsonl"),
                 "--out", str(self.root / "out"), "--configs", str(configs),
-                "--embed-url", self.base_url, "--embed-model", "mxbai-embed-large-v1",
+                "--embed-url", self.base_url, "--embed-model", "bge-m3-mlx-fp16",
                 "--rerank-url", self.base_url, "--rerank-model", "jina-reranker-v3",
                 "--api-key-env", "BENCH_ROUNDTRIP_KEY", "--only", "rec"])
         finally:
@@ -846,7 +911,7 @@ class TestRealHttpRoundTrip(_Fixture):
                                                encoding="utf-8")
         code = cb.main(["--corpus", str(self.root / "corpus.json"),
                         "--probes", str(self.root / "probes.jsonl"), "--out", str(self.root / "out2"),
-                        "--configs", str(self.configs([self.mxbai("x", "recursive", 20, 0)])),
+                        "--configs", str(self.configs([self.arm("x", "recursive", 20, 0)])),
                         "--embed-url", "http://127.0.0.1:9621"])
         self.assertEqual(code, 3)
         self.assertFalse((self.root / "out2" / "results.json").exists())
@@ -864,7 +929,7 @@ class TestEmbedderWindowMeasurement(_Fixture):
         return directory
 
     def test_the_window_is_counted_with_the_embedders_own_vocabulary(self):
-        entry = self.mxbai("one", "recursive", 12, 0)
+        entry = self.arm("one", "recursive", 12, 0)
         entry["embedder"]["max_input_tokens"] = 13   # just over the cl100k-style maximum
         configs = self.configs([entry])
         report, _http = self.run_bench(configs=configs,
@@ -874,8 +939,12 @@ class TestEmbedderWindowMeasurement(_Fixture):
         summary = report["configs"][0]
         self.assertIsNotNone(summary["embedder_tokens"])
         self.assertEqual(summary["embedder_window"], 13,
-                         "a declared window wins; the 512 default is only the fallback")
-        self.assertEqual(report["embedder_window"], 512, "the run-level guard names the default")
+                         "a declared window wins; the default is only the fallback")
+        self.assertEqual(report["embedder_window"], cb.EMBED_WINDOW_DEFAULT,
+                         "the run-level guard names the served embedder's window")
+        self.assertGreaterEqual(cb.EMBED_WINDOW_DEFAULT, 8192,
+                                "BGE-M3 is the embedder: the guard must not be sized for "
+                                "the 512-token model that was retired")
         self.assertIn("wordpiece", summary["over_embedder_window_basis"])
         self.assertGreaterEqual(summary["embedder_tokens"]["max"],
                                 summary["chunk_tokens"]["max"],
@@ -887,7 +956,7 @@ class TestEmbedderWindowMeasurement(_Fixture):
         self.assertIn("Embedder tokenizer:", table)
 
     def test_without_the_flag_the_report_says_the_window_test_is_a_stand_in(self):
-        configs = self.configs([self.mxbai("one", "recursive", 12, 0)])
+        configs = self.configs([self.arm("one", "recursive", 12, 0)])
         report, _http = self.run_bench(configs=configs)
         self.assertFalse(report["embed_tokenizer"]["loaded"])
         self.assertIsNone(report["configs"][0]["embedder_tokens"])
@@ -896,9 +965,9 @@ class TestEmbedderWindowMeasurement(_Fixture):
         self.assertIn("NOT LOADED", table, "the report must not let this be missed")
 
     def test_a_tokenizer_path_that_is_not_local_is_refused_before_any_embedding(self):
-        configs = self.configs([self.mxbai("one", "recursive", 12, 0)])
+        configs = self.configs([self.arm("one", "recursive", 12, 0)])
         with self.assertRaises(cb.BenchError) as caught:
-            self.run_bench(configs=configs, extra=["--embed-tokenizer", "mixedai/mxbai"])
+            self.run_bench(configs=configs, extra=["--embed-tokenizer", "BAAI/bge-m3"])
         self.assertIn("never downloads", str(caught.exception))
 
 
@@ -913,7 +982,7 @@ class TestCoverageGate(_Fixture):
         return self.configs([{"name": "structure-tiny",
                               "chunker": {"strategy": "structure", "budget_tokens": budget,
                                           "header_tokens": 8},
-                              "embedder": {"model": "mxbai-embed-large-v1",
+                              "embedder": {"model": "bge-m3-mlx-fp16",
                                            "max_input_tokens": 512},
                               "rerank": None}])
 
@@ -999,8 +1068,8 @@ class TestTextCopiesAndBudgets(_Fixture):
         self.assertIn("1/1", str(caught.exception))
 
     def test_recall_at_token_budgets_ranks_by_tokens_not_by_chunk_count(self):
-        tiny = self.configs([self.mxbai("tiny", "recursive", 6, 0),
-                             self.mxbai("big", "fixed_token", 400, 0)])
+        tiny = self.configs([self.arm("tiny", "recursive", 6, 0),
+                             self.arm("big", "fixed_token", 400, 0)])
         report, _http = self.run_bench(configs=tiny, extra=["--budgets", "20,400"])
         for summary in report["configs"]:
             self.assertIn("recall@20tok", summary["recall"])
@@ -1025,7 +1094,7 @@ class TestTextCopiesAndBudgets(_Fixture):
         parser = cb.build_parser()
         args = parser.parse_args(["--corpus", str(self.root / "corpus.json"),
                                   "--probes", str(probes), "--out", str(self.root / "out"),
-                                  "--configs", str(self.configs([self.mxbai("one", "recursive",
+                                  "--configs", str(self.configs([self.arm("one", "recursive",
                                                                            40, 0)])),
                                   "--embed-url", "http://127.0.0.1:8080"])
         cb.run(args, http=FakeHttp(), sleep=lambda _s: None, print_fn=lambda _l: None)

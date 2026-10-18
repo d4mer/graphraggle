@@ -26,7 +26,8 @@ posted before they existed:
 - `"chunking": {"strategy": ..., "params": {...}}` → the per-request chunker LightRAG
   1.5.7 accepts. Key names belong to LightRAG; the driver checks them structurally and
   forwards them untouched.
-- `"structure_chunking": {"budget_tokens": 350, "header_tokens": 25, "headers": true}` →
+- `"structure_chunking": {"max_piece_tokens": 7500, "min_piece_tokens": 150,
+  "merge_until": "floor", "header_tokens": 25, "headers": true}` →
   `app.structure_chunker` chooses every cut and the request tells LightRAG to cut ONLY
   there (`fixed_token` + `split_by_character_only`). Cannot be combined with `"chunking"`:
   two instructions about where the cuts fall means the result says nothing about which
@@ -122,13 +123,58 @@ extracting them only to let LightRAG re-cut the text would trade one invisible c
 | setting | default | meaning |
 |---|---|---|
 | `WORKER_PDF_EXTRACT_ENABLED` / `WORKER_DOCX_EXTRACT_ENABLED` | true | per-type kill switch (still requires `STRUCTURE_CHUNKING_ENABLED`) |
-| `WORKER_PDF_TEXT_BACKEND` | `auto` | `auto` prefers poppler's `pdftotext -layout` (already in the image, and it reproduces column positions, which is what the row reassembly reads), then `pypdf` |
+| `WORKER_PDF_TEXT_BACKEND` | `auto` | `auto` prefers poppler's `pdftotext -layout` (already in the image, and it reproduces column positions, which is what the row reassembly reads), then `pypdf`. Which one ran is recorded as `structure_extract_backend` |
 | `WORKER_PDF_MAX_BYTES` / `_MAX_CHARS`, `WORKER_DOCX_MAX_BYTES` / `_MAX_CHARS` | 104857600 / 2000000 | byte and character guards |
-| `STRUCTURE_CHUNKING_MAX_PIECE_TOKENS` | 450 | a plan with a bigger piece is not submitted chunked |
+| `STRUCTURE_CHUNKING_MAX_PIECE_TOKENS` | 7500 | the **window**: the only reason to cut, and it is the embedder window minus margin, not a size target |
+| `STRUCTURE_CHUNKING_MIN_PIECE_TOKENS` | 150 | the **merge floor**: a unit smaller than this welds into its neighbour, so a heading never stands alone |
+| `STRUCTURE_CHUNKING_MERGE_UNTIL` | `floor` | `floor` (default) stops a merge chain as soon as the piece clears the floor, keeping one natural unit per piece; `window` chains small neighbours all the way to the window |
+| `STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS` | 8192 | BGE-M3's window, used for the fit check |
 | `STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS` | 64 | `chunk_token_size` = largest piece + margin, so LightRAG cannot re-cut our pieces |
-| `STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS` | 512 | the served embedder's window |
-| `STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH` | empty | local tokenizer files for the fit check; never fetched |
+| `STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH` | empty | local tokenizer files for the fit check; never fetched. BGE-M3's `tokenizer.json` + `tokenizer_config.json` + `special_tokens_map.json` are read directly (Unigram, byte fallback, XLM-R pre-tokenizer split) |
+| `STRUCTURE_CHUNKING_EMBED_URL` | empty | the model server for **topic-shift cuts** only. Empty means no topic pass and a recorded deterministic fallback. The LightRAG and gateway ports are refused |
+| `STRUCTURE_CHUNKING_EMBED_MODEL` / `_EMBED_API_KEY_ENV` / `_EMBED_TIMEOUT_SECONDS` / `_EMBED_BATCH` | `bge-m3-mlx-fp16` / `OMLX_API_KEY` / 15 / 16 | the call is batched, cached by sha256(model+text), and bounded. The setting names the environment variable holding the key; the key is never a setting |
+| `STRUCTURE_CHUNKING_TOPIC_THRESHOLD` / `_TOPIC_UNITS_PER_WINDOW` / `_TOPIC_MAX_WINDOWS` | 0.30 / 6 / 400 | TextTiling depth that counts as a topic change, window granularity, and the per-document cap on embedded windows |
 | `STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT` | false | make a coverage gap fall back instead of only recording it |
+
+### What a piece is
+
+A piece is a **natural unit**: a whole section (heading plus everything nested under it), a
+whole table, or a run of turns on one topic. A unit is split only when it cannot fit the
+window, and then at its best *internal* boundary — sub-heading, paragraph, table row (header
+repeated), turn change, sentence — never at a token count. A 7,000-token section is one piece;
+a 12,000-token section is cut at its sub-headings; a page of sub-headings becomes a few
+pieces, not a fragment each, because of the merge floor. A section's heading always rides on
+its first content, including before a big table.
+
+Both merge modes are supported deliberately. `floor` is the default because chaining unrelated
+short sections into one mixed-topic piece dilutes the vector; `window` exists as the knob for
+the benchmark to measure the difference rather than argue about it.
+
+### Documents with no headings and no tables
+
+Flat text and transcripts get **topic-shift segmentation**: windows of turns or sentences are
+embedded with BGE-M3 and cut where adjacent windows stop resembling each other (TextTiling
+depth minima above the threshold). `structure_chunking_topic_method` on the state row says
+which kind of cut happened — `embedder`, `embedder(no-shift-found)`, `fallback(no-embedder)`
+or `fallback(embedder-unreachable)`. A model server that is down changes how a document is
+cut, never whether it is ingested.
+
+Transcript labels are recognised by **repeated behaviour, not line count**: `(Name)`,
+`(Name):`, `Name 12:34`, bracketed timestamps, and labels sitting inside one long line. A
+parenthesised label that alternates strictly with one other label (or heads two whole
+thousand-token lines) is a speaker **even when the word is a pronoun** — "(They) / (You)"
+across forty lines is a transcript, "(they) said" in a paragraph is not. Stage directions
+(`(Cross-talk)`, `(Inaudible)`, `(Background noise)`) are never rescued. A turn longer than
+the window is split inside the turn.
+
+### Table text shape
+
+PDF, DOCX and PPTX tables all arrive in one shape: a canonical **pipe row**, header row first,
+one logical row per line — `| Region | Q1 | Q2 |`. In DOCX each cell is one line; in PDF,
+`pdftotext -layout` column positions are reassembled into that row (a cell that wrapped over
+three to eight physical lines becomes one logical row). pypdf output has no column positions,
+so it is passed through without reassembly rather than guessed at. Old quotes written in tab
+form do not match this; they are regenerated, not accommodated.
 
 Fallbacks are the point: a scan with no text layer, a corrupt archive, a piece over the
 ceiling, a piece over the embedder window, or an unreadable tokenizer path all put the

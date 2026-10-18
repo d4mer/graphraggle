@@ -5,10 +5,15 @@ Why this module exists
 Fixed-token cutting is blind. It splits tables between the header row and the
 numbers, cuts a speaker turn in half, and leaves every chunk after the first
 without any idea which document or section it came from. The embedder makes the
-same demand from the other side: mxbai only sees 512 tokens, so a piece has to be
-SMALL and COHERENT at once. The offline benchmark (docs/ops/runs/chunk-embed-bench
-.md, summarised in docs/09-retrieval-accuracy-plan.md) says pieces of about 350
-cl100k tokens work best - far smaller than what today's ingest produces.
+same demand from the other side: a piece has to fit what the embedder can see, and a
+piece that is coherent is worth more than a piece that is a round number.
+
+There is no chunk-size budget here. The only ceiling is the embedder window (BGE-M3:
+8192 tokens; this module works in a conservative estimate and is told 7500), and the only
+reason to cut a natural unit is that it cannot fit it. Below the floor (default 150) a
+unit is welded to its neighbour instead of standing alone, which is what keeps a page of
+numbered sub-headings from becoming a hundred fragments. Hermes' real-document run is the
+evidence: capping at 350 turned one PDF into 596 pieces with a median of 111 tokens.
 
 LightRAG 1.5.7 cannot be handed a custom chunker through the API, but it WILL cut
 exactly where we tell it: ``fixed_token`` accepts ``split_by_character`` +
@@ -88,6 +93,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from . import topic_segment
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
@@ -96,10 +102,14 @@ from typing import Any, Callable, Iterable, Sequence
 # cutting turns the preparer never recognised.
 from .transcript_prep import (
     _HEADER_RE,
+    _MONOLITHIC_LINE_CHARS,
+    monolithic_speaker_set,
+    speaker_set_from_alternation,
     _classify_paren_label,
     _leading_parenthetical,
     _metadata_from_name,
     _parse_turn,
+    split_inline_turns,
 )
 
 # A conservative over-count. cl100k runs at roughly 4 characters per token for
@@ -110,7 +120,20 @@ from .transcript_prep import (
 # budget and can never produce an oversize piece, which is the trade wanted.
 CHARS_PER_TOKEN = 3.6
 
-DEFAULT_BUDGET_TOKENS = 350
+# There is no chunk-size budget any more: the embedder's window is the only ceiling, and
+# a natural unit (a section, a table, a run of turns) is cut only when it cannot fit it.
+# 7500 is BGE-M3's 8192-token window minus a safety margin, measured in THIS module's
+# conservative estimate, which over-counts English prose by ~10-15% and therefore errs
+# on the small side. ``DEFAULT_BUDGET_TOKENS`` survives as an alias for callers that pass
+# an explicit cap (the offline benchmark compares capped arms on purpose).
+DEFAULT_MAX_PIECE_TOKENS = 7500
+DEFAULT_MIN_PIECE_TOKENS = 150
+# "floor": a chain of small units stops as soon as it clears the floor, so a piece stays a
+# natural unit (the lead's call, 2026-10-18: welding unrelated short sections into one
+# piece makes a mixed-topic piece, which dilutes the vector it is embedded into).
+# "window" lets a chain run to the window; kept as an opt-in knob and a benchmark arm.
+DEFAULT_MERGE_UNTIL = "floor"
+DEFAULT_BUDGET_TOKENS = DEFAULT_MAX_PIECE_TOKENS
 DEFAULT_HEADER_TOKENS = 25
 
 # A short line seen this many times is document furniture, not content.
@@ -210,7 +233,13 @@ class ChunkPlan:
 # ── line classification ────────────────────────────────────────────────────
 
 _HEADING_MD = re.compile(r"^#{1,6}[ \t]*\S")
-_HEADING_NUMBERED = re.compile(r"^\d{1,3}(?:\.\d{1,3}){0,4}[.)]?[ \t]+\S")
+# A numbered HEADING is "3.1 Freight costs" or "3. Approval". It is NOT "12 months ago we
+# signed it", and it is not the columnar row "2019 1240 3300". A dotted number is a
+# section number by shape alone; a bare "3." only counts when the line is short, is not a
+# sentence, is not table-shaped, and carries more letters than digits.
+_HEADING_NUMBERED_DOTTED = re.compile(r"^\d{1,3}(?:\.\d{1,3})+(?:[.)][ \t]|[ \t])\S")
+_HEADING_NUMBERED_BARE = re.compile(r"^\d{1,3}[.)][ \t]+\S")
+_HEADING_BARE_TITLE = re.compile(r"^\d{1,3}[.)][ \t]+[A-Z\u00c0-\u0178]")
 _PAGE_MARK = re.compile(r"^\s*(?:page[ \t]*\d+|\d{1,4}|[ivxlcdm]{1,5})\s*$", re.IGNORECASE)
 _BULLET = re.compile(r"^\s*(?:[-*\u2022\u00b7]|\(?\d{1,3}[.)])\s+\S")
 _TERMINAL = re.compile(r"[.!?\u2026]$")
@@ -232,8 +261,26 @@ def _is_all_caps_heading(line: str) -> bool:
     return stripped == stripped.upper()
 
 
+def _is_numbered_heading(line: str) -> bool:
+    """A numbered section title, and not a sentence or a data row that starts with a digit."""
+    stripped = line.strip()
+    if not stripped or _is_table_line(stripped) or _is_table_separator(stripped):
+        return False
+    dotted = bool(_HEADING_NUMBERED_DOTTED.match(stripped))
+    bare = bool(_HEADING_NUMBERED_BARE.match(stripped))
+    if not (dotted or bare):
+        return False
+    if _TERMINAL.search(stripped) or len(stripped.split()) > 12:
+        return False
+    letters = sum(1 for ch in stripped if ch.isalpha())
+    digits = sum(1 for ch in stripped if ch.isdigit())
+    if letters < digits:
+        return False
+    return dotted or bool(_HEADING_BARE_TITLE.match(stripped))
+
+
 def _is_heading(line: str) -> bool:
-    return bool(_HEADING_MD.match(line) or _HEADING_NUMBERED.match(line)
+    return bool(_HEADING_MD.match(line) or _is_numbered_heading(line)
                 or _is_all_caps_heading(line))
 
 
@@ -732,14 +779,20 @@ def _split_row(row: str, budget: int, headers: Sequence[str], stats: _Stats,
     return out
 
 
-def _table_bodies(block: _Block, budget: int, stats: _Stats,
-                  warnings: list[str]) -> list[str]:
-    """A table block as bodies that each fit the budget, whole table if it can."""
+def _table_bodies(block: _Block, budget: int, stats: _Stats, warnings: list[str],
+                  *, lead: str = "") -> list[str]:
+    """A table block as bodies that each fit the budget, whole table if it can.
+
+    ``lead`` is the section heading the table sits under: it rides on the FIRST body,
+    and its cost is counted against that body, so a heading is never pushed out of the
+    piece it introduces by a table that fills the window.
+    """
     rows = [line for line in block.lines if line.strip()]
+    lead = lead.strip()
     if not rows:
-        return []
+        return [lead] if lead else []
     caption = block.caption.strip() if block.caption else ""
-    whole = "\n".join(([caption] if caption else []) + list(rows))
+    whole = "\n".join(([lead] if lead else []) + ([caption] if caption else []) + list(rows))
     if token_count(whole) <= budget:
         return [whole]
     headers = _header_rows(rows, stats)
@@ -749,7 +802,8 @@ def _table_bodies(block: _Block, budget: int, stats: _Stats,
     prefix_cost = token_count(prefix) if headers else 0
     # The caption rides on the FIRST piece only: it names the table, and a repeat
     # of it would be counted content twice for no gain in retrieval.
-    first_overhead = prefix_cost + (token_count(caption) if caption else 0)
+    first_overhead = (prefix_cost + (token_count(caption) if caption else 0)
+                      + (token_count(lead) if lead else 0))
     later_overhead = prefix_cost
     bodies: list[str] = []
     current: list[str] = []
@@ -760,8 +814,9 @@ def _table_bodies(block: _Block, budget: int, stats: _Stats,
     def flush() -> None:
         if not current:
             return
-        lead = ([caption] if not bodies and caption else []) + list(headers) + current
-        bodies.append("\n".join(lead))
+        lines = ([lead] if not bodies and lead else []) + (
+            [caption] if not bodies and caption else []) + list(headers) + current
+        bodies.append("\n".join(lines))
         current.clear()
 
     for row in data:
@@ -769,7 +824,8 @@ def _table_bodies(block: _Block, budget: int, stats: _Stats,
         # cell boundaries: keeping the header is not optional, so the row gives.
         if token_count(row) + overhead() > budget:
             flush()
-            room = max(16, (later_overhead and budget - later_overhead) or budget - prefix_cost)
+            room = max(16, (first_overhead if not bodies else later_overhead)
+                       and budget - (first_overhead if not bodies else later_overhead))
             for piece in _split_row(row, room, headers, stats, warnings):
                 bodies.append(piece)
             continue
@@ -793,77 +849,237 @@ def _table_bodies(block: _Block, budget: int, stats: _Stats,
 
 # ── packing blocks into pieces ─────────────────────────────────────────────
 
-def _block_bodies(block: _Block, budget: int, stats: _Stats,
-                  warnings: list[str]) -> list[tuple[str, str]]:
-    """One block -> (kind, body) units that each fit the budget."""
+def _block_text(block: _Block) -> str:
+    """A block as text, caption included: it names the table and must not vanish."""
+    parts = [block.caption.strip()] if block.caption and block.caption.strip() else []
+    parts += [line for line in block.lines if line.strip()]
+    return "\n".join(parts)
+
+
+def _block_fits(block: _Block, window: int) -> bool:
+    """Can this block be handed to a piece whole?"""
     if block.kind == "table":
-        return [("table", body) for body in _table_bodies(block, budget, stats, warnings)]
-    text = "\n".join(line for line in block.lines if line.strip())
-    if not text:
-        return []
-    if token_count(text) <= budget:
-        return [(block.kind, text)]
-    if block.kind == "heading":
-        # A heading longer than the budget is a heading, not prose: it cannot be
-        # split without destroying what makes it a heading.
-        warnings.append("heading-over-budget")
-        return [(block.kind, text)]
-    stats.bump("blocks_split")
-    return [(block.kind, body) for body in _split_run(text, budget)]
+        # A table counts as "fitting" when its ROWS can be laid out inside the window
+        # with the header repeated: the rows are the boundary, not the table.
+        return bool(block.lines) and max(
+            (token_count(line) for line in block.lines), default=0) <= window
+    text = _block_text(block)
+    return bool(text) and token_count(text) <= window
 
 
-def _pack_blocks(blocks: Sequence[_Block], budget: int, stats: _Stats,
-                 warnings: list[str]) -> list[tuple[str, str, tuple[str, ...]]]:
-    """Greedily fill pieces to the budget, breaking only where structure allows.
+@dataclass
+class _Unit:
+    """One natural unit: a heading and everything nested under it."""
+    heading: _Block | None
+    body_blocks: list[_Block]
+    level: int
+    path: tuple[str, ...]
 
-    A heading always starts a piece. A table always stands alone (its header row is
-    the whole point of keeping it). A list travels with the paragraph that
-    introduced it when there is room, and starts a piece when there is not.
+    @property
+    def blocks(self) -> list[_Block]:
+        return ([self.heading] if self.heading else []) + self.body_blocks
+
+    def token_estimate(self) -> int:
+        return sum(token_count(_block_text(block)) for block in self.blocks)
+
+
+def _build_units(blocks: Sequence[_Block]) -> list[_Unit]:
+    """Flat block list -> natural units, one per top-level heading, plus front matter.
+
+    A sub-heading stays INSIDE its parent's unit rather than opening one. That is what
+    makes the split order meaningful: if the whole unit fits the window nothing is cut
+    at all, and when it does not, the first place it is cut is its shallowest
+    sub-heading.
     """
-    pieces: list[tuple[str, str, tuple[str, ...]]] = []
+    units: list[_Unit] = []
+    current: _Unit | None = None
+    front: _Unit | None = None
+    for block in blocks:
+        if block.kind == "heading":
+            level = _heading_level(block.lines[0])
+            if current is not None and level > current.level:
+                current.body_blocks.append(block)
+                continue
+            current = _Unit(heading=block, body_blocks=[], level=level, path=block.path)
+            units.append(current)
+            front = None
+            continue
+        if current is not None:
+            current.body_blocks.append(block)
+            continue
+        if front is None or front.path != block.path:
+            front = _Unit(heading=None, body_blocks=[block], level=0, path=block.path)
+            units.append(front)
+        else:
+            front.body_blocks.append(block)
+    return units
+
+
+def _split_unit(unit: _Unit, window: int, stats: _Stats, warnings: list[str],
+                *, depth: int = 0) -> list[tuple[str, str, tuple[str, ...]]]:
+    """One natural unit -> (kind, body, path) pieces that each fit the window.
+
+    Cut order, and the order matters: the unit whole, its shallowest sub-headings,
+    paragraph and list blocks, table rows (header repeated), and only then a
+    sentence boundary inside one block. Nothing is ever cut by token count alone.
+    """
+    if depth > 24:
+        warnings.append("unit-nesting-too-deep")
+        return []
+    estimate = unit.token_estimate()
+    if estimate <= window and all(_block_fits(block, window) for block in unit.blocks):
+        return _unit_bodies_whole(unit, stats, warnings)
+
+    children = [block for block in unit.body_blocks if block.kind == "heading"]
+    if children:
+        shallowest = min(_heading_level(block.lines[0]) for block in children)
+        stats.bump("units_split_at_subheadings")
+        groups: list[_Unit] = []
+
+        def start(path: tuple[str, ...], level: int, heading: _Block | None) -> None:
+            groups.append(_Unit(heading=heading, body_blocks=[], level=level, path=path))
+
+        start(unit.path, unit.level, unit.heading)
+        for block in unit.body_blocks:
+            if block.kind == "heading" and _heading_level(block.lines[0]) == shallowest:
+                start(block.path, _heading_level(block.lines[0]), block)
+                continue
+            groups[-1].body_blocks.append(block)
+        out: list[tuple[str, str, tuple[str, ...]]] = []
+        for group in groups:
+            if group.heading is None and not group.body_blocks:
+                continue
+            out.extend(_split_unit(group, window, stats, warnings, depth=depth + 1))
+        return out
+
+    return _split_unit_blocks(unit, window, stats, warnings)
+
+
+def _unit_bodies_whole(unit: _Unit, stats: _Stats,
+                       warnings: list[str]) -> list[tuple[str, str, tuple[str, ...]]]:
+    """The unit fits the window, so it is ONE piece: nothing inside it is cut."""
+    parts: list[str] = []
+    kind = "paragraph"
+    for block in unit.blocks:
+        text = _block_text(block)
+        if not text:
+            continue
+        if block.kind == "heading":
+            kind = "section"
+        elif block.kind == "list" and kind == "paragraph":
+            kind = "list"
+        elif block.kind == "table" and kind == "paragraph":
+            kind = "table"
+        parts.append(text)
+    body = "\n".join(parts)
+    if not body.strip():
+        return []
+    stats.bump("units_whole")
+    return [(kind, body, unit.path)]
+
+
+def _split_unit_blocks(unit: _Unit, window: int, stats: _Stats,
+                       warnings: list[str]) -> list[tuple[str, str, tuple[str, ...]]]:
+    """No sub-headings to use: pack blocks into pieces at their own boundaries."""
+    out: list[tuple[str, str, tuple[str, ...]]] = []
     current: list[str] = []
-    current_path: tuple[str, ...] = ()
-    current_kind = ""
+    kind = "paragraph"
 
     def flush() -> None:
+        nonlocal kind
         if not current:
             return
         body = "\n".join(current)
         if body.strip():
-            pieces.append((current_kind or "paragraph", body, current_path))
+            out.append((kind or "paragraph", body, unit.path))
         current.clear()
+        kind = "paragraph"
 
-    for block in blocks:
-        path = block.path
-        for kind, body in _block_bodies(block, budget, stats, warnings):
-            if kind == "table":
-                flush()
-                pieces.append(("table", body, path))
-                current_path = path
-                continue
-            if kind == "heading":
-                flush()
-                current.append(body)
-                current_path = path
-                current_kind = "section"
-                continue
-            if not current:
-                current.append(body)
-                current_path = path
-                current_kind = "list" if kind == "list" else "paragraph"
-                continue
-            candidate = "\n".join(current + [body])
-            if token_count(candidate) <= budget:
-                current.append(body)
-                if current_kind == "section":
-                    current_kind = "section"
-                continue
+    for block in unit.blocks:
+        if block.kind == "table":
+            # A heading already pending rides on the table's first body rather than being
+            # flushed out as a piece of its own.
+            lead = "\n".join(current)
+            current.clear()
+            for body in _table_bodies(block, window, stats, warnings, lead=lead):
+                out.append(("table", body, unit.path))
+            continue
+        text = _block_text(block)
+        if not text:
+            continue
+        if block.kind == "heading":
             flush()
-            current.append(body)
-            current_path = path
-            current_kind = "list" if kind == "list" else "paragraph"
+            current.append(text)
+            kind = "section"
+            continue
+        if block.kind == "list" and kind in ("", "paragraph"):
+            kind = "list"
+        if current and token_count("\n".join(current + [text])) > window:
+            stats.bump("blocks_split_at_paragraphs")
+            flush()
+        if token_count(text) > window:
+            stats.bump("blocks_split_at_sentences")
+            for part in _split_run(text, window):
+                if token_count(part) > window:
+                    warnings.append("piece-over-budget(one-unsplittable-block)")
+                    stats.bump("pieces_over_budget")
+                out.append((block.kind, part, unit.path))
+            continue
+        current.append(text)
     flush()
-    return pieces
+    return out
+
+
+def _merge_small_pieces(pieces: list[tuple[str, str, tuple[str, ...]]], floor: int,
+                        window: int, stats: _Stats, *, until: str = DEFAULT_MERGE_UNTIL
+                        ) -> list[tuple[str, str, tuple[str, ...]]]:
+    """A floor, not a cap: everything below ``floor`` is welded to its neighbour.
+
+    The window is the only ceiling. This is what turns a page of numbered
+    sub-headings into a handful of readable pieces instead of a hundred fragments,
+    without ever deciding a piece should be small. Two table bodies are never
+    welded together: each already carries the repeated header rows, and a piece
+    with the same header twice is worse than two pieces.
+    """
+    if floor <= 0 or not pieces:
+        return pieces
+    merged = [pieces[0]]
+    for kind, body, path in pieces[1:]:
+        prev_kind, prev_body, prev_path = merged[-1]
+        prev_cost = token_count(prev_body)
+        cost = token_count(body)
+        if prev_kind == "table" and kind == "table":
+            merged.append((kind, body, path))
+            continue
+        # until="floor"  : a chain stops as soon as it clears the floor (small siblings
+        #                  pair up and the document's own units keep their shape).
+        # until="window" : a chain only stops at the window, so a run of small sections
+        #                  becomes a few large pieces instead of hundreds of fragments.
+        if until == "floor":
+            # Stop the chain the moment it clears the floor: small siblings pair up, and a
+            # unit that already stands on its own keeps its own shape.
+            worth_merging = prev_cost < floor
+        else:
+            worth_merging = prev_cost < floor or cost < floor
+        if worth_merging and prev_cost + 1 + cost <= window:
+            joined_kind = "section" if "section" in (prev_kind, kind) else prev_kind
+            merged[-1] = (joined_kind, prev_body + "\n" + body,
+                          prev_path if len(prev_path) >= len(path) else path)
+            stats.bump("pieces_merged_up_to_floor")
+            continue
+        merged.append((kind, body, path))
+    return merged
+
+
+def _pack_units(units: Sequence[_Unit], window: int, floor: int, stats: _Stats,
+                warnings: list[str], *, until: str = DEFAULT_MERGE_UNTIL
+                ) -> list[tuple[str, str, tuple[str, ...]]]:
+    """Natural units first, merge floor last. The window only ever forces a cut."""
+    pieces: list[tuple[str, str, tuple[str, ...]]] = []
+    for unit in units:
+        pieces.extend(_split_unit(unit, window, stats, warnings))
+    stats.bump("natural_units", len(units))
+    return _merge_small_pieces(pieces, floor, window, stats, until=until)
 
 
 # ── transcript path ────────────────────────────────────────────────────────
@@ -880,44 +1096,65 @@ def _scan_turns(lines: Sequence[str]) -> tuple[list[_TurnLines], Counter[str], i
     The lines are kept verbatim rather than rebuilt from parsed words, so the
     speaker labels and any cue lines inside a turn survive the trip through the
     chunker - the pieces have to account for every word in the document.
+
+    A monolithic minutes line ("Ana: ... Liang: ... Ana: ...") is split into its turns
+    BEFORE anything is counted, so detection counts labels by FREQUENCY rather than by
+    how the file happens to be wrapped. The segments are exact substrings of the source,
+    so no word is invented, changed or lost.
     """
     turns: list[_TurnLines] = []
     label_counts: Counter[str] = Counter()
     label_lines = 0
     cue_lines = 0
+    long_labelled = 0
+    # "(They)" and "(You)" are ordinary words a name grammar must refuse, and in prose it
+    # is right to refuse them. What makes them speakers is behaviour, and behaviour is a
+    # property of the file: two labels heading the lines, strictly alternating, or two
+    # enormous labelled turns and nothing else. Both passes are per-document, and stage
+    # markers are refused by both.
+    accepted = speaker_set_from_alternation(lines) | monolithic_speaker_set(lines)
     for raw in lines:
-        line = raw.rstrip()
-        if not line.strip():
+        source = raw.rstrip()
+        if not source.strip():
             continue
-        if "-->" in line and re.search(r"\d{1,2}:\d{2}", line):
+        if "-->" in source and re.search(r"\d{1,2}:\d{2}", source):
             cue_lines += 1
-        parsed = _parse_turn(line)
-        if parsed is not None:
-            speaker, _body, _style = parsed
-            label_lines += 1
-            label_counts[speaker.lower()] += 1
-            turns.append(_TurnLines(speaker=speaker, lines=[line]))
-            continue
-        candidate = _leading_parenthetical(line)
-        if candidate is not None and _classify_paren_label(candidate[0])[1] == "unparseable":
-            # Its own turn, no speaker claimed - transcript_prep's rule, for its
-            # reason: guessing a speaker is worse than claiming none.
-            turns.append(_TurnLines(speaker=None, lines=[line]))
-            continue
-        if turns:
-            turns[-1].lines.append(line)
-        else:
-            turns.append(_TurnLines(speaker=None, lines=[line]))
-    return turns, label_counts, label_lines, cue_lines
+        for line in (split_inline_turns(source) or [source]):
+            parsed = _parse_turn(line, accepted)
+            if parsed is not None:
+                speaker, _body, _style = parsed
+                label_lines += 1
+                label_counts[speaker.lower()] += 1
+                if len(line) >= _MONOLITHIC_LINE_CHARS:
+                    long_labelled += 1
+                turns.append(_TurnLines(speaker=speaker, lines=[line]))
+                continue
+            candidate = _leading_parenthetical(line)
+            if candidate is not None and _classify_paren_label(
+                    candidate[0], accepted)[1] == "unparseable":
+                # Its own turn, no speaker claimed - transcript_prep's rule, for its
+                # reason: guessing a speaker is worse than claiming none.
+                turns.append(_TurnLines(speaker=None, lines=[line]))
+                continue
+            if turns:
+                turns[-1].lines.append(line)
+            else:
+                turns.append(_TurnLines(speaker=None, lines=[line]))
+    return turns, label_counts, label_lines, cue_lines, long_labelled
 
 
 def _transcript_like(turns: Sequence[_TurnLines], label_counts: Counter[str],
-                     label_lines: int, cue_lines: int, nonempty: int) -> bool:
-    """The same bars as :func:`app.transcript_prep.prepare_transcript`.
+                     label_lines: int, cue_lines: int, nonempty: int,
+                     long_labelled: int = 0) -> bool:
+    """The same bars as :func:`app.transcript_prep.prepare_transcript`, plus one.
 
     Shared bars, deliberately: a document the preparer will not touch must not be
     chunked as a transcript here either, or the two modules disagree about what the
-    corpus contains.
+    corpus contains. The extra bar is the monolithic shape - two or three lines, each
+    one whole turn of thousands of tokens. The preparer rewrites a document it accepts,
+    and rewriting a 9,000-token turn is not something to do on this evidence; the
+    chunker only chooses boundaries, and a labelled turn of any length has a boundary at
+    its head and can be split inside, which an unlabelled block cannot.
     """
     if not turns:
         return False
@@ -929,11 +1166,14 @@ def _transcript_like(turns: Sequence[_TurnLines], label_counts: Counter[str],
                     and label_lines >= 0.5 * nonempty)
     captioned = (cue_lines >= 3 and (label_lines + cue_lines) >= 0.30 * nonempty
                  and (label_lines >= 2 or nonempty >= 6))
-    return bool(labelled or single_voice or captioned)
+    monolithic = (label_lines >= 2 and distinct >= 2
+                  and long_labelled >= 2 and long_labelled == label_lines)
+    return bool(labelled or single_voice or captioned or monolithic)
 
 
-def _transcript_units(turns: Sequence[_TurnLines], budget: int, stats: _Stats,
-                      warnings: list[str]) -> list[str]:
+def _transcript_units(turns: Sequence[_TurnLines], budget: int, floor: int,
+                      stats: _Stats, warnings: list[str], *, until: str = DEFAULT_MERGE_UNTIL
+                      ) -> list[str]:
     """Bodies cut at turn boundaries, an oversized turn split finer. Never mid-word."""
     bodies: list[str] = []
     current: list[str] = []
@@ -959,24 +1199,57 @@ def _transcript_units(turns: Sequence[_TurnLines], budget: int, stats: _Stats,
             bodies.append(part)
     if current:
         bodies.append("\n".join(current))
-    return bodies
+    merged = _merge_small_pieces([("turn", body, ()) for body in bodies],
+                                 min(floor, budget), budget, stats, until=until)
+    return [body for _kind, body, _path in merged]
 
 
 # ── public entry points ────────────────────────────────────────────────────
 
-def chunk_document(text: str, *, filename: str = "", budget_tokens: int = DEFAULT_BUDGET_TOKENS,
+def _topic_stats(stats: _Stats, report: Any) -> None:
+    """Record HOW the topic cuts were found. A fallback cut and a topic cut are different
+    facts, and a reader of the state row has to be able to tell them apart."""
+    stats.counts["topic_method"] = report.method
+    for key in ("blocks", "boundaries", "embedded", "splits_over_window",
+                "merges_under_floor"):
+        stats.counts[f"topic_{key}"] = getattr(report, key, 0)
+    stats.counts["topic_coarsened"] = int(bool(getattr(report, "coarsened", False)))
+
+
+def chunk_document(text: str, *, filename: str = "",
+                   max_piece_tokens: int | None = None,
+                   min_piece_tokens: int | None = None,
+                   budget_tokens: int | None = None, until_merge: str = DEFAULT_MERGE_UNTIL,
                    header_tokens: int = DEFAULT_HEADER_TOKENS, kind: str = "auto",
-                   headers: Any = True) -> ChunkPlan:
+                   headers: Any = True,
+                   topic_embed: Callable[[Sequence[str]], Sequence[Sequence[float]]] | None = None,
+                   topic_options: dict[str, Any] | None = None) -> ChunkPlan:
     """Plan every cut in one document. Deterministic; nothing is invented.
 
+    ``max_piece_tokens`` is the window: the ONLY ceiling, and the only reason to cut.
+    ``min_piece_tokens`` is the floor: a unit smaller than this is welded to its
+    neighbour, which is what keeps a page of sub-headings from becoming a hundred
+    fragments. ``budget_tokens`` is the old name for the ceiling, kept for the
+    benchmark's capped arms; when both are given ``budget_tokens`` wins.
+    ``until_merge``: ``"floor"`` (default) stops a merge chain as soon as the piece clears
+    the floor, so a piece stays one natural unit; ``"window"`` lets the chain run to the
+    window. A parent section whose whole extent fits the window is ONE unit either way.
     ``kind``: ``auto`` detects, or force ``transcript`` / ``table`` / ``structured``
     / ``plain``. ``headers``: ``True`` for the deterministic context header,
     ``False`` for none, ``"shuffled"`` for the benchmark placebo (same tokens, wrong
-    attachment). The budget always covers body AND header.
+    attachment). The ceiling always covers body AND header.
     """
     if kind not in ("auto", "transcript", "table", "structured", "plain"):
         raise StructureChunkerError(f"unknown kind {kind!r}")
-    budget = max(32, int(budget_tokens))
+    ceiling = (int(budget_tokens) if budget_tokens is not None
+               else int(DEFAULT_MAX_PIECE_TOKENS if max_piece_tokens is None
+                        else max_piece_tokens))
+    budget = max(32, ceiling)
+    floor = int(DEFAULT_MIN_PIECE_TOKENS if min_piece_tokens is None else min_piece_tokens)
+    floor = max(0, min(floor, budget))
+    merge_until = str(until_merge) if until_merge else DEFAULT_MERGE_UNTIL
+    if merge_until not in ("window", "floor"):
+        raise StructureChunkerError('until_merge must be "window" or "floor"')
     header_budget = max(0, int(header_tokens))
     if not text or not text.strip():
         return ChunkPlan(pieces=[], kind_detected="plain", warnings=("empty-input",),
@@ -996,9 +1269,10 @@ def chunk_document(text: str, *, filename: str = "", budget_tokens: int = DEFAUL
     title, date = _metadata_from_name(filename)
 
     if kind in ("auto", "transcript"):
-        turns, label_counts, label_lines, cue_lines = _scan_turns(raw_lines)
+        turns, label_counts, label_lines, cue_lines, long_labelled = _scan_turns(raw_lines)
         nonempty = len([line for line in raw_lines if line.strip()])
-        if _transcript_like(turns, label_counts, label_lines, cue_lines, nonempty):
+        if _transcript_like(turns, label_counts, label_lines, cue_lines, nonempty,
+                            long_labelled):
             # Only a label that heads at least two turns is claimed as a voice: a
             # one-off label ("Meeting:", "Note:") is not a speaker, and writing it
             # into the header of every piece would be a claim this file does not
@@ -1014,7 +1288,27 @@ def chunk_document(text: str, *, filename: str = "", budget_tokens: int = DEFAUL
                                     meeting=title, speakers=speakers,
                                     header_budget=header_budget, warnings=[])
             reserve = token_count(probe) if headers else 0
-            bodies = _transcript_units(turns, max(32, budget - reserve), stats, warnings)
+            window = max(32, budget - reserve)
+            if topic_embed is not None:
+                turn_units = ["\n".join(turn.lines) for turn in turns
+                              if any(line.strip() for line in turn.lines)]
+                bodies, report = topic_segment.segment_bodies(
+                    turn_units, tokens=token_count, window=window,
+                    floor=min(floor, window), embed=topic_embed,
+                    **(topic_options or {}))
+                _topic_stats(stats, report)
+                stats.bump("oversized_turns_split", report.splits_over_window)
+                # A turn bigger than the window still cannot be sent whole.
+                bodies = [part for body in bodies
+                          for part in ([body] if token_count(body) <= window
+                                       else _split_run(body, window, clause_fallback=True))]
+                for body in bodies:
+                    if token_count(body) > window:
+                        warnings.append("turn-over-budget(one-unsplittable-word)")
+                        stats.bump("turn_pieces_over_budget")
+            else:
+                bodies = _transcript_units(turns, window, floor, stats, warnings,
+                                           until=merge_until)
             units = [("turn", body, ()) for body in bodies]
         elif kind == "transcript":
             warnings.append("transcript-not-detected")
@@ -1025,7 +1319,21 @@ def chunk_document(text: str, *, filename: str = "", budget_tokens: int = DEFAUL
         probe = _compose_header(doc=title, date=date, path=probe_path, part=1, total=1,
                                 header_budget=header_budget, warnings=[])
         reserve = token_count(probe) if headers else 0
-        units = _pack_blocks(blocks, max(32, budget - reserve), stats, warnings)
+        window = max(32, budget - reserve)
+        natural = _build_units(blocks)
+        if topic_embed is not None and all(unit.heading is None for unit in natural):
+            # No headings at all: the only boundaries available are topic shifts.
+            flat = [text for unit in natural for block in unit.body_blocks
+                    if (text := _block_text(block))]
+            bodies, report = topic_segment.segment_bodies(
+                flat, tokens=token_count, window=window, floor=min(floor, window),
+                embed=topic_embed, **(topic_options or {}))
+            _topic_stats(stats, report)
+            # No headings means no section path exists to claim.
+            units = [("paragraph", body, ()) for body in bodies]
+        else:
+            units = _pack_units(natural, window, floor, stats, warnings,
+                                until=merge_until)
         table_tokens = sum(token_count(body) for kind_name, body, _p in units if kind_name == "table")
         all_tokens = sum(token_count(body) for _k, body, _p in units) or 1
         if table_tokens >= 40 and table_tokens >= 0.4 * all_tokens:
@@ -1042,7 +1350,7 @@ def chunk_document(text: str, *, filename: str = "", budget_tokens: int = DEFAUL
     if not pieces:
         return ChunkPlan(pieces=[], kind_detected=kind_detected,
                          warnings=tuple(sorted(warnings) + ["no-usable-text"]),
-                         stats=_finish_stats(stats, 0, budget))
+                         stats=_finish_stats(stats, 0, budget, floor=floor, until=merge_until))
 
     if headers == "shuffled":
         for index, piece in enumerate(pieces, 1):
@@ -1083,13 +1391,17 @@ def chunk_document(text: str, *, filename: str = "", budget_tokens: int = DEFAUL
     return ChunkPlan(pieces=pieces, kind_detected=kind_detected,
                      warnings=tuple(sorted(set(warnings))),
                      stats=_finish_stats(stats, len(pieces), budget,
-                                         [piece.token_estimate for piece in pieces]))
+                            [piece.token_estimate for piece in pieces],
+                            floor=floor, until=merge_until))
 
 
 def _finish_stats(stats: _Stats, pieces: int, budget: int,
-                  estimates: Sequence[int] = ()) -> dict[str, Any]:
+                  estimates: Sequence[int] = (), floor: int = 0,
+                  until: str = DEFAULT_MERGE_UNTIL) -> dict[str, Any]:
     """Run numbers for the provenance row: counts and percentiles, never text."""
     payload: dict[str, Any] = {"tokenizer": tokenizer_name(), "budget_tokens": budget,
+                               "max_piece_tokens": budget, "min_piece_tokens": floor,
+                               "merge_until": until,
                                "pieces": pieces}
     if estimates:
         ordered = sorted(estimates)

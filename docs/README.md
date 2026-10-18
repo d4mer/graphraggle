@@ -44,4 +44,4 @@ Main URLs:
 2. Text files ingest via LightRAG `POST /documents/text`
 3. Binary docs ingest via LightRAG `POST /documents/upload`
 4. Ignore `source_docs/__enqueued__`
-5. Use `EMBEDDING_MODEL=mxbai-embed-large-v1`
+5. Use `EMBEDDING_MODEL=bge-m3-mlx-fp16`

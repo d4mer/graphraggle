@@ -87,11 +87,51 @@ class Settings(BaseSettings):
     # can never change a document's identity.
     structure_chunking_enabled: bool = Field(default=False,
                                              alias="STRUCTURE_CHUNKING_ENABLED")
-    # Body + header, in the module's conservative token estimate. 350 is what the
-    # offline benchmark picked (docs/ops/runs/chunk-embed-bench.md): small enough for
-    # mxbai's real 512-token window, big enough to stay coherent.
-    structure_chunking_budget_tokens: int = Field(
-        default=350, alias="STRUCTURE_CHUNKING_BUDGET_TOKENS")
+    # The window, not a budget: a natural unit (a section, a table, a run of turns) is
+    # cut ONLY when it cannot fit this. 7500 = BGE-M3's 8192-token window less a safety
+    # margin, expressed in app/structure_chunker.py's conservative estimate, which
+    # over-counts English prose by ~10-15% and therefore errs small. There is no
+    # chunk-size target any more: the document decides how big a piece is.
+    structure_chunking_max_piece_tokens: int = Field(
+        default=7500, alias="STRUCTURE_CHUNKING_MAX_PIECE_TOKENS")
+    # The merge floor. A unit below this is welded to its neighbour, so a page of
+    # numbered sub-headings becomes a few readable pieces instead of a hundred
+    # fragments. It is a floor, never a cap: nothing is cut for being large until it
+    # cannot fit the window above.
+    structure_chunking_min_piece_tokens: int = Field(
+        default=150, alias="STRUCTURE_CHUNKING_MIN_PIECE_TOKENS")
+    # How far a merge chain runs. "floor" (default) stops it once the piece clears the
+    # floor, so a piece stays a natural unit; "window" lets unrelated short sections chain
+    # into one big piece. A section whose whole extent fits the window is one unit either way.
+    structure_chunking_merge_until: str = Field(
+        default="floor", alias="STRUCTURE_CHUNKING_MERGE_UNTIL")
+
+    # Topic-shift segmentation for documents with no headings and no tables (the flat
+    # transcripts, the "(Name)"-label meetings, the monolithic single-line minutes). The
+    # chunker asks an injected embedder where adjacent windows stop resembling each other
+    # and cuts there, so a piece is one topic of whatever length that topic happens to be.
+    # With no URL configured there is no embedder and the deterministic fallback is used -
+    # cut at unit boundaries near the window - and the state row says which happened.
+    structure_chunking_embed_url: str = Field(default="", alias="STRUCTURE_CHUNKING_EMBED_URL")
+    structure_chunking_embed_model: str = Field(
+        default="bge-m3-mlx-fp16", alias="STRUCTURE_CHUNKING_EMBED_MODEL")
+    # The NAME of the environment variable holding the model server key. The key itself is
+    # never in a setting, a log line or a report.
+    structure_chunking_embed_api_key_env: str = Field(
+        default="OMLX_API_KEY", alias="STRUCTURE_CHUNKING_EMBED_API_KEY_ENV")
+    structure_chunking_embed_timeout_seconds: float = Field(
+        default=15.0, alias="STRUCTURE_CHUNKING_EMBED_TIMEOUT_SECONDS")
+    structure_chunking_embed_batch: int = Field(default=16,
+                                                alias="STRUCTURE_CHUNKING_EMBED_BATCH")
+    # Similarity drop (TextTiling depth) needed to call a place a topic change. Lower cuts
+    # more often. 0.30 is a starting point measured on synthetic vocabularies, NOT on the
+    # corpus: the first real run should print the depth distribution before moving it.
+    structure_chunking_topic_threshold: float = Field(
+        default=0.30, alias="STRUCTURE_CHUNKING_TOPIC_THRESHOLD")
+    structure_chunking_topic_units_per_window: int = Field(
+        default=6, alias="STRUCTURE_CHUNKING_TOPIC_UNITS_PER_WINDOW")
+    structure_chunking_topic_max_windows: int = Field(
+        default=400, alias="STRUCTURE_CHUNKING_TOPIC_MAX_WINDOWS")
     # The context header is capped separately so a long section path can never eat the
     # body's room: fields are dropped (path, date, speakers, title last) until it fits.
     structure_chunking_header_tokens: int = Field(
@@ -99,21 +139,16 @@ class Settings(BaseSettings):
     structure_chunking_headers: bool = Field(default=True,
                                              alias="STRUCTURE_CHUNKING_HEADERS")
 
-    # Hard ceiling on one piece, in the module's conservative tokens. The budget is what we
-    # aim for; this is what we refuse to submit. A piece over it means the document contains
-    # something the chunker could not split inside (one enormous cell), and submitting it
-    # would put a piece past the embedder's window, where truncation is silent.
-    structure_chunking_max_piece_tokens: int = Field(
-        default=450, alias="STRUCTURE_CHUNKING_MAX_PIECE_TOKENS")
+    # The fit check: the served embedder's real window, in ITS tokens.
     # chunk_token_size in the request must be at least the largest piece, or LightRAG is
     # allowed to re-cut our pieces and the whole exercise means nothing. The margin absorbs
     # the difference between our conservative estimate and the server's tokenizer.
     structure_chunking_fit_margin_tokens: int = Field(
         default=64, alias="STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS")
-    # The served embedder's window. With no tokenizer files configured the check runs on the
-    # chunker's own conservative over-count, which is deliberately larger than reality.
+    # BGE-M3's window (8192 tokens, dense 1024-dim, served by oMLX). With no tokenizer
+    # files configured the check runs on the chunker's own conservative over-count.
     structure_chunking_embed_window_tokens: int = Field(
-        default=512, alias="STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS")
+        default=8192, alias="STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS")
     # Optional local directory of the SERVED embedder's tokenizer (tokenizer.json or
     # vocab.txt). Never fetched: app/embed_tokenizer.py refuses a hub id. When it is set,
     # the fit check is stated in the embedder's own tokens instead of cl100k-style ones.

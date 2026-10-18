@@ -12,8 +12,9 @@ from .config import settings
 from .lightrag_client import client
 from .docx_extract import DocxExtractError, extract_docx_payload
 from .embed_tokenizer import EmbedTokenizerError, load_embed_tokenizer
-from .pdf_extract import PdfExtractError, extract_pdf_payload
+from .pdf_extract import PdfExtractError, extract_pdf_payload_with_backend
 from .pptx_extract import PptxExtractError, cap_extracted_text, extract_pptx_text
+from .topic_embedder import embedder_from_settings
 from .state_store import (
     build_company_attribution,
     get_document_by_path,
@@ -25,7 +26,8 @@ from .state_store import (
     update_document_state,
 )
 from .structure_chunker import (
-    DEFAULT_BUDGET_TOKENS,
+    DEFAULT_MAX_PIECE_TOKENS,
+    DEFAULT_MIN_PIECE_TOKENS,
     DEFAULT_HEADER_TOKENS,
     chunk_document,
     coverage_gaps,
@@ -236,6 +238,24 @@ def prepare_transcript_payload(path: Path, text: str) -> tuple[str, dict[str, An
 _EMBED_TOKENIZER_CACHE: dict[str, Any] = {}
 
 
+# Vectors for the topic pass, kept for the life of the process. A re-ingest of an
+# unchanged document embeds nothing, and the key is a hash of the text, never the text.
+_TOPIC_VECTOR_CACHE: dict[str, list[float]] = {}
+
+
+def topic_embedder_for_plan() -> tuple[Any | None, str | None]:
+    """The topic-pass embedder, or the reason there is not one (recorded, not swallowed)."""
+    return embedder_from_settings(settings, cache=_TOPIC_VECTOR_CACHE)
+
+
+def topic_options_from_settings() -> dict[str, Any]:
+    return {
+        "threshold": float(settings.structure_chunking_topic_threshold or 0.30),
+        "units_per_block": int(settings.structure_chunking_topic_units_per_window or 6),
+        "max_windows": int(settings.structure_chunking_topic_max_windows or 400),
+    }
+
+
 def embed_tokenizer_for_check() -> tuple[Any | None, str | None]:
     """The served embedder's tokenizer, if the operator pointed at one. Never downloaded.
 
@@ -270,9 +290,11 @@ def prepare_structure_payload(
     invisible downstream (truncation and re-cutting both look like "the answer is not in the
     context"):
 
-    1. **Piece ceiling.** A piece over ``STRUCTURE_CHUNKING_MAX_PIECE_TOKENS`` is refused.
-    2. **Fit.** ``chunk_token_size`` is set to at least the largest piece plus a margin - if
-       it were left at the budget, LightRAG would be free to re-cut our pieces - and the
+    1. **Piece ceiling.** A piece over ``STRUCTURE_CHUNKING_MAX_PIECE_TOKENS`` (the
+       embedder window less a margin) is refused: the chunker warns when it could not fit
+       one, and a warning here means the document contains something uncuttable.
+    2. **Fit.** ``chunk_token_size`` is set to the largest piece plus a margin - if it were
+       left smaller, LightRAG would be free to re-cut our pieces - and the
        largest piece is measured against the embedder's window in the embedder's own tokens
        when tokenizer files are configured, or in the chunker's conservative over-count
        when they are not. A piece over the window would be truncated silently.
@@ -285,12 +307,18 @@ def prepare_structure_payload(
     """
     if not settings.structure_chunking_enabled:
         return text, None, {}
-    budget = int(settings.structure_chunking_budget_tokens or DEFAULT_BUDGET_TOKENS)
+    piece_window = int(settings.structure_chunking_max_piece_tokens or DEFAULT_MAX_PIECE_TOKENS)
+    floor = int(settings.structure_chunking_min_piece_tokens or DEFAULT_MIN_PIECE_TOKENS)
+    embedder, embedder_note = topic_embedder_for_plan()
     try:
         plan = chunk_document(
             text,
             filename=path.name,
-            budget_tokens=budget,
+            max_piece_tokens=piece_window,
+            min_piece_tokens=floor,
+            until_merge=str(settings.structure_chunking_merge_until or "floor"),
+            topic_embed=embedder,
+            topic_options=topic_options_from_settings(),
             header_tokens=int(settings.structure_chunking_header_tokens or DEFAULT_HEADER_TOKENS),
             headers=bool(settings.structure_chunking_headers),
         )
@@ -308,13 +336,22 @@ def prepare_structure_payload(
         "structure_chunking": "applied",
         "structure_chunking_kind": plan.kind_detected,
         "structure_chunking_pieces": len(plan.pieces),
-        "structure_chunking_budget_tokens": plan.stats.get("budget_tokens"),
+        "structure_chunking_max_piece_tokens": plan.stats.get("max_piece_tokens"),
+        "structure_chunking_min_piece_tokens": plan.stats.get("min_piece_tokens"),
+        "structure_chunking_pieces_merged": plan.stats.get("pieces_merged_up_to_floor", 0),
+        "structure_chunking_units_whole": plan.stats.get("units_whole", 0),
         "structure_chunking_tokens_p50": plan.stats.get("tokens_p50"),
         "structure_chunking_tokens_p95": plan.stats.get("tokens_p95"),
         "structure_chunking_tokens_max": largest,
         "structure_chunking_dropped_lines": plan.stats.get("dropped_running_lines", 0),
         "structure_chunking_repeated_words": plan.stats.get("repeated_words", 0),
         "structure_chunking_tokenizer": plan.stats.get("tokenizer"),
+        "structure_chunking_merge_until": plan.stats.get("merge_until"),
+        "structure_chunking_topic_method": plan.stats.get("topic_method"),
+        "structure_chunking_topic_blocks": plan.stats.get("topic_blocks"),
+        "structure_chunking_topic_boundaries": plan.stats.get("topic_boundaries"),
+        "structure_chunking_topic_embedded": plan.stats.get("topic_embedded"),
+        "structure_chunking_topic_note": embedder_note,
         "structure_chunking_warnings": list(plan.warnings),
         "structure_chunking_source_word_tokens": coverage["source_word_tokens"],
         "structure_chunking_lost_word_tokens": coverage["unaccounted_word_tokens"],
@@ -340,10 +377,10 @@ def prepare_structure_payload(
         measured = max(tokenizer.count(piece.render()) for piece in plan.pieces)
         basis = f"embedder tokens via {tokenizer.name}"
         updates["structure_chunking_embedder_tokens_max"] = measured
-    window = int(settings.structure_chunking_embed_window_tokens or 0)
+    embed_window = int(settings.structure_chunking_embed_window_tokens or 0)
     updates["structure_chunking_fit_basis"] = basis
-    if window and measured > window:
-        return fallback(f"largest piece {measured} {basis} exceeds the {window}-token "
+    if embed_window and measured > embed_window:
+        return fallback(f"largest piece {measured} {basis} exceeds the {embed_window}-token "
                         "embedder window; submitting it risks silent truncation")
 
     if coverage["unaccounted_word_tokens"] and bool(settings.structure_chunking_fail_on_lost_text):
@@ -351,7 +388,10 @@ def prepare_structure_payload(
                         f"{coverage['unaccounted_word_tokens']} word tokens of the source")
 
     margin = int(settings.structure_chunking_fit_margin_tokens or 0)
-    size = max(budget, largest + margin)
+    # There is no chunk-size budget to floor this against: the pieces are whatever the
+    # document's own boundaries produced, so the size we tell LightRAG is exactly the
+    # largest one plus the margin that keeps its own cutting from ever firing.
+    size = max(64, largest + margin)
     try:
         payload, params = render_for_lightrag(plan, chunk_token_size=size)
     except Exception as exc:
@@ -405,21 +445,33 @@ def uses_binary_extract(path: Path) -> bool:
     return False
 
 
-def extract_binary_payload(path: Path) -> str:
-    """Byte-guarded extraction of a PDF/DOCX into submission-ready text.
+def extract_binary_payload_with_backend(path: Path) -> tuple[str, str | None]:
+    """Byte-guarded extraction of a PDF/DOCX, plus the backend that ran (None for DOCX).
 
-    Raises PdfExtractError / DocxExtractError; the caller decides the fallback (upload), so
-    nothing here can lose a document.
+    The backend is recorded on the row because it changes the answer: ``pdftotext
+    -layout`` reproduces the column positions the row reassembly reads and pypdf does not,
+    so two PDFs of the same layout can chunk differently depending on which one ran.
+    Without the field that difference is invisible from the database.
+
+    Raises PdfExtractError / DocxExtractError; the caller decides the fallback (upload),
+    so nothing here can lose a document.
     """
     suffix = path.suffix.lower()
     if suffix in PDF_EXTENSIONS:
-        text = extract_pdf_payload(path, max_bytes=int(settings.worker_pdf_max_bytes or 0),
-                                   max_chars=int(settings.worker_pdf_max_chars or 0),
-                                   backend=str(settings.worker_pdf_text_backend or "auto"))
+        text, backend_used = extract_pdf_payload_with_backend(
+            path, max_bytes=int(settings.worker_pdf_max_bytes or 0),
+            max_chars=int(settings.worker_pdf_max_chars or 0),
+            backend=str(settings.worker_pdf_text_backend or "auto"))
     else:
         text = extract_docx_payload(path, max_bytes=int(settings.worker_docx_max_bytes or 0),
                                     max_chars=int(settings.worker_docx_max_chars or 0))
-    return normalize_text_submission_payload(text)
+        backend_used = None
+    return normalize_text_submission_payload(text), backend_used
+
+
+def extract_binary_payload(path: Path) -> str:
+    """Submission-ready text only. See :func:`extract_binary_payload_with_backend`."""
+    return extract_binary_payload_with_backend(path)[0]
 
 
 def extract_pptx_payload(path: Path) -> str:
@@ -851,7 +903,7 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
     elif uses_binary_extract(path):
         kind = path.suffix.lower().lstrip(".")
         try:
-            text_payload = extract_binary_payload(path)
+            text_payload, backend_used = extract_binary_payload_with_backend(path)
         except (PdfExtractError, DocxExtractError) as exc:
             # Never lose a document: the parser failed, so do what this file did before
             # the route existed and let LightRAG parse the bytes. The reason is recorded
@@ -868,6 +920,8 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
                  "falling back to /documents/upload")
         else:
             structure_updates = {"structure_extract": "worker", "structure_extract_kind": kind}
+            if backend_used:
+                structure_updates["structure_extract_backend"] = backend_used
 
     if text_payload is not None and not prepared_chain:
         # Extracted text takes the same preparation order as a text file: transcript

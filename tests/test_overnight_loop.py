@@ -3588,12 +3588,15 @@ class TestStructureChunkingExperimentKey(_Case):
         self.assertEqual(body["text"], self.TABLE)
 
     def test_the_key_sends_delimited_text_and_the_fixed_token_params(self):
-        body = self._run_with({"budget_tokens": 120, "header_tokens": 20})
+        body = self._run_with({"max_piece_tokens": 40, "min_piece_tokens": 8,
+                               "header_tokens": 20})
         params = body["chunking"]
         self.assertEqual(params["strategy"], "fixed_token")
         self.assertIs(params["params"]["split_by_character_only"], True,
                       "a real bool: that image 422s on a bool-as-int")
-        self.assertEqual(params["params"]["chunk_token_size"], 120)
+        self.assertGreaterEqual(params["params"]["chunk_token_size"], 64,
+                                "at least the largest piece plus a margin: a smaller size "
+                                "would let LightRAG re-cut the pieces the plan chose")
         delimiter = params["params"]["split_by_character"]
         self.assertNotIn(delimiter, self.TABLE, "the delimiter is ours, not the corpus's")
         parts = [part for part in body["text"].split(delimiter) if part]
@@ -3606,25 +3609,45 @@ class TestStructureChunkingExperimentKey(_Case):
         self.assertIn("tokenizer=", log)
 
     def test_headers_false_is_honoured_end_to_end(self):
-        body = self._run_with({"budget_tokens": 120, "headers": False})
+        body = self._run_with({"max_piece_tokens": 40, "headers": False})
         self.assertNotIn("[Doc:", body["text"])
         self.assertIn("split_by_character", body["chunking"]["params"])
 
     def test_the_spec_defaults_and_types_are_checked_at_startup(self):
         self.assertIsNone(ol.structure_chunking_spec({}, "A"))
         self.assertIsNone(ol.structure_chunking_spec({"structure_chunking": False}, "A"))
-        self.assertEqual(ol.structure_chunking_spec({"structure_chunking": True}, "A"),
-                         {"budget_tokens": ol.DEFAULT_BUDGET_TOKENS,
-                          "header_tokens": ol.DEFAULT_HEADER_TOKENS, "headers": True})
+        self.assertEqual(
+            ol.structure_chunking_spec({"structure_chunking": True}, "A"),
+            {"max_piece_tokens": ol.DEFAULT_MAX_PIECE_TOKENS,
+             "min_piece_tokens": ol.DEFAULT_MIN_PIECE_TOKENS,
+             "header_tokens": ol.DEFAULT_HEADER_TOKENS, "headers": True,
+             "merge_until": ol.DEFAULT_MERGE_UNTIL},
+            "the default arm has no chunk-size target: the window is the only ceiling")
         spec = ol.structure_chunking_spec(
-            {"structure_chunking": {"budget_tokens": 300, "header_tokens": 10,
-                                    "headers": False}}, "A")
-        self.assertEqual(spec, {"budget_tokens": 300, "header_tokens": 10, "headers": False})
+            {"structure_chunking": {"max_piece_tokens": 300, "min_piece_tokens": 90,
+                                    "header_tokens": 10, "headers": False}}, "A")
+        self.assertEqual(spec, {"max_piece_tokens": 300, "min_piece_tokens": 90,
+                                "header_tokens": 10, "headers": False,
+                                "merge_until": ol.DEFAULT_MERGE_UNTIL})
+        self.assertEqual(
+            ol.structure_chunking_spec({"structure_chunking": {"merge_until": "window"}},
+                                       "A")["merge_until"],
+            "window", "the opt-in packing mode is reachable from an experiment arm")
+        self.assertEqual(
+            ol.structure_chunking_spec({"structure_chunking": {"budget_tokens": 300}}, "A"),
+            {"max_piece_tokens": 300, "min_piece_tokens": ol.DEFAULT_MIN_PIECE_TOKENS,
+             "header_tokens": ol.DEFAULT_HEADER_TOKENS, "headers": True,
+             "merge_until": ol.DEFAULT_MERGE_UNTIL},
+            "budget_tokens stays accepted as an explicit ceiling for size arms")
         for bad in ({"structure_chunking": 5},
-                    {"structure_chunking": {"budget_tokens": "350"}},
-                    {"structure_chunking": {"budget_tokens": 10}},
+                    {"structure_chunking": {"max_piece_tokens": "350"}},
+                    {"structure_chunking": {"max_piece_tokens": 10}},
+                    {"structure_chunking": {"min_piece_tokens": -1}},
+                    {"structure_chunking": {"budget_tokens": 300, "max_piece_tokens": 300}},
                     {"structure_chunking": {"header_tokens": -1}},
                     {"structure_chunking": {"headers": "shuffled"}},
+                    {"structure_chunking": {"merge_until": "both"}},
+                    {"structure_chunking": {"merge_until": True}},
                     {"structure_chunking": {"overlap": 50}}):
             with self.subTest(spec=bad):
                 with self.assertRaises(ol.LoopConfigError):
@@ -3640,7 +3663,7 @@ class TestStructureChunkingExperimentKey(_Case):
     def test_the_plan_line_shows_the_arm_is_chunking(self):
         config = self.write_experiments({"baseline_env": {}, "experiments": [
             {"name": "S1", "env": {}, "reingest": False,
-             "structure_chunking": {"budget_tokens": 350}}]})
+             "structure_chunking": {"max_piece_tokens": 350}}]})
         lines = ol.build_plan_lines(config)
         self.assertTrue(any("structure_chunking" in line for line in lines), lines)
 class TestChunk350ArmOnStack2(_Case):
