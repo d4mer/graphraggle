@@ -22,10 +22,15 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "scripts"))
 
+from app import structure_chunker as sc          # noqa: E402
+from app.lightrag_text import (                  # noqa: E402
+    is_conservative_marker, pieces_survive, sanitize_like_lightrag)
 from app.structure_chunker import (              # noqa: E402
     DELIMITER_CANDIDATES,
     StructureChunkerError,
     chunk_document,
+    chunk_token_size_for_payload,
+    lightrag_chunk_token_size,
     pick_delimiter,
     render_for_lightrag,
     tokenizer_name,
@@ -524,6 +529,15 @@ class TestInvariants(unittest.TestCase):
         for piece, part in zip(plan.pieces, parts):
             self.assertEqual(part, piece.render(),
                              f"{name} b{budget}: render drifted from the plan")
+        # The step that actually happened to the stack2 run: LightRAG sanitises the whole
+        # field, THEN splits on the delimiter. Replay that here for every shape.
+        self.assertTrue(is_conservative_marker(delimiter),
+                        f"{name} b{budget}: delimiter {delimiter!r} is not made of characters "
+                        f"the pipeline cannot touch")
+        survives, why = pieces_survive(rendered, delimiter, [p.render() for p in plan.pieces])
+        self.assertTrue(survives, f"{name} b{budget}: {why}")
+        self.assertNotIn(delimiter, sanitize_like_lightrag(rendered).replace(delimiter, ""),
+                         f"{name} b{budget}: a body carries marker-shaped text")
         return plan
 
     def test_invariants_hold_for_every_fixture_at_three_budgets(self):
@@ -671,7 +685,12 @@ class TestDelimiterAndRender(unittest.TestCase):
         self.assertIsInstance(block["chunk_token_size"], int)
         self.assertEqual(block["chunk_token_size"], 90)
         self.assertIsInstance(block["split_by_character"], str)
-        self.assertTrue(text.endswith(block["split_by_character"]))
+        # A join, never a wrap. The stored field is stripped before it is split, so a marker
+        # at either edge loses its newlines and the payload stops carrying the delimiter the
+        # request named - the failure mode that made \x1e useless.
+        self.assertFalse(text.startswith(block["split_by_character"]))
+        self.assertFalse(text.endswith(block["split_by_character"]))
+        self.assertEqual(text.count(block["split_by_character"]), len(plan.pieces) - 1)
 
     def test_an_empty_plan_cannot_be_rendered(self):
         plan = chunk_document("", filename="blank.txt")
@@ -1114,21 +1133,91 @@ class TestBinaryRoutes(unittest.TestCase):
                                 "if chunk_token_size sat at the budget, LightRAG could re-cut")
 
     def test_a_payload_whose_cuts_do_not_round_trip_is_not_submitted_chunked(self):
-        def broken(plan, delimiter=None, *, chunk_token_size=None):
-            return ("text with no markers at all",
-                    {"strategy": "fixed_token",
-                     "params": {"chunk_token_size": 400, "split_by_character": "\x1e",
-                                "split_by_character_only": True}})
-        path = self.docs / "words.txt"
-        path.write_text("\n".join(f"row {index} records alpha beta gamma delta"
-                                   for index in range(1, 9)) + "\n", encoding="utf-8")
-        with patch.object(worker, "render_for_lightrag", broken):
+        real = worker.render_for_lightrag
+
+        def markers_removed(plan, delimiter=None, *, chunk_token_size=None):
+            text, params = real(plan, delimiter, chunk_token_size=chunk_token_size)
+            marker = params["params"]["split_by_character"]
+            return text.replace(marker, "\n"), params
+
+        path = self.docs / "wide.txt"
+        path.write_text("\n".join(f"## Section {index}\n\n" + " ".join(
+            f"carrier{index} lane depot tariff customs origin papers margin"
+            for _ in range(120)) for index in range(12)) + "\n", encoding="utf-8")
+        with patch.object(worker, "render_for_lightrag", markers_removed):
             got = self._submit(path)
         self.assertEqual(got["meta"]["structure_chunking"], "fallback")
         self.assertIn("cut markers", got["meta"]["structure_chunking_reason"])
-        self.assertEqual(got["meta"]["structure_chunking_delimiters"], 0)
+        self.assertLess(got["meta"]["structure_chunking_delimiters"],
+                        got["meta"]["structure_chunking_pieces"])
         self.assertNotIn("chunking", got["json_body"],
                          "no params without the matching markers in the text")
+
+    def test_a_delimiter_the_sanitiser_strips_is_refused_before_submit(self):
+        # The stack2 failure, reproduced offline: \x1e passes through the API and is deleted
+        # by LightRAG's own input sanitiser, so the document arrives as one segment. The
+        # pre-submit replay is what catches it now.
+        def old_way(plan, delimiter=None, *, chunk_token_size=None):
+            # join-only, so the marker count is right and only the survival replay can stop it
+            body = "\x1e".join(piece.render() for piece in plan.pieces)
+            return body, {"strategy": "fixed_token",
+                          "params": {"chunk_token_size": 400, "split_by_character": "\x1e",
+                                     "split_by_character_only": True}}
+
+        path = self.docs / "wide.txt"
+        path.write_text("\n".join(f"## Section {index}\n\n" + " ".join(
+            f"carrier{index} lane depot tariff customs origin papers margin"
+            for _ in range(120)) for index in range(12)) + "\n", encoding="utf-8")
+        with patch.object(worker, "render_for_lightrag", old_way):
+            got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "fallback")
+        self.assertIn("sanitiser", got["meta"]["structure_chunking_reason"])
+        self.assertNotEqual(got["meta"]["structure_chunking_sanitiser_check"], "ok",
+                            "the reason is recorded, not just the fact of the refusal")
+        self.assertNotIn("chunking", got["json_body"])
+
+    def test_control_characters_are_taken_out_at_plan_time_and_reported(self):
+        # A form feed rides in on a page break and a NUL rides in on a bad decode. Both are
+        # invisible in the stored text and both move where a piece reads as ending, so the
+        # chunker normalises them BEFORE planning (planned text == stored text) and names them.
+        filler = " ".join(f"carrier{index} lane depot tariff customs" for index in range(120))
+        path = self.docs / "paged.txt"
+        path.write_text("page one\x0ctop line\n\n" + filler + "\n\n\x0cpage two\x00tail\n",
+                        encoding="utf-8")
+        got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "applied")
+        report = got["meta"]["structure_chunking_stripped_chars"]
+        self.assertIn("U+000C", report)
+        self.assertIn("U+0000", report)
+        posted = got["json_body"]["text"]
+        for ch in ("\x0c", "\x00"):
+            self.assertNotIn(ch, posted, f"U+{ord(ch):04X} reached the request")
+        self.assertEqual(got["meta"].get("structure_chunking_sanitiser_check"), "ok")
+
+    def test_the_submitted_chunk_token_size_clears_every_segment_it_will_be_handed(self):
+        # doc08 in the stack2 run: chunk_token_size 2579 against a segment LightRAG counted
+        # at 2592. Under split_by_character_only that is a rejection, not a re-cut, so the
+        # number goes out in the counter LightRAG counts with and clears the payload.
+        filler = " ".join(f"carrier{index} lane depot tariff customs" for index in range(120))
+        path = self.docs / "wide.txt"
+        path.write_text(filler + "\n\n" + filler.replace("carrier", "depot") + "\n",
+                        encoding="utf-8")
+        def cl100k_shaped(text):                    # ~2 tokens per word: higher than the
+            return max(1, 2 * len(text.split()))    # over-count's word rung on this prose
+        with patch.object(sc, "_TOKENIZER", ("tiktoken:fake", cl100k_shaped)), \
+             patch.object(worker.settings, "structure_chunking_max_piece_tokens", 900):
+            got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "applied")
+        self.assertEqual(got["meta"]["structure_chunking_chunk_token_basis"], "tiktoken:fake")
+        params = got["json_body"]["chunking"]["params"]
+        marker = params["split_by_character"]
+        segments = [seg for seg in got["json_body"]["text"].split(marker) if seg.strip()]
+        self.assertGreater(len(segments), 1)
+        margin = int(worker.settings.structure_chunking_fit_margin_tokens or 0)
+        biggest = max(cl100k_shaped(seg) for seg in segments)
+        self.assertGreaterEqual(params["chunk_token_size"], biggest + margin,
+                                f"cts {params['chunk_token_size']} would reject a segment "
+                                f"the counter names at {biggest}")
 
     def test_a_coverage_gap_is_recorded_and_only_blocks_when_told_to(self):
         path = self.docs / "words.txt"
@@ -1725,6 +1814,178 @@ class TestRotationWithStageMarkers(unittest.TestCase):
 
 
 
+
+class TestStubPiecesAreNotPieces(unittest.TestCase):
+    """A piece below the merge floor is a mistake, whatever kind of document it came from.
+
+    Hermes' doc01 ended in a 28-token piece: a trailing turn the turn packer could not
+    weld because its neighbour was already full, so it stood alone with a header costing
+    more than its content.
+    """
+
+    WINDOW = 7500
+    FLOOR = 150
+    STUB = "(Ana) the depot note was read twice, and nobody wrote it down."
+
+    def turn(self, label: str, marker: str, blocks: int) -> str:
+        return f"({label}) " + " ".join(
+            f"{marker}{i} carrier lane depot tariff customs origin papers margin period{i}."
+            for i in range(blocks))
+
+    def plan(self, text: str, **over):
+        over.setdefault("max_piece_tokens", self.WINDOW)
+        over.setdefault("min_piece_tokens", self.FLOOR)
+        over.setdefault("filename", "Call_2026-04-11.txt")
+        return chunk_document(text, **over)
+
+    def sizes(self, plan):
+        return [piece.token_estimate for piece in plan.pieces]
+
+    def test_a_trailing_stub_turn_welds_into_the_piece_before_it(self):
+        text = self.turn("They", "freight", 400) + "\n" + self.STUB + "\n"
+        plan = self.plan(text)
+        self.assertLess(token_count(self.STUB), self.FLOOR)
+        self.assertTrue(all(size >= self.FLOOR for size in self.sizes(plan)),
+                        f"a piece under the floor is not a piece: {self.sizes(plan)}")
+        self.assertIn("nobody wrote it down", plan.pieces[-1].body)
+        self.assertGreaterEqual(plan.stats.get("stub_pieces_merged", 0), 1)
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_a_label_only_trailing_line_is_welded_the_same_way(self):
+        text = self.turn("They", "freight", 400) + "\n(Ana)\n"
+        plan = self.plan(text)
+        self.assertTrue(all(size >= self.FLOOR for size in self.sizes(plan)),
+                        self.sizes(plan))
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_a_leading_stub_has_no_previous_piece_so_it_welds_forward(self):
+        text = self.STUB + "\n" + self.turn("They", "freight", 400) + "\n"
+        plan = self.plan(text)
+        self.assertTrue(all(size >= self.FLOOR for size in self.sizes(plan)),
+                        self.sizes(plan))
+        self.assertIn("nobody wrote it down", plan.pieces[0].body,
+                      "the first piece is the only neighbour available")
+
+    def test_a_stub_whose_merge_would_break_the_window_is_left_and_says_so(self):
+        para = lambda blocks: " ".join(
+            f"freight{i} carrier lane depot tariff customs origin papers margin period{i}."
+            for i in range(blocks))
+        doc = ("## Alpha\n\n" + para(352) + "\n\n## Beta\n\nThe depot note was read twice, "
+               "and nobody wrote it down.\n\n## Gamma\n\n" + para(352) + "\n")
+        plan = self.plan(doc, filename="Report_2026-04.txt")
+        self.assertIn("stub-piece-cannot-merge", plan.warnings)
+        self.assertGreaterEqual(plan.stats.get("stub_pieces_left", 0), 1)
+        self.assertEqual(coverage_gaps(doc, plan)["unaccounted_word_tokens"], 0,
+                         "leaving it alone must never cost text")
+        for size in self.sizes(plan):
+            self.assertLessEqual(size, self.WINDOW, self.sizes(plan))
+
+    def test_the_weld_prefers_the_previous_neighbour_and_takes_the_next_only_when_it_must(self):
+        from app.structure_chunker import _merge_stub_pieces, _Stats
+        big = "w " * 3000                     # ~3,000 tokens
+        stub = "a short note"
+        units = [("section", big, ("Alpha",)), ("paragraph", stub, ()),
+                 ("section", big, ("Gamma",))]
+        merged = _merge_stub_pieces(units, 150, 7500, _Stats(), [])
+        self.assertEqual(len(merged), 2)
+        self.assertIn("short note", merged[0][1], "a document reads forward: the previous piece")
+        units_first = [("paragraph", stub, ()), ("section", big, ("Alpha",))]
+        merged_first = _merge_stub_pieces(units_first, 150, 7500, _Stats(), [])
+        self.assertEqual(len(merged_first), 1)
+        self.assertIn("short note", merged_first[0][1])
+        warnings: list[str] = []
+        stuck = _merge_stub_pieces(units, 150, 2900, _Stats(), warnings)
+        self.assertEqual(len(stuck), 3, "neither join fits the window, so nothing is merged")
+        self.assertIn("stub-piece-cannot-merge", warnings)
+
+    def test_a_document_whose_only_piece_is_small_keeps_it(self):
+        text = "(Ana) the depot note was read twice, and nobody wrote it down.\n"
+        plan = self.plan(text)
+        self.assertEqual(len(plan.pieces), 1)
+        self.assertLess(plan.pieces[0].token_estimate, self.FLOOR)
+
+    def test_no_kind_leaves_a_piece_under_the_floor(self):
+        para = lambda blocks: " ".join(
+            f"freight{i} carrier lane depot tariff customs origin papers margin period{i}."
+            for i in range(blocks))
+        documents = {
+            "transcript trailing stub": (self.turn("They", "freight", 400) + "\n" + self.STUB + "\n",
+                                         "Call_2026-04-11.txt"),
+            "transcript leading stub": (self.STUB + "\n" + self.turn("They", "freight", 400) + "\n",
+                                        "Call_2026-04-11.txt"),
+            "headed short tail": ("\n".join(f"## Section {i}\n\n" + para(60) for i in range(20))
+                                  + "\n## Tail\n\nThe depot note was read twice.\n",
+                                  "Report_2026-04.txt"),
+            "flat then a scrap": (para(300) + "\n\nThe depot note was read twice, and nobody "
+                                  "wrote it down at the time of the review.\n", "Report_2026-04.txt"),
+        }
+        for label, (text, filename) in documents.items():
+            with self.subTest(shape=label):
+                plan = self.plan(text, filename=filename)
+                for piece in plan.pieces:
+                    self.assertLessEqual(piece.token_estimate, self.WINDOW)
+                self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+                if len(plan.pieces) > 1:
+                    self.assertTrue(all(piece.token_estimate >= self.FLOOR
+                                        for piece in plan.pieces),
+                                    f"{label}: {[p.token_estimate for p in plan.pieces]}")
+
+
+class TestOversizeSplitIsBalanced(unittest.TestCase):
+    """A monolithic turn cut in three should come out as three pieces, not two and an orphan."""
+
+    def parts_at(self, text: str, window: int):
+        from app.structure_chunker import _split_oversize, _Stats
+        stats, warnings = _Stats(), []
+        parts = _split_oversize(text, window, stats, warnings)
+        return parts, stats, warnings
+
+    def monolith(self, blocks: int) -> str:
+        return "(They) " + " ".join(
+            f"freight{i} carrier lane depot tariff customs origin papers margin period{i}."
+            for i in range(blocks))
+
+    def test_three_pieces_come_out_as_three_equal_pieces(self):
+        text = self.monolith(1300)
+        parts, stats, warnings = self.parts_at(text, 7500)
+        sizes = [token_count(part) for part in parts]
+        self.assertEqual(stats.counts["oversized_pieces_rebalanced"], 1)
+        self.assertEqual(warnings, [])
+        self.assertGreaterEqual(len(sizes), 3)
+        self.assertLessEqual(max(sizes), min(sizes) * 1.5,
+                             f"pieces should be roughly equal, not a full one and a runt: {sizes}")
+        for size in sizes:
+            self.assertLessEqual(size, 7500)
+        self.assertEqual(" ".join(parts).split(), text.split(),
+                         "rebalancing moves boundaries, never words")
+
+    def test_a_split_that_is_already_even_is_left_exactly_as_it_was(self):
+        from app.structure_chunker import _rebalance_parts, _Stats
+        text = self.monolith(1200)
+        words = text.split()
+        third = len(words) // 3
+        even = [" ".join(words[0:third]), " ".join(words[third:2 * third]),
+                " ".join(words[2 * third:])]
+        stats = _Stats()
+        self.assertEqual(_rebalance_parts(even, 7500, stats), even,
+                         "a document with no runt must not move: the benchmark build compares "
+                         "piece counts, and an unnecessary change is a regression")
+        self.assertEqual(stats.counts["oversized_pieces_rebalanced"], 0)
+
+    def test_the_balance_survives_every_window_that_forces_a_split(self):
+        text = self.monolith(1500)
+        for window in (7500, 4000, 2500, 1200):
+            with self.subTest(window=window):
+                parts, _stats, warnings = self.parts_at(text, window)
+                self.assertEqual(warnings, [])
+                sizes = [token_count(part) for part in parts]
+                self.assertTrue(all(size <= window for size in sizes), sizes)
+                self.assertEqual(" ".join(parts).split(), text.split())
+                if len(sizes) >= 3:
+                    self.assertLessEqual(max(sizes), min(sizes) * 2.0, sizes)
+
+
+
 class TestTopicPassInTheWorker(unittest.TestCase):
     """The topic pass runs in the worker, and the state row says which kind of cut happened."""
 
@@ -1847,6 +2108,159 @@ class TestTopicPassInTheWorker(unittest.TestCase):
         self.assertEqual(meta["structure_chunking_topic_method"],
                          "fallback(embedder-unreachable)")
 
+
+
+# ── delimiter survival through LightRAG's input sanitiser ──────────────────
+
+class TestDelimiterSurvival(unittest.TestCase):
+    def test_no_candidate_can_be_stripped(self):
+        # \x1e was the first candidate and the stack2 run proved what it costs: the sanitiser
+        # deletes the C0 range, the marker vanishes, ten documents become eight single-segment
+        # documents, and the request never says so.
+        for candidate in DELIMITER_CANDIDATES:
+            self.assertTrue(is_conservative_marker(candidate), candidate)
+            self.assertEqual(sanitize_like_lightrag(candidate), candidate.strip(), candidate)
+        self.assertNotIn("\x1e", "".join(DELIMITER_CANDIDATES))
+        self.assertEqual(DELIMITER_CANDIDATES[0], "\n\n<<<CHUNK-BREAK>>>\n\n",
+                         "the default is the documented printable marker")
+
+    def test_an_explicit_delimiter_the_sanitiser_would_delete_is_refused(self):
+        plan = chunk_document(TRANSCRIPT, filename="m.txt", budget_tokens=60)
+        for marker in ("\x1e", "\n\n\x1e\n\n", "\ufeff", "\u200b", "\x00x"):
+            with self.assertRaises(StructureChunkerError, msg=marker) as caught:
+                pick_delimiter(plan, marker)
+            self.assertIn("sanitiser", str(caught.exception), marker)
+
+    def test_a_whitespace_only_delimiter_is_refused_too(self):
+        plan = chunk_document(TRANSCRIPT, filename="m.txt", budget_tokens=60)
+        for marker in ("", "   ", "\x0b", "\n\n"):
+            with self.assertRaises(StructureChunkerError, msg=marker):
+                pick_delimiter(plan, marker)
+
+    def test_an_explicit_delimiter_outside_the_stripped_range_is_obeyed(self):
+        plan = chunk_document(TRANSCRIPT, filename="m.txt", budget_tokens=60)
+        self.assertEqual(pick_delimiter(plan, "\n\n@@BREAK@@\n\n"), "\n\n@@BREAK@@\n\n")
+
+    def _colliding_plan(self, tail=""):
+        # A plan whose bodies literally carry every candidate, marker newlines and all. The
+        # chunker cannot normally produce that (it cuts at blank lines), so the picker is
+        # tested at its own level: given a document nothing fits, what does it reach for?
+        filler = " ".join(f"carrier{index} lane depot tariff customs" for index in range(60))
+        pieces = [sc.Piece(body=f"{candidate}{filler}{tail}", header=None, kind="paragraph")
+                  for candidate in DELIMITER_CANDIDATES]
+        pieces.append(sc.Piece(body=filler + tail, header=None, kind="paragraph"))
+        return sc.ChunkPlan(pieces=pieces, kind_detected="plain")
+
+    def test_a_document_that_carries_every_candidate_escalates_by_document_hash(self):
+        plan = self._colliding_plan()
+        first = pick_delimiter(plan)
+        second = pick_delimiter(self._colliding_plan())
+        self.assertEqual(first, second, "escalation is deterministic, not random")
+        self.assertTrue(is_conservative_marker(first), first)
+        self.assertNotIn(first, "\n".join(piece.body for piece in plan.pieces))
+        self.assertIn("<<<CHUNK-BREAK-", first)
+        self.assertNotIn("\x1e", first, "the escalation never reaches for a control character")
+
+    def test_the_escalated_marker_belongs_to_the_document(self):
+        a = pick_delimiter(self._colliding_plan(" alpha"))
+        b = pick_delimiter(self._colliding_plan(" beta"))
+        self.assertNotEqual(a, b, "two different documents do not share one escalated marker")
+
+    def test_the_escalation_runs_out_of_lengths_before_it_gives_up(self):
+        plan = self._colliding_plan()
+        marker = pick_delimiter(plan)
+        digest = hashlib.sha256("\n".join(p.body for p in plan.pieces).encode()).hexdigest()
+        self.assertIn(digest[:8], marker, "the shortest hash marker is tried first")
+        # A document that carries even that: the picker keeps going, then refuses to guess.
+        clogged = self._colliding_plan()
+        clogged.pieces.append(sc.Piece(body="".join(
+            f"\n\n<<<CHUNK-BREAK-{digest[:length]}>>>\n\n"
+            for length in sc._HASH_DELIMITER_LENGTHS), header=None, kind="paragraph"))
+        longer = pick_delimiter(clogged)
+        self.assertTrue(is_conservative_marker(longer), longer)
+
+    def test_no_payload_is_marked_at_its_own_edges(self):
+        # The whole field is stripped before it is split, so an edge marker loses its newlines
+        # and the payload stops carrying the delimiter the request named.
+        for name, text in FIXTURES.items():
+            plan = chunk_document(text, filename=f"{name}.txt", budget_tokens=120)
+            rendered, params = render_for_lightrag(plan)
+            marker = params["params"]["split_by_character"]
+            self.assertFalse(rendered.startswith(marker), name)
+            self.assertFalse(rendered.endswith(marker), name)
+            self.assertTrue(sanitize_like_lightrag(rendered).count(marker)
+                            == max(0, len(plan.pieces) - 1), name)
+
+
+class TestChunkTokenSizeFollowsLightRagNotTheEmbedder(unittest.TestCase):
+    """doc08 of the stack2 run: cts 2579 against a piece LightRAG counted at 2592.
+
+    ``chunk_token_size`` is LightRAG's own budget, measured with LightRAG's tokenizer family.
+    The embedder's count answers a different question (does a piece fit the 8192-token BGE-M3
+    window) and using it here sets the budget below what the image measures.
+    """
+
+    def _fake(self, name, counter):
+        return patch.object(sc, "_TOKENIZER", (name, counter))
+
+    def test_the_size_follows_the_lightrag_counter_when_it_counts_higher(self):
+        plan = chunk_document(TRANSCRIPT * 6, filename="m.txt", budget_tokens=60)
+        per_char = lambda text: len(text)                     # noqa: E731 - a fake BGE-vs-cl100k
+        with self._fake("tiktoken:fake-wide", per_char):
+            size, basis = lightrag_chunk_token_size(plan, margin=64)
+        self.assertEqual(basis, "tiktoken:fake-wide")
+        self.assertEqual(size, max(len(p.render()) for p in plan.pieces) + 64)
+
+    def test_the_size_follows_the_lightrag_counter_when_it_counts_lower(self):
+        # A counter that reads LOW is still the right one: LightRAG compares the same numbers,
+        # so the budget it enforces is the budget we named. The embedder window stays enforced
+        # separately, in the worker, in embedder tokens.
+        plan = chunk_document(TRANSCRIPT * 120, filename="m.txt", budget_tokens=60)
+        per_hundred = lambda text: max(1, len(text) // 100)   # noqa: E731
+        with self._fake("tiktoken:fake-narrow", per_hundred):
+            size, basis = lightrag_chunk_token_size(plan, margin=64)
+            chars = max(len(p.render()) for p in plan.pieces)
+        self.assertEqual(basis, "tiktoken:fake-narrow")
+        self.assertLess(size, chars + 64,
+                        "the budget follows the counter LightRAG uses even when that counter "
+                        "reads far below the embedder's - the embedder window is enforced "
+                        "separately, in embedder tokens, in the worker")
+
+    def test_the_basis_is_named_so_a_reader_can_price_the_number(self):
+        plan = chunk_document(TRANSCRIPT * 6, filename="m.txt", budget_tokens=60)
+        size, basis = lightrag_chunk_token_size(plan, margin=64)
+        self.assertEqual(basis, tokenizer_name())
+        self.assertIn(basis, ("tiktoken:cl100k_base", "conservative-overcount"),
+                      "tiktoken when installed, the documented over-count otherwise - never "
+                      "an embedder tokenizer name")
+        self.assertNotIn("bge", basis.lower())
+        self.assertLessEqual(max(token_count(p.render()) for p in plan.pieces) + 64, size)
+
+    def test_the_size_clears_every_segment_of_the_payload_not_just_every_piece(self):
+        plan = chunk_document(TRANSCRIPT * 8, filename="m.txt", budget_tokens=60)
+        rendered, params = render_for_lightrag(plan)
+        marker = params["params"]["split_by_character"]
+        size, _ = chunk_token_size_for_payload(rendered, marker, margin=64)
+        for segment in rendered.split(marker):
+            if segment.strip():
+                self.assertLessEqual(token_count(segment) + 64, size,
+                                     "a segment over chunk_token_size is a hard rejection "
+                                     "under split_by_character_only, not a re-cut")
+
+    def test_a_payload_segment_bigger_than_any_piece_is_caught_by_the_payload_sizer(self):
+        plan = chunk_document(TRANSCRIPT * 8, filename="m.txt", budget_tokens=60)
+        piece_size, _ = lightrag_chunk_token_size(plan, margin=64)
+        marker = pick_delimiter(plan)
+        # A payload that did NOT come from this plan: one segment carries two pieces.
+        bloated = (plan.pieces[0].render() + "\n" + plan.pieces[1].render()
+                   + marker + plan.pieces[-1].render())
+        payload_size, _ = chunk_token_size_for_payload(bloated, marker, margin=64)
+        self.assertGreater(payload_size, piece_size,
+                           "the payload sizer sees what the plan sizer cannot")
+
+    def test_an_empty_payload_cannot_be_sized(self):
+        with self.assertRaises(StructureChunkerError):
+            chunk_token_size_for_payload("   ", "\n\n<<<CHUNK-BREAK>>>\n\n", 64)
 
 
 if __name__ == "__main__":

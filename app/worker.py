@@ -30,9 +30,12 @@ from .structure_chunker import (
     DEFAULT_MIN_PIECE_TOKENS,
     DEFAULT_HEADER_TOKENS,
     chunk_document,
+    chunk_token_size_for_payload,
     coverage_gaps,
+    lightrag_chunk_token_size,
     render_for_lightrag,
 )
+from .lightrag_text import pieces_survive
 from .transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
 from .validation import validate_file
 
@@ -300,6 +303,9 @@ def prepare_structure_payload(
        when they are not. A piece over the window would be truncated silently.
     3. **Coverage.** ``coverage_gaps`` accounts for every word of the source. A gap is
        recorded, and only falls back when ``STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT`` is set.
+    4. **Survival.** The payload is replayed through an imitation of LightRAG's input
+       sanitiser and split again: the segments must be exactly the planned pieces. This is
+       the guard that would have caught the ``\x1e`` delimiter, which that sanitiser deletes.
 
     Any failure returns the ORIGINAL text with no params and a recorded reason. The dedupe
     hash comes from the file bytes before this call, so chunking can never change identity.
@@ -369,6 +375,13 @@ def prepare_structure_payload(
         return fallback(f"largest piece {largest} tokens exceeds "
                         f"STRUCTURE_CHUNKING_MAX_PIECE_TOKENS={ceiling}")
 
+    stripped = {name.split(":", 1)[1]: count for name, count in plan.stats.items()
+                if name.startswith("sanitiser_stripped:")}
+    if stripped:
+        # What the pipeline took out of this document, by codepoint. Invisible in the stored
+        # text, and it changes where a piece reads as ending.
+        updates["structure_chunking_stripped_chars"] = ", ".join(
+            f"{name} x{count}" for name, count in sorted(stripped.items()))
     measured, basis = largest, f"{plan.stats.get('tokenizer')} estimate"
     tokenizer, note = embed_tokenizer_for_check()
     if note:
@@ -390,23 +403,52 @@ def prepare_structure_payload(
     margin = int(settings.structure_chunking_fit_margin_tokens or 0)
     # There is no chunk-size budget to floor this against: the pieces are whatever the
     # document's own boundaries produced, so the size we tell LightRAG is exactly the
-    # largest one plus the margin that keeps its own cutting from ever firing.
-    size = max(64, largest + margin)
+    # largest one plus the margin that keeps its own cutting from ever firing. It is
+    # measured in LightRAG's tokenizer family (tiktoken cl100k when installed, the
+    # chunker's conservative over-count otherwise) and NEVER in the embedder's: doc08 in
+    # the stack2 run carried cts 2579 against a piece LightRAG counted at 2592, and under
+    # split_by_character_only that is a hard rejection, not a re-cut.
+    size, size_basis = lightrag_chunk_token_size(plan, margin)
+    updates["structure_chunking_chunk_token_basis"] = size_basis
     try:
         payload, params = render_for_lightrag(plan, chunk_token_size=size)
     except Exception as exc:
         return fallback(f"render failed: {type(exc).__name__}: {str(exc)[:160]}")
-    updates["structure_chunking_chunk_token_size"] = params["params"]["chunk_token_size"]
+    delimiter = params["params"]["split_by_character"]
     # The one claim the request makes about the text: every cut is marked. If the count is
     # wrong, LightRAG would re-cut somewhere we never chose, and nothing downstream could
     # tell. Cheap to assert per document, and it catches a delimiter collision, which is the
     # only way this can silently happen.
-    delimiter = params["params"]["split_by_character"]
     markers = payload.count(delimiter)
     updates["structure_chunking_delimiters"] = markers
-    if markers != len(plan.pieces):
+    # A join, not a wrap: N pieces carry N-1 markers, and a single-piece document carries
+    # none. Markers at the payload's own edges would be stripped by the input sanitiser.
+    if markers != max(0, len(plan.pieces) - 1):
         return fallback(f"rendered payload carries {markers} cut markers for "
                         f"{len(plan.pieces)} pieces: the cuts would not survive the request")
+    # Then size it again from what LightRAG will actually count: the payload's own segments.
+    # The plan and the payload are meant to agree, and when they do not by a whitespace's
+    # worth, this is the number that decides whether the request is accepted (doc08: cts 2579
+    # against a segment LightRAG counted at 2592). It can only ever raise the size.
+    try:
+        payload_size, _ = chunk_token_size_for_payload(payload, delimiter, margin)
+    except Exception as exc:
+        return fallback(f"sizing failed: {type(exc).__name__}: {str(exc)[:160]}")
+    if payload_size > params["params"]["chunk_token_size"]:
+        updates["structure_chunking_chunk_token_payload_gap"] = (
+            payload_size - params["params"]["chunk_token_size"])
+        params["params"]["chunk_token_size"] = payload_size
+    updates["structure_chunking_chunk_token_size"] = params["params"]["chunk_token_size"]
+    # The check the API-boundary test could not make: LightRAG sanitises the whole document
+    # BEFORE splitting (sanitize_text_for_encoding -> strip_control_characters), which deletes
+    # the C0 separators - the \x1e delimiter the first version of this path used. Eight of ten
+    # documents in the stack2 run reached LightRAG as one segment. So replay that step here,
+    # on the bytes we are about to send, and compare the segments with the plan: counts only,
+    # never text. A mismatch is a fallback to the old route, not a gamble on the re-cut.
+    survives, why = pieces_survive(payload, delimiter, [piece.render() for piece in plan.pieces])
+    updates["structure_chunking_sanitiser_check"] = "ok" if survives else why[:200]
+    if not survives:
+        return fallback(f"payload would not survive LightRAG's input sanitiser: {why}")
     return payload, params, updates
 
 

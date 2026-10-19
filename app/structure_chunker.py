@@ -90,10 +90,14 @@ information rather than to the extra tokens.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from collections import Counter
 from . import topic_segment
+from .lightrag_text import (is_conservative_marker, is_survivable_delimiter,
+                            normalise_for_lightrag, pieces_survive,
+                            stripped_characters)
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
@@ -143,13 +147,22 @@ _MAX_RUNNING_LINE_CHARS = 90
 _MAX_RUNNING_LINE_WORDS = 12
 
 # Delimiter candidates, safest first. Each can stand on its own line without being
-# mistaken for content.
+# mistaken for content, and - the rule that cost the stack2 run eight documents - every
+# candidate is PRINTABLE. LightRAG sanitises the whole document before it splits anything
+# (sanitize_text_for_encoding -> strip_control_characters), which deletes the C0 separators
+# \x1c-\x1f including \x1e, so an ASCII-record-separator delimiter silently turned every
+# multi-piece document into one segment. Only newline plus ASCII letters, digits, '<', '>',
+# '-' survive sanitising, NFKC, a whitespace collapse at the edges, and a strip of the field.
 DELIMITER_CANDIDATES: tuple[str, ...] = (
-    "\n\n\x1e\n\n",                  # ASCII record separator: near-absent in text
     "\n\n<<<CHUNK-BREAK>>>\n\n",
-    "\n\n\u279c\n\n",                # heavy round-trip arrow
-    "\n\n@@\n\n",
+    "\n\n<<<CHUNK-BREAK-HERE>>>\n\n",
+    "\n\n<<<GRAGGLE-PIECE-BOUNDARY>>>\n\n",
+    "\n\n<<<PIECE-DONE-NEXT-PIECE>>>\n\n",
 )
+# If every candidate is present in the text (they will not be, but the picker must not
+# guess) the escalation is deterministic and printable too: a document-hash suffix, so the
+# same input always gets the same delimiter and two runs of one file stay comparable.
+_HASH_DELIMITER_LENGTHS: tuple[int, ...] = (8, 12, 16, 24, 32, 40, 64)
 
 _TOKENIZER: tuple[str, Callable[[str], int]] | None = None
 
@@ -395,7 +408,8 @@ def _split_run(text: str, budget: int, *, clause_fallback: bool = False) -> list
 
 
 def _split_oversize(text: str, window: int, stats: "_Stats",
-                    warnings: list[str]) -> list[str]:
+                    warnings: list[str], *,
+                    floor: int = DEFAULT_MIN_PIECE_TOKENS) -> list[str]:
     """Split a body that cannot fit the window, aiming for EQUAL pieces, never mid-word.
 
     The shape this exists for is one 9,000-token paragraph or a 20,000-token single line.
@@ -429,12 +443,126 @@ def _split_oversize(text: str, window: int, stats: "_Stats",
             stats.bump("oversized_stub_welds")
         else:
             welded.append(piece)
+    welded = _rebalance_parts(welded, int(window), stats, floor)
     out: list[str] = []
     for piece in welded:
         if token_count(piece) > int(window):
-            out.extend(_split_oversize(piece, window, stats, warnings))
+            out.extend(_split_oversize(piece, window, stats, warnings, floor=floor))
         else:
             out.append(piece)
+    return out
+
+
+def _sentence_atoms(text: str) -> list[str]:
+    """Sentences, for redistribution. Falls back to single words if nothing terminates."""
+    atoms: list[str] = []
+    current: list[str] = []
+    for word in text.split():
+        current.append(word)
+        if _TERMINAL.search(word):
+            atoms.append(_join(current))
+            current = []
+    if current:
+        atoms.extend(current)
+    return atoms or text.split()
+
+
+def _rebalance_parts(parts: list[str], window: int, stats: "_Stats",
+                     floor: int = DEFAULT_MIN_PIECE_TOKENS) -> list[str]:
+    """The same number of pieces, each roughly the same size.
+
+    Greedy packing fills to the window and dumps whatever is left, which is how a
+    monolithic turn came out 13,500 / 13,500 / 3,700 characters: two pieces a reader can
+    use and one orphan. Redistribute the sentences across the SAME count so every piece
+    takes its share: boundaries are placed at the atom nearest each k-th of the total, so
+    the count is a promise, not an outcome. It only fires when some part is under half the
+    mean, and it runs AFTER the tail weld, so a document that already splits evenly keeps
+    exactly the pieces it had - the chunkrun7 build must not move because of this.
+    """
+    if len(parts) < 3:
+        return parts
+    sizes = [token_count(part) for part in parts]
+    total = sum(sizes)
+    mean = total / len(parts)
+    # Two different complaints. A part at or above the merge floor that is much smaller
+    # than its neighbours is a badly drawn boundary: equalise it. A part BELOW the floor is
+    # the stub question, and the document-level rule answers that one (weld it into a
+    # neighbour, or leave it and say so) - equalising there would push every piece well
+    # under the window and cost capacity that retrieval needs.
+    if min(sizes) >= 0.5 * mean or min(sizes) < max(1, int(floor)):
+        return parts
+    atoms: list[str] = []
+    for part in parts:
+        atoms.extend(_sentence_atoms(part))
+    if len(atoms) < len(parts):
+        return parts
+    costs = [token_count(atom) for atom in atoms]
+    prefix = [0]
+    for cost in costs:
+        prefix.append(prefix[-1] + cost)
+    total = prefix[-1]
+    target = len(parts)
+    cuts: list[int] = []
+    for step in range(1, target):
+        want = step * total / target
+        index = min(range(1, len(atoms)), key=lambda at: abs(prefix[at] - want))
+        if cuts:
+            index = max(index, cuts[-1] + 1)
+        if index >= len(atoms):
+            break
+        cuts.append(index)
+    bounds = [0] + cuts + [len(atoms)]
+    groups = [atoms[low:high] for low, high in zip(bounds, bounds[1:])]
+    if any(sum(costs[at] for at in range(low, high)) > int(window)
+           for low, high in zip(bounds, bounds[1:])):
+        return parts                      # the window outranks balance; let the caller recurse
+    stats.bump("oversized_pieces_rebalanced")
+    return [_join(group) for group in groups if group]
+
+
+def _merge_stub_pieces(units: list[tuple[str, str, tuple[str, ...]]], floor: int,
+                       window: int, stats: "_Stats", warnings: list[str]
+                       ) -> list[tuple[str, str, tuple[str, ...]]]:
+    """The merge floor applied to the finished document, not just inside one unit.
+
+    A trailing "(Ana) the note was read twice." is a 26-token turn standing beside a
+    3,700-token neighbour: it retrieves badly, and its own context header costs more than
+    its content. Weld it into the previous piece (a document reads forward), or the next
+    one when there is no previous. When both joins would break the window the piece stays
+    alone and the row says so - silently dropping text is not an option.
+    """
+    if floor <= 0 or len(units) < 2:
+        return list(units)
+    out = list(units)
+    changed = True
+    while changed:
+        changed = False
+        for index in range(len(out)):
+            kind, body, _path = out[index]
+            if token_count(body) >= floor:
+                continue
+            neighbours = [index - 1] if index > 0 else []
+            if index + 1 < len(out):
+                neighbours.append(index + 1)
+            for target in neighbours:
+                first, second = ((out[target], out[index]) if target < index
+                                 else (out[index], out[target]))
+                merged_body = f"{first[1]}\n{second[1]}"
+                if token_count(merged_body) > int(window):
+                    continue
+                # "paragraph" is the neutral label, so the other kind wins a tie.
+                merged_kind = (first[0] if first[0] == second[0]
+                               else (second[0] if first[0] == "paragraph" else first[0]))
+                out[target] = (merged_kind, merged_body, first[2])
+                del out[index]
+                stats.bump("stub_pieces_merged")
+                changed = True
+                break
+            else:
+                warnings.append("stub-piece-cannot-merge")
+                stats.bump("stub_pieces_left")
+            if changed:
+                break
     return out
 
 
@@ -963,8 +1091,9 @@ def _build_units(blocks: Sequence[_Block]) -> list[_Unit]:
     return units
 
 
-def _split_unit(unit: _Unit, window: int, stats: _Stats, warnings: list[str],
-                *, depth: int = 0) -> list[tuple[str, str, tuple[str, ...]]]:
+def _split_unit(unit: _Unit, window: int, stats: _Stats, warnings: list[str], *,
+                depth: int = 0, floor: int = DEFAULT_MIN_PIECE_TOKENS
+                ) -> list[tuple[str, str, tuple[str, ...]]]:
     """One natural unit -> (kind, body, path) pieces that each fit the window.
 
     Cut order, and the order matters: the unit whole, its shallowest sub-headings,
@@ -997,10 +1126,11 @@ def _split_unit(unit: _Unit, window: int, stats: _Stats, warnings: list[str],
         for group in groups:
             if group.heading is None and not group.body_blocks:
                 continue
-            out.extend(_split_unit(group, window, stats, warnings, depth=depth + 1))
+            out.extend(_split_unit(group, window, stats, warnings, depth=depth + 1,
+                                   floor=floor))
         return out
 
-    return _split_unit_blocks(unit, window, stats, warnings)
+    return _split_unit_blocks(unit, window, stats, warnings, floor=floor)
 
 
 def _unit_bodies_whole(unit: _Unit, stats: _Stats,
@@ -1027,7 +1157,9 @@ def _unit_bodies_whole(unit: _Unit, stats: _Stats,
 
 
 def _split_unit_blocks(unit: _Unit, window: int, stats: _Stats,
-                       warnings: list[str]) -> list[tuple[str, str, tuple[str, ...]]]:
+                       warnings: list[str], *,
+                       floor: int = DEFAULT_MIN_PIECE_TOKENS
+                       ) -> list[tuple[str, str, tuple[str, ...]]]:
     """No sub-headings to use: pack blocks into pieces at their own boundaries."""
     out: list[tuple[str, str, tuple[str, ...]]] = []
     current: list[str] = []
@@ -1067,7 +1199,7 @@ def _split_unit_blocks(unit: _Unit, window: int, stats: _Stats,
             flush()
         if token_count(text) > window:
             stats.bump("blocks_split_at_sentences")
-            for part in _split_oversize(text, window, stats, warnings):
+            for part in _split_oversize(text, window, stats, warnings, floor=floor):
                 if token_count(part) > window:
                     warnings.append("piece-over-budget(one-unsplittable-block)")
                     stats.bump("pieces_over_budget")
@@ -1125,7 +1257,7 @@ def _pack_units(units: Sequence[_Unit], window: int, floor: int, stats: _Stats,
     """Natural units first, merge floor last. The window only ever forces a cut."""
     pieces: list[tuple[str, str, tuple[str, ...]]] = []
     for unit in units:
-        pieces.extend(_split_unit(unit, window, stats, warnings))
+        pieces.extend(_split_unit(unit, window, stats, warnings, floor=floor))
     stats.bump("natural_units", len(units))
     return _merge_small_pieces(pieces, floor, window, stats, until=until)
 
@@ -1246,7 +1378,7 @@ def _transcript_units(turns: Sequence[_TurnLines], budget: int, floor: int,
             bodies.append("\n".join(current))
             current = []
         stats.bump("oversized_turns_split")
-        parts = _split_oversize(body, budget, stats, warnings)
+        parts = _split_oversize(body, budget, stats, warnings, floor=floor)
         for part in parts:
             if token_count(part) > budget:
                 warnings.append("turn-over-budget(one-unsplittable-word)")
@@ -1313,12 +1445,30 @@ def chunk_document(text: str, *, filename: str = "",
 
     stats = _Stats()
     warnings: list[str] = []
+    # LightRAG sanitises the whole document BEFORE it splits: the C0 controls (except tab
+    # and newline), DEL, lone surrogates and zero-width/format characters are gone, and CRLF
+    # becomes LF. Planning over that same text is what keeps "the piece we measured" and
+    # "the chunk that gets stored" one and the same string - a form feed from a page break
+    # otherwise sits in a piece, disappears on the way in, and moves where the piece reads as
+    # ending. Counted, never silent.
+    cleaned = normalise_for_lightrag(text)
+    if cleaned != text:
+        report = stripped_characters(text)
+        for name, count in report.items():
+            # One counter per character: the report the brief asked for. A form feed from a
+            # page break is invisible in the stored text and moves where a piece reads as
+            # ending, so which characters went, and how many of each, has to be recoverable
+            # from the state row.
+            stats.bump(f"sanitiser_stripped:{name}", count)
+        stats.bump("sanitiser_chars_removed", sum(report.values()) or len(text) - len(cleaned))
+        text = cleaned
     raw_lines = [line for line in text.splitlines() if not _HEADER_RE.match(line.rstrip())]
     stats.bump("lines_in", len([line for line in text.splitlines() if line.strip()]))
     if len(raw_lines) != len(text.splitlines()):
         stats.bump("dropped_prior_headers")
 
     units: list[tuple[str, str, tuple[str, ...]]] = []
+    window = budget
     kind_detected = "plain"
     speakers: list[str] = []
     title, date = _metadata_from_name(filename)
@@ -1357,7 +1507,8 @@ def chunk_document(text: str, *, filename: str = "",
                 # A turn bigger than the window still cannot be sent whole.
                 bodies = [part for body in bodies
                           for part in ([body] if token_count(body) <= window
-                                       else _split_oversize(body, window, stats, warnings))]
+                                       else _split_oversize(body, window, stats, warnings,
+                                                              floor=floor))]
                 for body in bodies:
                     if token_count(body) > window:
                         warnings.append("turn-over-budget(one-unsplittable-word)")
@@ -1390,7 +1541,8 @@ def chunk_document(text: str, *, filename: str = "",
             # turn inside itself; the flat path needs the same guard or a long paragraph
             # falls out as one over-window piece and the document falls back.
             bodies = [part for body in bodies
-                      for part in _split_oversize(body, window, stats, warnings)]
+                      for part in _split_oversize(body, window, stats, warnings,
+                                                   floor=floor)]
             # No headings means no section path exists to claim.
             units = [("paragraph", body, ()) for body in bodies]
         else:
@@ -1414,10 +1566,12 @@ def chunk_document(text: str, *, filename: str = "",
         if token_count(body) > absolute:
             warnings.append("unit-over-window(split)")
             guarded.extend((unit_kind, part, path)
-                           for part in _split_oversize(body, absolute, stats, warnings))
+                           for part in _split_oversize(body, absolute, stats, warnings,
+                                                        floor=floor))
         else:
             guarded.append((unit_kind, body, path))
     units = guarded
+    units = _merge_stub_pieces(units, floor, window, stats, warnings)
 
     pieces: list[Piece] = []
     for unit_kind, body, path in units:
@@ -1534,27 +1688,80 @@ def coverage_gaps(source_text: str, plan: ChunkPlan) -> dict[str, Any]:
 
 
 def pick_delimiter(plan: ChunkPlan, explicit: str | None = None) -> str:
-    """A delimiter that cannot occur inside any piece, or a loud failure.
+    """A delimiter that cannot occur inside any piece, cannot be stripped, or it fails.
 
     ``split_by_character_only`` makes the delimiter the ONLY cut LightRAG will make,
     so a delimiter that also appears inside a piece silently produces the wrong
     chunks. Choosing from candidates that are absent, and refusing an explicit one
     that is present, is what keeps the promise that our cut list is the cut list.
+
+    Two refusals were added after the stack2 run. An explicit delimiter built from
+    characters the pipeline strips (``\x1e`` above all) is refused rather than obeyed, because
+    it arrives as nothing. And when every candidate is already in the text, the picker builds
+    a longer printable marker from the document's own sha256 - deterministic, so re-running one
+    file picks the same delimiter - instead of reaching for a control character.
     """
     joined = "\n".join(piece.body for piece in plan.pieces)
     if explicit is not None:
-        if not explicit.strip():
-            raise StructureChunkerError("delimiter must not be empty or whitespace only")
+        # One refusal for both shapes of the same mistake. A whitespace-only marker is
+        # refused because the pipeline strips the field before splitting it, which is also
+        # exactly why \x1e (Python calls it whitespace) killed the stack2 run.
+        if not explicit.strip() or not is_survivable_delimiter(explicit):
+            raise StructureChunkerError(
+                "delimiter would not survive LightRAG's input sanitiser: only newline plus "
+                "ASCII letters, digits, '<', '>', '-' get through sanitize_text_for_encoding "
+                "intact, and a stripped or whitespace-only delimiter turns the whole document "
+                "into one segment")
         if explicit in joined:
             raise StructureChunkerError(
                 "delimiter occurs inside the document: split_by_character_only would cut "
                 "where this plan did not. Choose another delimiter.")
         return explicit
-    for candidate in DELIMITER_CANDIDATES:
-        if candidate not in joined:
+    digest = hashlib.sha256(joined.encode("utf-8", "replace")).hexdigest()
+    for candidate in DELIMITER_CANDIDATES + tuple(
+            f"\n\n<<<CHUNK-BREAK-{digest[:length]}>>>\n\n"
+            for length in _HASH_DELIMITER_LENGTHS):
+        if candidate not in joined and is_conservative_marker(candidate):
             return candidate
     raise StructureChunkerError(
         "no candidate delimiter is absent from this document; refusing to guess")
+
+
+def lightrag_chunk_token_size(plan: ChunkPlan, margin: int = 0) -> tuple[int, str]:
+    """``chunk_token_size`` for the request, in the tokens LIGHTRAG counts with.
+
+    LightRAG sizes chunks with its own tokenizer (the tiktoken cl100k family), not with the
+    embedder's, and under ``split_by_character_only`` a chunk over ``chunk_token_size`` is a
+    hard ``ChunkTokenLimitExceededError`` - doc08 in the stack2 run: cts 2579 against a piece
+    LightRAG measured at 2592. So this number is the largest RENDERED piece (header included)
+    in ``tokenizer_name()`` units plus a margin, and it is never the embedder-token count: the
+    embedder's count decides whether a piece fits the embedding window, which is a different
+    question with a different answer. When tiktoken is not installed the chunker's conservative
+    over-count stands in; it over-counts English prose and pipe tables, so it errs high, which
+    is the safe direction for this number.
+    """
+    if not plan.pieces:
+        raise StructureChunkerError("cannot size an empty plan")
+    largest = max(token_count(piece.render()) for piece in plan.pieces)
+    return max(64, largest + max(0, int(margin))), tokenizer_name()
+
+
+def chunk_token_size_for_payload(payload: str, delimiter: str, margin: int = 0) -> tuple[int, str]:
+    """Size ``chunk_token_size`` from the payload's OWN segments, not from the plan.
+
+    The plan says what the pieces are; LightRAG counts what it is handed. Those can differ by
+    the whitespace a split leaves behind, and under ``split_by_character_only`` a count above
+    ``chunk_token_size`` is a hard ``ChunkTokenLimitExceededError`` rather than a re-cut - the
+    doc08 shape from the stack2 run. Counting the segments this function is given is the
+    closest offline stand-in for what that image will do, and it can only ever raise the size.
+    """
+    if not payload.strip():
+        raise StructureChunkerError("cannot size an empty payload")
+    # A single-piece payload carries no delimiter at all: one segment is the whole document,
+    # and that is the case LightRAG accepts whole.
+    largest = max(token_count(segment) for segment in payload.split(delimiter)
+                  if segment.strip())
+    return max(64, largest + max(0, int(margin))), tokenizer_name()
 
 
 def render_for_lightrag(plan: ChunkPlan, delimiter: str | None = None,
@@ -1571,7 +1778,16 @@ def render_for_lightrag(plan: ChunkPlan, delimiter: str | None = None,
     if not plan.pieces:
         raise StructureChunkerError("cannot render an empty plan")
     chosen = pick_delimiter(plan, delimiter)
-    text = chosen.join(piece.render() for piece in plan.pieces) + chosen
+    # No delimiter at either end of the payload. The stored field is stripped before it is
+    # split, which eats the NEWLINES of a leading or trailing marker and leaves the bare
+    # word glued to a piece - the payload would then contain a string that is not the
+    # delimiter, and split_by_character_only would never find the cut. Between pieces the
+    # marker is safe because its newlines belong to neither edge.
+    text = chosen.join(piece.render() for piece in plan.pieces)
+    ok, why = pieces_survive(text, chosen, [piece.render() for piece in plan.pieces])
+    if not ok:
+        raise StructureChunkerError(
+            f"rendered payload would not survive LightRAG's input sanitiser: {why}")
     size = int(chunk_token_size or plan.stats.get("budget_tokens") or DEFAULT_BUDGET_TOKENS)
     params = {
         "strategy": "fixed_token",

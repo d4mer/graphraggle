@@ -159,6 +159,56 @@ breaks after terminal punctuation), then a clause, then whitespace — never ins
 exception is a single word longer than the window: it stays, `unit-over-window(one-unsplittable-word)`
 is recorded, and the document takes the upload route as it always did.
 
+Two consequences of that rule are stated because they are measurable. **An oversize split is equal,
+not greedy**: a 30,000-character turn split at a 7,500-token window comes out as roughly equal
+pieces, and the piece *count* is kept, so an arm comparison is not disturbed by the balancing. **A
+piece below the merge floor is welded after the fact**: any finished piece under
+`STRUCTURE_CHUNKING_MIN_PIECE_TOKENS` joins its previous neighbour (or the next when there is none),
+including a trailing turn of 28 tokens; if both joins would exceed the window the piece stays and the
+state row carries `stub-piece-cannot-merge` with `stub_pieces_merged` / `stub_pieces_left` in the
+stats. A part at or above the floor that is much smaller than its neighbours is a boundary problem
+(equalise); a part below it is a stub problem (weld or report). Those are different rules, and the
+coverage gate is what keeps them from being merged into one.
+
+### How a cut survives the trip to LightRAG
+
+The delimiter is a promise: under `split_by_character_only` it is the **only** cut LightRAG
+will make, so it has to arrive intact. LightRAG sanitises the whole document field
+(`sanitize_text_for_encoding` → `strip_control_characters`) *before* splitting: the C0 range
+except tab and newline, DEL, lone surrogates and zero-width characters are deleted. A marker
+made of `` therefore arrives as nothing — the eight-of-ten single-segment failure in the
+stack2 run. So:
+
+- markers are **printable only**: newline plus ASCII letters, digits, `<`, `>`, `-`. Default
+  `
+
+<<<CHUNK-BREAK>>>
+
+`; when every candidate is already in the text, a longer marker is
+  derived from the document's sha256, so two runs of one file keep comparable pieces;
+- an explicit delimiter that the pipeline would strip is **refused**, not obeyed;
+- the payload is a **join, never a wrap**: the field is stripped before it is split, so a marker
+  at either edge loses its newlines and the payload stops containing the delimiter the request
+  named. `N` pieces carry `N-1` markers;
+- the plan is built over the **normalised** text, so planned text and stored text are one string,
+  and `structure_chunking_stripped_chars` names the codepoints that were taken out (a form feed
+  from a page break is invisible in the output and moves where a piece reads as ending);
+- before submitting, the worker replays the pipeline offline — sanitise, split on the delimiter,
+  compare the segments with the plan — and falls back to today's route on any mismatch.
+
+State-row fields for this path: `structure_chunking_delimiters` (markers in the payload),
+`structure_chunking_sanitiser_check` (`ok`, or the reason it refused),
+`structure_chunking_stripped_chars`, `structure_chunking_chunk_token_basis`,
+`structure_chunking_chunk_token_size`, `structure_chunking_chunk_token_payload_gap`.
+
+`chunk_token_size` is LightRAG's own budget and is counted the way **LightRAG** counts
+(tiktoken `cl100k_base` when installed, otherwise the chunker's documented over-count), then
+re-measured over the payload's own segments. It is never the embedder's count: doc08 of the
+stack2 run went out with 2579 against a segment the image measured at 2592, and under
+`split_by_character_only` that is a rejection rather than a re-cut. BGE-M3's count decides
+whether a piece fits the 8192-token embedding window, which is a separate check with a separate
+field (`structure_chunking_fit_basis`, `structure_chunking_embedder_tokens_max`).
+
 ### Documents with no headings and no tables
 
 Flat text and transcripts get **topic-shift segmentation**: windows of turns or sentences are

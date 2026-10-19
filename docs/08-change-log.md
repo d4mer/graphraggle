@@ -207,3 +207,82 @@ fixes, all in `app/structure_chunker.py` / `app/transcript_prep.py`:
   balanced splits, whole-word hard split of a sentence-less blob, unsplittable-word reporting,
   two-turn monoliths and their false positives, marker-broken rotations and the three-voice
   limit). Suite: **1107 passed, 166 subtests**.
+
+## 2026-10-19 — a piece below the merge floor is welded, and an oversize split comes out even
+
+Hermes' chunkrun6 rerun applied to 8 of 10 documents with no over-window pieces, but doc01 (the
+two-turn monolith) ended in a 28-token piece: a trailing turn the turn packer could not absorb
+because its neighbour was already full, so it stood alone with a context header costing more than
+its content. Two fixes, both in `app/structure_chunker.py`:
+
+- **The merge floor now applies to the finished document, not only inside one unit.** After every
+  cut is decided, any piece below `STRUCTURE_CHUNKING_MIN_PIECE_TOKENS` (150) that is not the
+  document's only piece is welded into the **previous** piece — a document reads forward — or the
+  next one when there is no previous. It covers every kind, including a trailing standalone turn
+  and a label-only line. If both joins would push past the window the piece is left alone and the
+  row says so: warning `stub-piece-cannot-merge`, stats `stub_pieces_merged` / `stub_pieces_left`.
+  Nothing is ever dropped to make a piece fit.
+- **An oversize split is balanced.** `_split_oversize` used to fill to the window and dump the
+  remainder, so a monolithic turn came out `13,500 / 13,500 / 3,700` characters: two pieces a
+  reader can use and one orphan. `_rebalance_parts` re-places the boundaries at the sentence nearest
+  each k-th of the total, so the pieces are roughly equal **and the piece count is a promise, not an
+  outcome** — a document that split evenly keeps exactly the pieces it had (the chunkrun7 benchmark
+  build compares counts, and an unnecessary move there would be a regression).
+- **Where the two rules hand over.** A part at or above the merge floor that is far smaller than its
+  neighbours is a badly drawn boundary → equalise it. A part *below* the floor is the stub question
+  → the document rule answers it (weld, or leave and warn). Letting the rebalancer handle the
+  below-floor case instead pushes every piece well under the window and costs retrieval capacity:
+  that variant is caught by the benchmark's coverage gate, which is why the handover is explicit and
+  controlled.
+- Tests: 10 new cases in `tests/test_structure_chunker.py` (trailing stub turn, leading stub,
+  label-only trailing line, a stub whose every join would break the window, previous-then-next
+  neighbour preference, a one-piece document keeps its small piece, a no-stub-under-the-floor sweep
+  across kinds, equal-thirds balancing, an already-even split left byte-identical, balance holding at
+  every window that forces a split). Suite: **1117 passed, 174 subtests**.
+- Verified unchanged, piece counts and sizes identical: the 19k/56k/130k-token flat documents, the
+  flat document with the topic pass on, the sentence-less blob, the 7,500-window two-turn monolith,
+  the 40-section headed document, the 1,200-row table, and the name+pronoun rotation. Only
+  stub-bearing shapes and one runt-bearing split moved.
+
+## 2026-10-19 — the cut marker survives LightRAG's input sanitiser (stack2 post-mortem)
+
+Ten documents went through the structure path in the stack2 run and eight arrived as **one
+segment**. The cause was ours: the piece delimiter was `\n\n\x1e\n\n`, and LightRAG sanitises
+the whole document field (`sanitize_text_for_encoding` → `strip_control_characters`) **before**
+it splits anything. `\x1e` is in the C0 range it deletes, so the marker vanished, the pieces
+joined into one block, and under `split_by_character_only` the result was either one whole
+document or `ChunkTokenLimitExceededError`. A ninth document, doc08, failed on
+`chunk_token_size` 2579 against a segment LightRAG counted at 2592: the size was measured in
+the wrong tokenizer family.
+
+Fixed in `app/`:
+
+- **`app/lightrag_text.py` (new)** — the offline stand-in for that pipeline:
+  `normalise_for_lightrag` (C0 except tab/newline, DEL, lone surrogates, zero-width and format
+  characters, CRLF folding), `sanitize_like_lightrag`, `stripped_characters`,
+  `is_survivable_delimiter`, `is_conservative_marker`, and `pieces_survive`, which replays
+  sanitise → split → compare against the plan.
+- **Printable markers only.** `DELIMITER_CANDIDATES` is now
+  `\n\n<<<CHUNK-BREAK>>>\n\n` and three longer siblings. When every candidate already sits in
+  the text, the picker escalates to a marker built from the document's own sha256 — same input,
+  same marker, every run. An explicit delimiter made of characters the pipeline strips is
+  **refused instead of obeyed**.
+- **The payload is a join, not a wrap.** No marker at either end: the field is stripped before
+  it is split, and an edge marker loses its newlines, which leaves a payload that no longer
+  contains the delimiter it named. `N` pieces carry `N-1` markers.
+- **The plan is stated over the stored text.** `chunk_document` normalises on entry, so a form
+  feed from a page break cannot sit in a piece and disappear on the way in. Which characters
+  went, and how many, is recorded: `structure_chunking_stripped_chars` on the state row.
+- **Four checks before submission**, any one of which falls back to today's route: marker count
+  (`N-1`), payload sizing, the survival replay (`structure_chunking_sanitiser_check`), and the
+  embedder-window check.
+- **`chunk_token_size` is measured in LightRAG's tokenizer family** — tiktoken `cl100k_base`
+  when installed, otherwise the chunker's documented conservative over-count — never in BGE-M3
+  tokens, and then **re-measured against the payload's own segments**, which is what the image
+  will count. The basis is recorded as `structure_chunking_chunk_token_basis`; the embedder count
+  stays where it belongs, on the 8192-token window.
+
+Tests: `tests/test_lightrag_text.py` (14) plus delimiter, sizing and worker replay cases in
+`tests/test_structure_chunker.py`; the shape-invariant helper now replays the sanitiser for
+**every** fixture at three budgets. Suite: 1148 passed, 174 subtests. Eleven sabotage controls,
+all red, tree restored byte-identical.
