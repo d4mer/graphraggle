@@ -150,6 +150,15 @@ Both merge modes are supported deliberately. `floor` is the default because chai
 short sections into one mixed-topic piece dilutes the vector; `window` exists as the knob for
 the benchmark to measure the difference rather than argue about it.
 
+**The window is an invariant, not an aspiration.** Whichever path produced a unit — a section, a
+table, a turn, or a flat document the topic pass had nothing to cut inside — a body larger than
+the window is split, and a final pass checks every unit again before pieces are built. Splits are
+**balanced**: a tail leftover is welded into its neighbour while the neighbour still fits, so the
+output is never "one full piece plus a stub". A sentence boundary is preferred (`_split_run`
+breaks after terminal punctuation), then a clause, then whitespace — never inside a word. The one
+exception is a single word longer than the window: it stays, `unit-over-window(one-unsplittable-word)`
+is recorded, and the document takes the upload route as it always did.
+
 ### Documents with no headings and no tables
 
 Flat text and transcripts get **topic-shift segmentation**: windows of turns or sentences are
@@ -164,8 +173,13 @@ Transcript labels are recognised by **repeated behaviour, not line count**: `(Na
 parenthesised label that alternates strictly with one other label (or heads two whole
 thousand-token lines) is a speaker **even when the word is a pronoun** — "(They) / (You)"
 across forty lines is a transcript, "(they) said" in a paragraph is not. Stage directions
-(`(Cross-talk)`, `(Inaudible)`, `(Background noise)`) are never rescued. A turn longer than
-the window is split inside the turn.
+(`(Cross-talk)`, `(Inaudible)`, `(Background noise)`) are never speakers **and no longer break
+the rotation**: they are dropped from the label sequence before the alternation is read, so
+`(Ana) … (They) … (Cross-talk) … (Ana)` is still two voices. A file where **every** non-empty
+line opens with a short label is a transcript on shape alone, which is what a meeting typed as
+two `(They)` / `(You)` lines of 6,000 tokens each looks like; a name-shaped label (≤2 words,
+≤24 characters) is what keeps "(Introduction)" plus a parenthesised paragraph, and a contents
+page of short parens, in the prose path. A turn longer than the window is split inside the turn.
 
 ### Table text shape
 

@@ -467,12 +467,17 @@ def speaker_set_from_alternation(lines: Sequence[str],
 
     Returns the two labels when the paren-labelled lines alternate between exactly two
     of them, each appearing at least twice, with no label repeated in consecutive
-    turns. Anything stage-direction-shaped is refused outright: "(Cross-talk)",
-    "(Inaudible)" and "(Background noise)" alternate just as happily and are still not
-    people. Labels that already parse are included in the pattern (that is what lets a
-    real name pair with a pronoun) but are not rescued, because they need no rescue.
+    turns. Stage directions are dropped before the pattern is read, so a real name
+    rotating with a pronoun still alternates; the markers themselves are never rescued.
+    Labels that already parse are included in the pattern (that is what lets a real name
+    pair with a pronoun) but are not rescued, because they need no rescue.
     """
-    sequence = paren_label_sequence(lines)
+    # Stage directions are dropped before the pattern is read: "(Cross-talk)" sits
+    # wherever people talked over each other, which is not every other line, and a name
+    # rotating with a pronoun only alternates once the markers are out. Dropping them is
+    # tolerance for the line between two turns, never a claim that the marker is a person.
+    sequence = [item for item in paren_label_sequence(lines)
+                if item[0] not in _STAGE_MARKER_WORDS]
     if len(sequence) < max(2, int(min_occurrences)):
         return frozenset()
     labels = [label for label, _kind, _chars in sequence]
@@ -483,8 +488,6 @@ def speaker_set_from_alternation(lines: Sequence[str],
         return frozenset()                              # a run of one voice: not alternating
     if any(labels[index] != labels[index + 2] for index in range(len(labels) - 2)):
         return frozenset()                              # period two, or no pattern claimed
-    if distinct & _STAGE_MARKER_WORDS:
-        return frozenset()
     rescued = {label for label, kind, _chars in sequence if kind != "ok"}
     if not rescued:
         return frozenset()                              # nothing needed rescuing
@@ -522,6 +525,52 @@ def monolithic_speaker_set(lines: Sequence[str],
     if set(labels) & _STAGE_MARKER_WORDS:
         return frozenset()
     if any(len(label.split()) > 2 or len(label) > 24 for label in set(labels)):
+        return frozenset()
+    return frozenset(labels)
+
+
+# A document whose EVERY non-empty line opens with the same shape of label needs no
+# repetition to be a transcript: "every line is a turn" is itself the evidence, and a
+# two-line meeting written as two 6,000-token turns can never produce four labels.
+_UNIFORM_MAX_LABEL_WORDS = 2
+_UNIFORM_MAX_LABEL_CHARS = 24
+# A turn has something said in it. This is what separates two 6,000-token turns from a
+# contents page written as "(Intro)", "(Scope)", "(Method)", or a heading followed by a
+# paragraph somebody put in parentheses.
+_UNIFORM_MIN_BODY_CHARS = 300
+
+
+def uniform_label_speaker_set(lines: Sequence[str]) -> frozenset[str]:
+    """The line-start labels, when every non-empty line carries one.
+
+    Refused unless: at least two lines; every non-empty line opens with a parenthetical;
+    every label is short (a voice, not a parenthesised sentence); no label is a stage
+    marker; at least two distinct labels appear; and the labelled bodies average at least
+    ``_UNIFORM_MIN_BODY_CHARS`` characters. The label-shape bar is what keeps
+    "(Introduction)" plus "(The quarterly report covers both depots and the freight
+    tariff for the year)" out.
+    """
+    nonempty = [line.rstrip() for line in lines if line.strip()]
+    if len(nonempty) < 2:
+        return frozenset()
+    labels: list[str] = []
+    bodies = 0
+    for line in nonempty:
+        candidate = _leading_parenthetical(line)
+        if candidate is None:
+            return frozenset()
+        label = " ".join(candidate[0].strip().split())
+        lowered = label.lower()
+        if (not label or len(label.split()) > _UNIFORM_MAX_LABEL_WORDS
+                or len(label) > _UNIFORM_MAX_LABEL_CHARS):
+            return frozenset()
+        if lowered in _STAGE_MARKER_WORDS:
+            return frozenset()
+        labels.append(lowered)
+        bodies += max(0, len(line) - len(label) - 2)
+    if len(set(labels)) < 2:
+        return frozenset()
+    if bodies < _UNIFORM_MIN_BODY_CHARS * len(nonempty):
         return frozenset()
     return frozenset(labels)
 
@@ -766,7 +815,8 @@ def prepare_transcript(
     # Idempotency: drop headers this module inserted, then regenerate them.
     lines = [line for line in lines if not _HEADER_RE.match(line.rstrip())]
 
-    accepted = speaker_set_from_alternation(lines)
+    accepted = (speaker_set_from_alternation(lines) | monolithic_speaker_set(lines)
+                | uniform_label_speaker_set(lines))
     turns: list[_Turn] = []
     label_lines = 0
     paren_label_lines = 0

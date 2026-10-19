@@ -105,6 +105,7 @@ from .transcript_prep import (
     _MONOLITHIC_LINE_CHARS,
     monolithic_speaker_set,
     speaker_set_from_alternation,
+    uniform_label_speaker_set,
     _classify_paren_label,
     _leading_parenthetical,
     _metadata_from_name,
@@ -371,7 +372,10 @@ def _split_run(text: str, budget: int, *, clause_fallback: bool = False) -> list
     current: list[str] = []
     for word in words:
         current.append(word)
-        if _TERMINAL.match(word) and token_count(_join(current)) >= budget * 0.5:
+        # search, not match: the terminator is at the END of the word. With .match this
+        # branch only ever fired on a bare "." token, so every real paragraph arrived as
+        # one "sentence" and an over-budget block was cut by whitespace inside a sentence.
+        if _TERMINAL.search(word) and token_count(_join(current)) >= budget * 0.5:
             sentences.append(current)
             current = []
     if current:
@@ -388,6 +392,50 @@ def _split_run(text: str, budget: int, *, clause_fallback: bool = False) -> list
         else:
             pieces.extend(_split_run(joined, budget, clause_fallback=True))
     return [piece for piece in pieces if piece]
+
+
+def _split_oversize(text: str, window: int, stats: "_Stats",
+                    warnings: list[str]) -> list[str]:
+    """Split a body that cannot fit the window, aiming for EQUAL pieces, never mid-word.
+
+    The shape this exists for is one 9,000-token paragraph or a 20,000-token single line.
+    Greedy packing would emit a full piece and a stub; equal pieces retrieve better and
+    keep every piece under the window. Boundaries are tried in the same order everywhere
+    else in this module: paragraph, sentence, clause, whitespace. A single word longer
+    than the window cannot be broken without inventing text, so it stays and is reported.
+    """
+    total = token_count(text)
+    if total <= int(window):
+        return [text]
+    stats.bump("oversized_units_split")
+    # The window is the budget _split_run is given, because its sentence rule already
+    # lands pieces just above half the budget: asking it for less produces smaller pieces
+    # without producing more of them, and a smaller piece is a quote that no longer fits
+    # inside one chunk. Balance is restored at the tail, below.
+    raw = _split_run(text, int(window), clause_fallback=True)
+    if len(raw) <= 1:
+        warnings.append("unit-over-window(one-unsplittable-word)")
+        stats.bump("units_unsplittable")
+        return raw or [text]
+    # A tail leftover is a stub, not a piece: a 90-token chunk retrieves badly and is a
+    # fifth of the context its neighbour already has. Weld it sideways while the
+    # neighbour still fits, which is the same reasoning as the merge floor.
+    welded: list[str] = []
+    stub = max(64, int(window) // 8)
+    for piece in raw:
+        if (welded and token_count(piece) < stub
+                and token_count(welded[-1]) + token_count(piece) <= int(window)):
+            welded[-1] = _join(welded[-1].split() + piece.split())
+            stats.bump("oversized_stub_welds")
+        else:
+            welded.append(piece)
+    out: list[str] = []
+    for piece in welded:
+        if token_count(piece) > int(window):
+            out.extend(_split_oversize(piece, window, stats, warnings))
+        else:
+            out.append(piece)
+    return out
 
 
 def _split_clause(sentence: Sequence[str], budget: int) -> list[str]:
@@ -1019,7 +1067,7 @@ def _split_unit_blocks(unit: _Unit, window: int, stats: _Stats,
             flush()
         if token_count(text) > window:
             stats.bump("blocks_split_at_sentences")
-            for part in _split_run(text, window):
+            for part in _split_oversize(text, window, stats, warnings):
                 if token_count(part) > window:
                     warnings.append("piece-over-budget(one-unsplittable-block)")
                     stats.bump("pieces_over_budget")
@@ -1090,7 +1138,7 @@ class _TurnLines:
     lines: list[str] = field(default_factory=list)
 
 
-def _scan_turns(lines: Sequence[str]) -> tuple[list[_TurnLines], Counter[str], int, int]:
+def _scan_turns(lines: Sequence[str]) -> tuple:
     """Turn-shaped scan: who speaks, and the ORIGINAL lines of each turn.
 
     The lines are kept verbatim rather than rebuilt from parsed words, so the
@@ -1112,7 +1160,9 @@ def _scan_turns(lines: Sequence[str]) -> tuple[list[_TurnLines], Counter[str], i
     # property of the file: two labels heading the lines, strictly alternating, or two
     # enormous labelled turns and nothing else. Both passes are per-document, and stage
     # markers are refused by both.
-    accepted = speaker_set_from_alternation(lines) | monolithic_speaker_set(lines)
+    uniform_turns = uniform_label_speaker_set(lines)
+    accepted = (speaker_set_from_alternation(lines) | monolithic_speaker_set(lines)
+                | uniform_turns)
     for raw in lines:
         source = raw.rstrip()
         if not source.strip():
@@ -1140,12 +1190,12 @@ def _scan_turns(lines: Sequence[str]) -> tuple[list[_TurnLines], Counter[str], i
                 turns[-1].lines.append(line)
             else:
                 turns.append(_TurnLines(speaker=None, lines=[line]))
-    return turns, label_counts, label_lines, cue_lines, long_labelled
+    return turns, label_counts, label_lines, cue_lines, long_labelled, bool(uniform_turns)
 
 
 def _transcript_like(turns: Sequence[_TurnLines], label_counts: Counter[str],
                      label_lines: int, cue_lines: int, nonempty: int,
-                     long_labelled: int = 0) -> bool:
+                     long_labelled: int = 0, uniform_ok: bool = False) -> bool:
     """The same bars as :func:`app.transcript_prep.prepare_transcript`, plus one.
 
     Shared bars, deliberately: a document the preparer will not touch must not be
@@ -1168,7 +1218,12 @@ def _transcript_like(turns: Sequence[_TurnLines], label_counts: Counter[str],
                  and (label_lines >= 2 or nonempty >= 6))
     monolithic = (label_lines >= 2 and distinct >= 2
                   and long_labelled >= 2 and long_labelled == label_lines)
-    return bool(labelled or single_voice or captioned or monolithic)
+    # Every line a labelled turn, with substance and a name-shaped label. That rule lives
+    # in transcript_prep.uniform_label_speaker_set, which already read these same lines; the
+    # bar here only checks that the chunker's own turn scan agrees with it. Two 6,000-token
+    # turns become a meeting; "(Intro)" / "(Scope)" / "(Method)" does not.
+    uniform = uniform_ok and label_lines >= 2 and distinct >= 2 and label_lines == nonempty
+    return bool(labelled or single_voice or captioned or monolithic or uniform)
 
 
 def _transcript_units(turns: Sequence[_TurnLines], budget: int, floor: int,
@@ -1191,7 +1246,7 @@ def _transcript_units(turns: Sequence[_TurnLines], budget: int, floor: int,
             bodies.append("\n".join(current))
             current = []
         stats.bump("oversized_turns_split")
-        parts = _split_run(body, budget, clause_fallback=True)
+        parts = _split_oversize(body, budget, stats, warnings)
         for part in parts:
             if token_count(part) > budget:
                 warnings.append("turn-over-budget(one-unsplittable-word)")
@@ -1269,10 +1324,11 @@ def chunk_document(text: str, *, filename: str = "",
     title, date = _metadata_from_name(filename)
 
     if kind in ("auto", "transcript"):
-        turns, label_counts, label_lines, cue_lines, long_labelled = _scan_turns(raw_lines)
+        turns, label_counts, label_lines, cue_lines, long_labelled, uniform_ok = (
+            _scan_turns(raw_lines))
         nonempty = len([line for line in raw_lines if line.strip()])
         if _transcript_like(turns, label_counts, label_lines, cue_lines, nonempty,
-                            long_labelled):
+                            long_labelled, uniform_ok):
             # Only a label that heads at least two turns is claimed as a voice: a
             # one-off label ("Meeting:", "Note:") is not a speaker, and writing it
             # into the header of every piece would be a claim this file does not
@@ -1301,7 +1357,7 @@ def chunk_document(text: str, *, filename: str = "",
                 # A turn bigger than the window still cannot be sent whole.
                 bodies = [part for body in bodies
                           for part in ([body] if token_count(body) <= window
-                                       else _split_run(body, window, clause_fallback=True))]
+                                       else _split_oversize(body, window, stats, warnings))]
                 for body in bodies:
                     if token_count(body) > window:
                         warnings.append("turn-over-budget(one-unsplittable-word)")
@@ -1329,6 +1385,12 @@ def chunk_document(text: str, *, filename: str = "",
                 flat, tokens=token_count, window=window, floor=min(floor, window),
                 embed=topic_embed, **(topic_options or {}))
             _topic_stats(stats, report)
+            # One unit that is itself over the window gives the topic pass nothing to cut
+            # BETWEEN, so it comes back whole. The transcript path has always split such a
+            # turn inside itself; the flat path needs the same guard or a long paragraph
+            # falls out as one over-window piece and the document falls back.
+            bodies = [part for body in bodies
+                      for part in _split_oversize(body, window, stats, warnings)]
             # No headings means no section path exists to claim.
             units = [("paragraph", body, ()) for body in bodies]
         else:
@@ -1340,6 +1402,22 @@ def chunk_document(text: str, *, filename: str = "",
             kind_detected = "table"
         elif any(kind_name == "section" for kind_name, _b, _p in units):
             kind_detected = "structured"
+
+    # The invariant, in one place and for every kind: no unit leaves this function
+    # larger than the ceiling. A document must never fall back to LightRAG's default
+    # chunker because our own piece was too big - that is the difference between a worse
+    # cut and no cut at all. Anything still over after splitting is one unsplittable
+    # word, and that is recorded rather than hidden.
+    absolute = max(32, budget)
+    guarded: list[tuple[str, str, tuple[str, ...]]] = []
+    for unit_kind, body, path in units:
+        if token_count(body) > absolute:
+            warnings.append("unit-over-window(split)")
+            guarded.extend((unit_kind, part, path)
+                           for part in _split_oversize(body, absolute, stats, warnings))
+        else:
+            guarded.append((unit_kind, body, path))
+    units = guarded
 
     pieces: list[Piece] = []
     for unit_kind, body, path in units:

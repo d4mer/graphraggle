@@ -173,3 +173,37 @@ configuration is stated in terms of the window instead of a size target.
   249,997-entry BGE-M3 vocabulary (synthetic XLM-R-shaped files only — Hermes' load of the real
   files reported `unigram-249997-entry-local+2special`); and what LightRAG does with an oversize
   piece under `split_by_character_only`.
+
+## 2026-10-19 — no structure-path piece is ever over the window; two-line and marker-broken transcripts are read
+
+Hermes' ingest lost two documents to the structure path itself: a flat document arrived as one
+unit, the topic pass found no topic change inside it and returned it whole, and the fit check
+then sent the file back to LightRAG's default chunker — a worse cut *and* no structure. Three
+fixes, all in `app/structure_chunker.py` / `app/transcript_prep.py`:
+
+- **An over-window unit is always split, whatever produced it.** Every path that can hand back a
+  body bigger than the window now goes through `_split_oversize`: the flat/topic path, the
+  paragraph-block path, and an over-window turn inside a transcript. A final pass before pieces
+  are built catches any unit that still exceeds it and records `unit-over-window(split)`. Pieces
+  are **balanced**: a tail leftover is welded sideways into its neighbour while the neighbour
+  still fits, so the splitter never emits "one full piece plus a stub". The one thing it will
+  not do is invent text — a single word longer than the window stays, warned as
+  `unit-over-window(one-unsplittable-word)`, and the document goes to the upload route as before.
+- **A bug in the splitter's own sentence detection:** `_TERMINAL.match(word)` matches at the
+  **start** of a word, so the branch that prefers sentence boundaries never fired on real text.
+  Every over-budget block was being cut at whitespace *inside a sentence*. It is `search` now,
+  which is what the other two call sites already used.
+- **Two-line meetings are transcripts.** `uniform_label_speaker_set` accepts a file when every
+  non-empty line opens with a short parenthetical label, at least two distinct labels appear, no
+  label is a stage direction, and each label has a body of real length. That is shape, not
+  repetition, so it catches a call written as `(They) …6,000 tokens…` and `(You) …6,000 tokens…`
+  where nothing repeats. The label has to be name-shaped (≤2 words, ≤24 characters): a heading
+  followed by a parenthesised paragraph, and a contents page of short paren labels, stay prose.
+- **A stage direction no longer breaks a speaker rotation.** `(Ana) … (They) … (Cross-talk) …`
+  used to fail the period-two test because the marker line interrupted the pattern. Markers are
+  dropped from the sequence *before* the pattern is read, so the rotation is still recognised —
+  and a file of only stage directions is still not a transcript.
+- Tests: 21 new cases in `tests/test_structure_chunker.py` (window invariant across every kind,
+  balanced splits, whole-word hard split of a sentence-less blob, unsplittable-word reporting,
+  two-turn monoliths and their false positives, marker-broken rotations and the three-voice
+  limit). Suite: **1107 passed, 166 subtests**.

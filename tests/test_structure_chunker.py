@@ -1433,6 +1433,298 @@ class TestHermesTranscriptShapes(unittest.TestCase):
 
 
 
+
+class TestOversizedUnitsAlwaysSplit(unittest.TestCase):
+    """No document may fall back because OUR piece was too big.
+
+    Hermes' run lost two documents this way: the structure path applied, then emitted one
+    piece over the window, and the fit check sent the file back to LightRAG's default
+    chunker - the worst of both, a worse cut and no structure at all.
+    """
+
+    WINDOW = 7500
+    FLOOR = 150
+
+    def plan(self, text: str, **kwargs):
+        kwargs.setdefault("max_piece_tokens", self.WINDOW)
+        kwargs.setdefault("min_piece_tokens", self.FLOOR)
+        kwargs.setdefault("filename", "Report_2026-04.txt")
+        return chunk_document(text, **kwargs)
+
+    def assert_invariant(self, text: str, plan, *, window: int | None = None):
+        limit = window or self.WINDOW
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, limit,
+                                 f"a piece of {piece.token_estimate} tokens is over the "
+                                 f"window; the document would fall back")
+        gaps = coverage_gaps(text, plan)
+        self.assertEqual(gaps["unaccounted_word_tokens"], 0, gaps)
+
+    def paragraph(self, blocks: int, words: int = 9) -> str:
+        return " ".join(f"freight{index} carrier lane depot tariff customs origin papers "
+                        f"margin period{index}." for index in range(blocks))
+
+    def test_a_nine_thousand_token_paragraph_is_cut_into_window_sized_pieces(self):
+        text = self.paragraph(900)
+        self.assertGreater(token_count(text), self.WINDOW)
+        plan = self.plan(text)
+        self.assertGreaterEqual(len(plan.pieces), 2)
+        self.assert_invariant(text, plan)
+
+    def test_the_topic_path_splits_a_unit_it_has_nothing_to_cut_between(self):
+        # The bug: with the topic pass on, one unit has no internal topic change, so the
+        # segmenter returns it whole and nothing else looks at its size.
+        text = self.paragraph(900)
+        plan = self.plan(text, topic_embed=lambda texts: [[float(len(t) % 7)] for t in texts],
+                         topic_options={"units_per_block": 4})
+        self.assertGreaterEqual(len(plan.pieces), 2)
+        self.assertGreaterEqual(plan.stats.get("oversized_units_split", 0), 1,
+                                "the split is counted, not just performed")
+        self.assertNotIn("unit-over-window(split)", plan.warnings,
+                         "the topic path is expected to split its own unit; the warning means "
+                         "only the last-resort pass saved it")
+        self.assert_invariant(text, plan)
+
+    def test_a_twenty_thousand_token_single_line_is_cut_at_sentence_boundaries(self):
+        text = self.paragraph(2600)
+        plan = self.plan(text)
+        self.assert_invariant(text, plan)
+        bodies = [piece.body.strip() for piece in plan.pieces]
+        for body in bodies[:-1]:
+            self.assertTrue(body.endswith((".", "!", "?")),
+                            "a sentence boundary was available; use it: " + repr(body[-40:]))
+
+    def test_a_sentenceless_blob_is_hard_split_at_whitespace_never_mid_word(self):
+        words = [f"alpha{index}" for index in range(4200)]
+        text = " ".join(words)
+        plan = self.plan(text)
+        self.assert_invariant(text, plan)
+        source = set(text.split())
+        for piece in plan.pieces:
+            self.assertTrue(set(piece.body.split()) <= source,
+                            "every piece word is a whole word of the source")
+
+    def test_one_unsplittable_word_is_reported_rather_than_hidden(self):
+        monster = "x" * 60000
+        text = monster + " " + self.paragraph(60)
+        plan = self.plan(text)
+        self.assertIn("unit-over-window(one-unsplittable-word)", plan.warnings)
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+        self.assertGreaterEqual(plan.stats.get("units_unsplittable", 0), 1)
+
+    def test_the_pieces_it_does_make_are_balanced_not_one_full_plus_a_stub(self):
+        text = self.paragraph(2600)
+        plan = self.plan(text)
+        sizes = sorted(piece.token_estimate for piece in plan.pieces)
+        self.assertGreaterEqual(len(sizes), 3)
+        self.assertGreaterEqual(sizes[0], sizes[-1] // 3,
+                                f"a piece a third the size of the largest is a stub: {sizes}")
+        self.assertLessEqual(sizes[-1], self.WINDOW)
+
+    def test_the_invariant_holds_for_every_kind_this_module_produces(self):
+        documents = {
+            "headed": "\n".join(f"## Section {index}\n\n" + self.paragraph(60)
+                                 for index in range(40)),
+            "table": "\n".join(f"| region{index} | 12{index} | 9{index} |"
+                                for index in range(1200)),
+            "transcript": "\n".join(
+                f"(Speaker {index % 3}) " + self.paragraph(30) for index in range(200)),
+            "flat": self.paragraph(3000),
+        }
+        for label, text in documents.items():
+            with self.subTest(kind=label):
+                plan = self.plan(text)
+                self.assert_invariant(text, plan)
+
+
+class TestMonolithicTwoTurnTranscript(unittest.TestCase):
+    """A meeting written as two lines. Nothing repeats, so repetition cannot be the test."""
+
+    WINDOW = 3000
+
+    def turn(self, label: str, marker: str, count: int) -> str:
+        return f"({label}) " + " ".join(
+            f"{marker}{index} carrier lane depot tariff customs origin papers margin period{index}."
+            for index in range(count))
+
+    def plan(self, text: str, **kwargs):
+        kwargs.setdefault("max_piece_tokens", self.WINDOW)
+        kwargs.setdefault("min_piece_tokens", 150)
+        kwargs.setdefault("filename", "Call_2026-04-11.txt")
+        return chunk_document(text, **kwargs)
+
+    def test_two_giant_pronoun_turns_are_turns_and_are_split_inside(self):
+        text = self.turn("They", "freight", 900) + "\n" + self.turn("You", "wage", 900) + "\n"
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript")
+        self.assertGreaterEqual(len(plan.pieces), 3, "each turn is over the window on its own")
+        for piece in plan.pieces:
+            self.assertLessEqual(piece.token_estimate, self.WINDOW)
+        sizes = sorted(piece.token_estimate for piece in plan.pieces)
+        # A looser band than the flat-path test: a transcript piece must stay inside ONE
+        # speaker's turn, so the tail of a turn cannot always be welded to its neighbour.
+        self.assertGreaterEqual(sizes[0] * 4, sizes[-1],
+                                f"a turn split that leaves a stub retrieves badly: {sizes}")
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_two_short_labelled_turns_are_still_a_transcript(self):
+        # Deliberately under the 2,500-character monolith bar: this document is detected
+        # by line shape alone, so it fails if the uniform rule is removed.
+        text = self.turn("They", "freight", 24) + "\n" + self.turn("You", "wage", 24) + "\n"
+        self.assertLess(len(text.splitlines()[0]), 2500)
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript",
+                         "every line is a labelled turn; that is the evidence on its own")
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_a_multi_word_parenthetical_is_not_a_speaker_name(self):
+        body_a = ("the carrier lane renewals were signed in the spring, the freight tariff moved "
+                  "twice inside one quarter, and the depot foreman kept saying that the numbers "
+                  "on the board did not match the numbers in the folder that the broker brought "
+                  "around in March")
+        body_b = ("the origin papers the broker filed for the third period were never reconciled "
+                  "with the depot figures, the customs note was read aloud twice, and nobody in "
+                  "the room could say which of the two carriers had actually signed the renewal "
+                  "or whether the margin the board saw was the margin anyone had agreed to")
+        lines = [f"(Regarding the quarterly numbers) {body_a}",
+                 f"(And the customs position) {body_b}"]
+        self.assertGreaterEqual(sum(len(line) for line in lines), 600,
+                                "long enough that only the label shape can reject this: the "
+                                "body-length bar is what would otherwise stop a contents page")
+        text = "\n".join(lines) + "\n"
+        plan = self.plan(text)
+        self.assertNotEqual(plan.kind_detected, "transcript",
+                            "two long parentheticals are sentences, not two voices")
+
+    def test_an_unsplittable_word_inside_a_turn_says_which_unit_it_was_in(self):
+        monster = "x" * 40000
+        text = self.turn("They", "freight", 40) + "\n" + f"(You) {monster} " + self.turn("You", "wage", 10).split(" ", 1)[1] + "\n"
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript")
+        self.assertIn("unit-over-window(one-unsplittable-word)", plan.warnings,
+                      "the warning names the unit that could not be cut, so the row shows "
+                      "why a piece is over the window")
+
+    def test_the_uniform_rule_itself_refuses_a_multi_word_label(self):
+        # The chunker test above can also be saved by the turn parser, which refuses a
+        # multi-word label of its own. This pins the rule that is named in the brief.
+        from app.transcript_prep import uniform_label_speaker_set
+        lines = ["(Regarding the quarterly numbers) the carrier lane renewals were signed "
+                 "in the spring, the freight tariff moved twice inside one quarter, and the "
+                 "depot foreman kept saying that the numbers on the board did not match the "
+                 "numbers in the folder the broker brought around in March, which is why the "
+                 "margin was never signed off by anyone in the room that afternoon.",
+                 "(And the customs position) the origin papers filed for the third period "
+                 "were never reconciled with the depot figures, the customs note was read "
+                 "aloud twice, nobody could say which of the two carriers had actually "
+                 "signed the renewal, and the tariff line was carried forward into the next "
+                 "quarter's sheet without a single correction being written against it."]
+        self.assertGreaterEqual(sum(len(line) for line in lines), 600)
+        self.assertEqual(uniform_label_speaker_set(lines), frozenset(),
+                         "a four-word parenthetical is a sentence, not a name")
+
+    def test_a_heading_and_a_parenthesised_paragraph_are_not_two_speakers(self):
+        text = ("(Introduction)\n(The quarterly report covers both depots and the freight "
+                "tariff for the year, the carrier lane renewals signed in the spring, and the "
+                "customs position on the origin papers the broker filed for the third period.)\n")
+        plan = self.plan(text)
+        self.assertNotEqual(plan.kind_detected, "transcript")
+
+    def test_a_contents_page_of_short_paren_labels_is_not_a_transcript(self):
+        text = "\n".join(["(Introduction)", "(Scope)", "(Method)", "(Findings)",
+                           "(Appendix)"]) + "\n"
+        plan = self.plan(text)
+        self.assertNotEqual(plan.kind_detected, "transcript")
+
+    def test_one_line_is_never_enough(self):
+        plan = self.plan(self.turn("They", "freight", 300) + "\n")
+        self.assertNotEqual(plan.kind_detected, "transcript")
+
+    def test_the_split_of_an_over_window_turn_is_balanced_and_whole_word(self):
+        from app.structure_chunker import _split_oversize, _Stats
+        text = self.turn("They", "freight", 900)
+        stats, warnings = _Stats(), []
+        parts = _split_oversize(text, 3000, stats, warnings)
+        self.assertGreaterEqual(len(parts), 3)
+        self.assertEqual(" ".join(parts).split(), text.split(),
+                         "the split reorders nothing and loses nothing")
+        for part in parts:
+            self.assertLessEqual(token_count(part), 3000)
+        sizes = sorted(token_count(part) for part in parts)
+        self.assertGreaterEqual(sizes[0], sizes[-1] // 3, f"stub pieces: {sizes}")
+        self.assertEqual(warnings, [])
+
+    def test_the_speaker_set_rule_itself(self):
+        from app.transcript_prep import uniform_label_speaker_set
+        lines = [self.turn("They", "freight", 200), self.turn("You", "wage", 200)]
+        self.assertEqual(uniform_label_speaker_set(lines), frozenset({"they", "you"}))
+        self.assertEqual(uniform_label_speaker_set(["(Introduction)",
+                                                    "(Method)"]), frozenset(),
+                         "short labels with nothing said in them are a contents page")
+        self.assertEqual(uniform_label_speaker_set(["(Cross-talk) the desks talked over each "
+                                                    "other for a while at the review of the "
+                                                    "carrier lane figure and the customs note "
+                                                    "for period three, which nobody wrote down.",
+                                                    "(They) the freight figure moved twice."]),
+                         frozenset(), "a stage marker is not a speaker")
+
+
+class TestRotationWithStageMarkers(unittest.TestCase):
+    """A real name rotating with a pronoun, with stage directions dropped in between."""
+
+    def transcript(self, lines: int = 120, markers: int = 3) -> str:
+        out: list[str] = []
+        for index in range(lines):
+            label = "Ana" if index % 2 == 0 else "They"
+            out.append(f"({label}) the depot carrier lane {index} held while the freight "
+                       f"tariff moved twice in the customs review of the origin papers for "
+                       f"period {index}, and the {label} note was read again.")
+            if markers and index % max(1, lines // markers) == 0:
+                out.append("(Cross-talk) both desks spoke at once about the same carrier lane "
+                           "figure and the customs note for period three, and neither note was "
+                           "written down at the time of the review.")
+        return "\n".join(out) + "\n"
+
+    def plan(self, text: str):
+        return chunk_document(text, filename="Call_2026-04-11.txt", max_piece_tokens=3000,
+                              min_piece_tokens=150)
+
+    def test_the_pronoun_is_rescued_as_the_second_voice(self):
+        text = self.transcript()
+        plan = self.plan(text)
+        self.assertEqual(plan.kind_detected, "transcript")
+        bodies = "\n".join(piece.body for piece in plan.pieces)
+        self.assertIn("(Ana)", bodies)
+        self.assertIn("(They)", bodies)
+        self.assertEqual(coverage_gaps(text, plan)["unaccounted_word_tokens"], 0)
+
+    def test_the_pattern_is_read_after_the_stage_directions_are_dropped(self):
+        from app.transcript_prep import speaker_set_from_alternation
+        with_markers = self.transcript().splitlines()
+        without_markers = [line for line in with_markers if not line.startswith("(Cross-talk)")]
+        self.assertEqual(speaker_set_from_alternation(with_markers),
+                         frozenset({"ana", "they"}))
+        self.assertEqual(speaker_set_from_alternation(without_markers),
+                         frozenset({"ana", "they"}))
+
+    def test_a_stage_direction_pair_is_still_never_a_speaker_set(self):
+        from app.transcript_prep import speaker_set_from_alternation
+        lines = ["(Cross-talk) the desks talked over each other about the carrier lane.",
+                 "(Inaudible) the customs note for period three was not recorded."] * 6
+        self.assertEqual(speaker_set_from_alternation(lines), frozenset())
+
+    def test_three_rotating_voices_are_not_claimed_by_a_two_voice_rule(self):
+        from app.transcript_prep import speaker_set_from_alternation
+        lines = []
+        for index in range(30):
+            label = ("Ana", "They", "We")[index % 3]
+            lines.append(f"({label}) the depot carrier lane {index} held while the freight "
+                         f"tariff moved twice in the customs review of the origin papers.")
+        self.assertEqual(speaker_set_from_alternation(lines), frozenset(),
+                         "this rescue is a two-voice rule; three voices need their own")
+
+
+
 class TestTopicPassInTheWorker(unittest.TestCase):
     """The topic pass runs in the worker, and the state row says which kind of cut happened."""
 
