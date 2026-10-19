@@ -1,7 +1,7 @@
 # Hermes brief: rerun the two fallback documents (and all 10 as a regression), chunkrun7 (read-only, scratch only)
 
-**Status: APPROVED by the operator on 2026-10-19 ("check ... progress" chain; same standing approval as the
-chunkrun6 rerun, same hard rules).** No production change, no ingest into any LightRAG store, no restart,
+**Status: DRAFT, NOT YET APPROVED by the operator (lead's request; same read-only, scratch-only scope as the approved chunkrun6 rerun). Do not start until the lead sends the go.** Same hard rules:
+No production change, no ingest into any LightRAG store, no restart,
 no .env edit, no corpus text in reports. Append `# Rerun with chunkrun7` to structure-probes.md.
 
 Code `~/rag-project/docs/chunkrun7.tgz` (commit 583d7e1), manifest chunkrun7-MANIFEST.txt, sha256 2a1f9282815f03d548327347fdd97ed718f50a8b1e7f5e483debb34899f69d01.
