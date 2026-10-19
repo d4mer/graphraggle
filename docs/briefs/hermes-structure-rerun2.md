@@ -1,6 +1,6 @@
 # Hermes brief: rerun the two fallback documents (and all 10 as a regression), chunkrun7 (read-only, scratch only)
 
-**Status: DRAFT, NOT YET APPROVED by the operator (lead's request; same read-only, scratch-only scope as the approved chunkrun6 rerun). Do not start until the lead sends the go.** Same hard rules:
+**Status: APPROVED by the operator on 2026-10-19 ("yes, notify Hermes to run it").** Read-only, scratch-only. Same hard rules:
 No production change, no ingest into any LightRAG store, no restart,
 no .env edit, no corpus text in reports. Append `# Rerun with chunkrun7` to structure-probes.md.
 
