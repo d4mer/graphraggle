@@ -1,7 +1,8 @@
 # Hermes brief: structure-aware ingest of the 10 real documents on stack2 (BGE-M3), then retrieval check
 
-**Status: DRAFT - NOT APPROVED. Do not start. Needs the operator's written go in your pane. The
-operator approves the five numbered actions below by name; anything not listed is out of scope.**
+**Status: APPROVED by the operator on 2026-10-19 for actions 1 to 4 only ("approve 1 to 4 and send it to
+Hermes"). Action 5 (queries against production) is NOT approved: do not do it.** Approval prompts appear in your
+pane. Anything not listed in 1 to 4 is out of scope.
 Production (compose project rag-project, LightRAG :9621, gateway :8020, Open WebUI :3010, the live worker,
 `.env`, `source_docs/`, `uploads/`, `lightrag_store/`, `state/ingest.db`) is NOT changed by anything here.
 Report to `~/rag-project/docs/ops/runs/stack2-structure-ingest.md` (files, not `rig send`); STATUS on line 1.
@@ -14,7 +15,7 @@ embedding with BGE-M3, the oversize check you read in the source, and real retri
 end-to-end run, on the scratch stack, to decide whether to bring a cutover to the operator. It is a gate
 on one build, not a comparison of options.
 
-## Actions needing explicit operator approval (only these)
+## Approved actions (1 to 4); action 5 is not approved
 1. **Back up, then empty stack2's LightRAG store** (`~/rag-project/stack2/lightrag_store/`): copy it to
    `stack2/backups/pre-structure-<UTC>/` with a sha256 manifest first (it holds 1 half-processed document from the stopped
    chunk-350 run). Then clear the store files (not the directory, not the compose files).
@@ -43,9 +44,9 @@ on one build, not a comparison of options.
    structure-bgem3` for the dev and held-out probe files, and compute `evidence_in_context%` (judge-free) for the 100
    evidence probes (68 plain + 32 structure-v2; if the loop only takes its own two probe files, run the 32
    structure probes through the same recall helper and say how). Report per probe type and per source kind.
-5. **OPTIONAL, only if the operator says so in the same approval: the same read-only probe run against
+5. **NOT APPROVED - do not do: the same read-only probe run against
    production** (`:8020` gateway queries, no writes) for the 100 probes, as a before-and-after on the identical
-   questions. It generates ~100 queries of load on the live stack; skip it unless explicitly approved.
+   questions. It generates ~100 queries of load on the live stack; skip it.
 
 ## Hard rules
 - Production untouched; at start and end confirm :9621 processed=10/failed=0, container ids unchanged, `.env`
