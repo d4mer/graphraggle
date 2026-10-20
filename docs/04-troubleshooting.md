@@ -175,13 +175,13 @@ podman exec rag-gateway-api curl -i http://lightrag-server:9621/health
 Symptom:
 
 ```text
-Model 'mxbai-embed-large' not found
+Model 'bge-m3-mlx' not found
 ```
 
 Correct value:
 
 ```bash
-EMBEDDING_MODEL=mxbai-embed-large-v1
+EMBEDDING_MODEL=bge-m3-mlx-fp16
 ```
 
 ## Upload ingests only one line of text

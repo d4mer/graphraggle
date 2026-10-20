@@ -35,7 +35,7 @@ Verified on the production Thinkpad (`~/rag-project`) on 2026-10-09; details in
 
 1. Runtime: **Docker** (`docker compose`) — not podman
 2. LightRAG image tag: `ghcr.io/hkuds/lightrag:v1.5.7` (the repo `compose.yml` was reconciled to it on 2026-10-11)
-3. Embedding model: `mxbai-embed-large-v1` (dimension 1024)
+3. Embedding model: `bge-m3-mlx-fp16` (dimension 1024, window 8192 tokens)
 4. Reranker model: `jina-reranker-v3-mlx`
 5. LLM, embeddings and reranker host: `192.168.1.190:1234` — one oMLX server for all three
 6. Host ports: gateway `8020`, Open WebUI `3010`, LightRAG `9621`

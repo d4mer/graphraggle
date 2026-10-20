@@ -46,7 +46,7 @@ Supported file types:
 ## Current Validated Assumptions
 
 1. LightRAG image tag is `ghcr.io/hkuds/lightrag:v1.4.15`
-2. Embedding model is `mxbai-embed-large-v1`
+2. Embedding model is `bge-m3-mlx-fp16`
 3. Reranker model is `jina-reranker-v3-mlx`
 4. Text-like files should be ingested via LightRAG `POST /documents/text`
 5. Binary files should be ingested via LightRAG `POST /documents/upload`

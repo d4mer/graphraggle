@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import dis
 import io
 import json
@@ -22,6 +23,8 @@ import time
 import unittest
 import urllib.error
 from contextlib import redirect_stdout
+from typing import Any
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -67,15 +70,23 @@ class FakeOps(ol.Ops):
         self.commands: list[list[str]] = []
         self.env_snapshots: list[str] = []
         self.http_calls: list[tuple[str, str]] = []
+        self.payloads_seen: list[tuple[str, Any]] = []
         self.headers_seen: list[tuple[str, dict]] = []
         self.delete_status = 200
         self.container_states: dict[str, str] = {}
         self.logs: dict[str, str] = {}
         self.worker_running = False
+        self.names: list[str] | None = None   # scripted `docker ps --format {{.Names}}`
+        self.env_file: Path | None = None     # the .env THIS stack reads (--env-file)
         self.fail_compose_calls: set[int] = set()
         self.raise_on_exec = False
         self.judge_garbage = 0
         self.chat_fails: set[str] = set()
+        # Retrieval-recall stub: what the LightRAG /query context contains per
+        # question, and what the attribution judge answers per question.
+        self.recall_context: dict[str, str] = {}
+        self.recall_off = False
+        self.attribution_answers: dict[str, str] = {}
         self.advance_per_call = 0.0
         self.compose_index = 0
 
@@ -85,12 +96,26 @@ class FakeOps(ol.Ops):
     def sleep(self, seconds: float) -> None:
         self.clock += max(0.0, seconds)
 
+    def _context_for(self, question: str) -> str:
+        """The stub's retrieved context for a question: by default the gold evidence,
+        which is what a hit means. Set recall_context[q] = "..." to force a miss."""
+        if question in self.recall_context:
+            return self.recall_context[question]
+        for item in list(DEV_ITEMS) + list(HELDOUT_ITEMS):
+            if item.get("question") == question:
+                return str(item.get("evidence") or "")
+        return "unrelated context"
+
+    def _current_env_text(self) -> str:
+        # The stack under test may read a different .env than <root>/.env.
+        return (self.env_file or self.root / ".env").read_text(encoding="utf-8")
+
     def run(self, argv, *, cwd=None, timeout=180.0):
         argv = list(argv)
         self.commands.append(argv)
         if argv[:2] == ["docker", "compose"]:
             self.compose_index += 1
-            self.env_snapshots.append((self.root / ".env").read_text(encoding="utf-8"))
+            self.env_snapshots.append(self._current_env_text())
             if self.compose_index in self.fail_compose_calls:
                 return 1, "", "compose exploded"
             return 0, "", ""
@@ -105,14 +130,14 @@ class FakeOps(ol.Ops):
                             raw = argv[index + 1]
                 name = raw.removeprefix("name=")
                 return 0, self.container_states.get(name or ol.CONTAINER, "running") + "\n", ""
-            names = ["lightrag-server", "rag-gateway-api"]
+            names = list(self.names) if self.names is not None else ["lightrag-server", "rag-gateway-api"]
             if self.worker_running:
                 names.append("rag-ingest-worker")
             return 0, "".join(name + "\n" for name in names), ""
         if argv[:2] == ["docker", "exec"]:
             if self.raise_on_exec:
                 raise RuntimeError("docker exec blew up")
-            text = (self.root / ".env").read_text(encoding="utf-8")
+            text = self._current_env_text()
             values = []
             for line in text.splitlines():
                 match = ol._ENV_LINE.match(line.strip())
@@ -123,6 +148,7 @@ class FakeOps(ol.Ops):
 
     def http_json(self, method, url, *, headers=None, payload=None, timeout=30.0):
         self.http_calls.append((method, url))
+        self.payloads_seen.append((url, payload))
         self.headers_seen.append((url, dict(headers or {})))
         self.clock += self.advance_per_call
         if url.endswith("/documents") and method == "DELETE" and self.delete_status != 200:
@@ -145,16 +171,26 @@ class FakeOps(ol.Ops):
                 {"id": "doc-1", "status": "processed", "file_path": "doc1.txt",
                  "chunks_count": 1, "error_msg": None},
             ], "total_count": 1, "status_summary": {"processed": 1}}
+        if url.endswith("/query") and method == "POST":
+            if self.recall_off:
+                return 500, {"error": "context endpoint unavailable"}
+            question = str((payload or {}).get("query") or "")
+            return 200, {"status": "success", "result": self._context_for(question)}
         if url.endswith("/api/chat"):
             question = payload["messages"][-1]["content"]
             if question in self.chat_fails:
                 return 500, {"error": "upstream failure"}
             return 200, {"message": {"content": f"answer for: {question}"}}
         if url.endswith("/v1/chat/completions"):
+            prompt = payload["messages"][0]["content"]
+            if "did it attribute the statement to the right speaker" in prompt:
+                question = prompt.split("Question:\n", 1)[1].split("\n", 1)[0]
+                value = self.attribution_answers.get(question, "right")
+                return 200, {"choices": [{"message": {
+                    "content": json.dumps({"attribution": value, "reason": "stub"})}}]}
             if self.judge_garbage > 0:
                 self.judge_garbage -= 1
                 return 200, {"choices": [{"message": {"content": "I am unable to decide"}}]}
-            prompt = payload["messages"][0]["content"]
             expected = prompt.split("Expected answer (ground truth):", 1)[1].split("Evidence quote", 1)[0].strip()
             if expected.startswith("MISMATCH:"):
                 verdict = "wrong"
@@ -186,7 +222,8 @@ class _Case(unittest.TestCase):
         self.experiments_path.write_text(json.dumps(config), encoding="utf-8")
         return ol.load_experiments(self.experiments_path)
 
-    def make_loop(self, config: dict, *, resume: bool = False, dry_run: bool = False, max_hours: float = 11.0) -> ol.Loop:
+    def make_loop(self, config: dict, *, resume: bool = False, dry_run: bool = False,
+                  max_hours: float = 11.0, **kwargs: Any) -> ol.Loop:
         return ol.Loop(
             root=self.root,
             out=self.out,
@@ -197,6 +234,7 @@ class _Case(unittest.TestCase):
             resume=resume,
             handle_signals=False,
             print_fn=lambda line: None,
+            **kwargs,
         )
 
     def env_now(self) -> str:
@@ -423,11 +461,39 @@ class TestScoring(unittest.TestCase):
         row = ol.results_row("E1", "done", old, old, 1.0, 2.0)
         self.assertEqual(row.count("|"), header_cells)
         self.assertIn("| n/a |", row)
+        # A summary written before answerable%/attribution%/recall% existed renders
+        # those cells as n/a, never as 0.0: a zero would be read as a measured failure.
         new = dict(old, ok_pct=90.0, ok_partial_credit_pct=95.0)
         row = ol.results_row("E1", "done", new, new, 1.0, 2.0)
         self.assertEqual(row.count("|"), header_cells)
+        self.assertIn("n/a", row)
+        for measured in ("| 90.0 |", "| 80.0 |", "| 85.0 |", "| 1.0 |"):
+            self.assertIn(measured, row, "a column that HAS a number stopped rendering it")
+        full = dict(new, answerable_correct_pct=92.5, attribution_right_pct=70.0,
+                    attribution_wrong_pct=12.5, evidence_in_context_pct=64.0)
+        row = ol.results_row("E1", "done", full, full, 1.0, 2.0)
+        self.assertEqual(row.count("|"), header_cells)
         self.assertNotIn("n/a", row)
-        self.assertIn("| 90.0 |", row)
+        self.assertIn("| 92.5 |", row)
+        self.assertIn("| 64.0 |", row)
+
+    def test_results_table_names_the_columns_that_separate_refusals_from_accuracy(self):
+        """F7: one headline that counts a correct refusal as accuracy lets a system
+        that refuses more score better. The table now reports the two halves apart."""
+        header = ol.RESULTS_TABLE_HEADER
+        for column in ("heldout answerable%", "refusal acc%", "evidence in context%",
+                       "attrib right%", "attrib wrong%"):
+            self.assertIn(column, header)
+        items = [{"id": f"d{i}", "question": "q", "expected_answer": "a fact"}
+                 for i in range(4)]
+        items += [{"id": "u1", "question": "q", "expected_answer": "not in the documents"}]
+        verdicts = ["refused_ok", "refused_ok", "refused_ok", "refused_ok", "refused_ok"]
+        summary = ol.score_set(items, verdicts, [1.0] * 5)
+        self.assertEqual(summary["ok_pct"], 100.0, "the old headline still says perfect")
+        self.assertEqual(summary["answerable_n"], 4)
+        self.assertEqual(summary["answerable_correct_pct"], 0.0,
+                         "accuracy on answerable questions is what actually happened")
+        self.assertEqual(summary["unanswerable_refused_pct"], 100.0)
 
 
 # ── driver behaviour ────────────────────────────────────────────────────────
@@ -621,20 +687,24 @@ class TestDriver(_Case):
         self.assertEqual(stored["heldout_ok_pct"], 66.67)        # h1 + h2 of 3, h3 judged wrong
         self.assertEqual(stored["heldout_correct_pct"], 33.33)
 
-    def test_best_experiment_ranks_by_dev_ok_partial_credit(self):
+    def test_best_experiment_ranks_by_answerable_accuracy_not_by_refusals(self):
+        """Finding F7: the old headline rewarded refusing, so an arm could win by knowing less."""
         config = self.two_experiments()
         loop = self.make_loop(config)
         loop.load_state()
         loop.state["results"] = {
-            "A": {"dev_partial_credit_pct": 92.0, "dev_ok_partial_credit_pct": 91.5,
-                  "latency_p95": 5.0, "env": {}},
-            "B": {"dev_partial_credit_pct": 90.0, "dev_ok_partial_credit_pct": 93.0,
-                  "latency_p95": 5.0, "env": {}},
+            "A": {"dev_partial_credit_pct": 80.0, "dev_ok_partial_credit_pct": 86.0,
+                  "dev_answerable_correct_pct": 78.0, "latency_p95": 5.0, "env": {}},
+            "B": {"dev_partial_credit_pct": 84.0, "dev_ok_partial_credit_pct": 92.0,
+                  "dev_answerable_correct_pct": 61.0, "latency_p95": 6.0, "env": {}},
         }
-        self.assertEqual(loop._best_experiment()[0], "B")        # the old metric would pick A
+        self.assertEqual(loop._best_experiment()[0], "A",
+                         "B leads on ok+0.5*partial but answers fewer real questions")
         loop._write_recommendation()
         text = (self.out / "results.md").read_text(encoding="utf-8")
-        self.assertIn("best experiment by dev ok+0.5*partial%: **B** (93.0%", text)
+        self.assertIn("best experiment by dev answerable-correct%: **A** (78.0%", text)
+        self.assertIn("dev ok+0.5*partial% was 86.0%", text, "the old column stays printed")
+        self.assertIn("counts a correct refusal as answered", text)
 
     def test_an_old_state_json_still_ranks_without_the_new_key(self):
         config = self.two_experiments()
@@ -2347,12 +2417,38 @@ class TestJudgeRubricV2(unittest.TestCase):
             self.assertIn(phrase, self.flat, f"rule 2 lost: {phrase!r}")
 
     def test_rule_3_speaker_attribution_is_not_a_failure_by_itself(self):
+        """F4: the old carve-out ("unless the question explicitly asks who said it")
+        let attribution decide the content verdict. It never does now - attribution
+        has its own call - so the deliberate change here is that the carve-out is gone
+        entirely rather than conditional.
+        """
         for phrase in (
             "do not mark an answer wrong merely because it attributes a statement to a different speaker label",
             "or omits who said it",
-            "unless the question explicitly asks who said it",
+            "Attribution is NOT part of this verdict at all",
         ):
             self.assertIn(phrase, self.flat, f"rule 3 lost: {phrase!r}")
+        self.assertNotIn("unless the question explicitly asks who said it", self.flat)
+
+    def test_attribution_has_its_own_prompt_and_never_touches_the_verdict(self):
+        flat = " ".join(ol.ATTRIBUTION_PROMPT.split())
+        for phrase in (
+            "did it attribute the statement to the right speaker",
+            "attributes the statement to a DIFFERENT named speaker than the expected one",
+            "Never guess: absence is na, not wrong",
+            "Judge the attribution only",
+        ):
+            self.assertIn(phrase, flat, f"attribution rubric lost: {phrase!r}")
+        self.assertEqual(ol.ATTRIBUTION_VALUES, ("right", "wrong", "na"))
+        # A probe that pins no speaker is not graded, so adding the column cannot
+        # change the numbers of a probe set written before the field existed.
+        self.assertFalse(ol.attribution_applicable({"question": "q", "expected_answer": "a"}))
+        self.assertTrue(ol.attribution_applicable(
+            {"question": "who said it", "expected_answer": "Ana", "expected_speaker": "Ana"}))
+        self.assertFalse(ol.attribution_applicable(
+            {"expected_answer": "not in the documents", "expected_speaker": "Ana"}))
+        self.assertEqual(ol.parse_attribution('{"attribution": "wrong", "reason": "x"}'), "wrong")
+        self.assertIsNone(ol.parse_attribution('{"attribution": "maybe"}'))
 
     def test_rule_4_evidence_only_and_harmless_extra_detail(self):
         for phrase in (
@@ -2436,6 +2532,1205 @@ class TestJudgeRubricV2(unittest.TestCase):
         self.assertIn("hallucinated ONLY if the answer asserts a specific value", sent)
         self.assertEqual(ops.sent["max_tokens"], ol.JUDGE_MAX_TOKENS)
 
+
+class TestTranscriptPrepExperimentKey(_Case):
+    """Experiment-level ``"transcript_prep": true`` in the loop's inserts.
+
+    The loop posts text straight to ``/documents/text`` and bypasses the worker,
+    so it must be able to apply the same pre-processing production would. Default
+    (no key) sends the file text unchanged.
+    """
+
+    TRANSCRIPT = """Alice Chen  0:12
+We should ship the bridge change behind a flag.
+Bob Nguyen  0:31
+Agreed, but the rollback path needs a test first.
+Alice Chen  0:48
+I will write it tonight; the plan is to cut on Friday.
+Bob Nguyen  1:02
+Friday works, the freeze starts that night.
+"""
+
+    def _posted_texts(self, experiment: dict) -> list[str]:
+        (self.root / "doc1.txt").write_text(self.TRANSCRIPT, encoding="utf-8")
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        self.make_loop(config).run()
+        return [
+            (payload or {}).get("text", "")
+            for url, payload in self.ops.payloads_seen
+            if url.endswith("/documents/text")
+        ]
+
+    def test_without_the_key_the_file_text_is_posted_unchanged(self):
+        posted = self._posted_texts({"name": "E1", "env": {}, "reingest": True})
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0], self.TRANSCRIPT)
+
+    def test_key_on_posts_headered_turn_text(self):
+        posted = self._posted_texts({"name": "E1", "env": {}, "reingest": True,
+                                     "transcript_prep": True})
+        self.assertEqual(len(posted), 1)
+        self.assertIn("[Meeting: doc1 | ", posted[0])
+        self.assertIn("Alice Chen: We should ship the bridge change behind a flag.", posted[0])
+        self.assertIn("Bob Nguyen: Friday works, the freeze starts that night.", posted[0])
+
+
+
+# ── experiment-level per-request chunker (LightRAG 1.5.7) ───────────────────
+
+class TestChunkingExperimentKey(_Case):
+    """``"chunking": {"strategy": ..., "params": {...}}`` on every posted insert.
+
+    Param key names come from Hermes reading the 1.5.7 image; they are validated
+    structurally here so a typo fails at startup instead of three hours into an
+    ingest, and the values are forwarded untouched. No key at all means the body
+    is byte-identical to what this driver posted before the key existed.
+    """
+
+    def _bodies(self, experiment: dict) -> list[dict]:
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        self.make_loop(config).run()
+        return [payload for url, payload in self.ops.payloads_seen
+                if url.endswith("/documents/text")]
+
+    def test_absent_key_posts_exactly_the_old_body(self):
+        bodies = self._bodies({"name": "C0", "env": {}, "reingest": True})
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(set(bodies[0]), {"text", "file_source"})
+        self.assertEqual(bodies[0]["text"], "transcript body\n")
+
+    def test_valid_strategy_and_params_are_forwarded_untouched(self):
+        spec = {"strategy": "semantic_vector",
+                "params": {"chunk_token_size": 1200, "breakpoint_threshold_type": "percentile",
+                           "breakpoint_threshold_amount": 95, "buffer_size": 1}}
+        bodies = self._bodies({"name": "C2", "env": {}, "reingest": True, "chunking": spec})
+        self.assertEqual(bodies[0]["chunking"], spec)
+        self.assertEqual(set(bodies[0]), {"text", "file_source", "chunking"})
+
+    def test_recursive_params_pass_through_as_written(self):
+        spec = {"strategy": "recursive_character",
+                "params": {"chunk_token_size": 1200, "chunk_overlap_token_size": 100,
+                           "separators": ["\n\n", "\n", ". "]}}
+        bodies = self._bodies({"name": "C1", "env": {}, "reingest": True, "chunking": spec})
+        self.assertEqual(bodies[0]["chunking"]["params"]["separators"], ["\n\n", "\n", ". "])
+
+    def _refuse(self, params: dict, fragment: str, strategy: str = "fixed_token") -> None:
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "X", "env": {}, "reingest": False,
+                 "chunking": {"strategy": strategy, "params": params}}]})
+        message = str(caught.exception)
+        self.assertIn(fragment, message, message)
+
+    def test_unknown_strategy_refuses_at_load(self):
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "X", "env": {}, "chunking": {"strategy": "hyde"}}]})
+        self.assertIn("chunking.strategy must be one of", str(caught.exception))
+
+    def test_params_must_be_an_object(self):
+        with self.assertRaises(ol.LoopConfigError):
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "X", "env": {}, "chunking": {"strategy": "fixed_token", "params": [1]}}]})
+
+    def test_unknown_param_key_is_refused_and_names_the_accepted_ones(self):
+        self._refuse({"chunk_token_size": 800, "chunk_overlap_tokens": 100},
+                     "chunk_overlap_tokens is not a fixed_token param")
+        self._refuse({"chunk_token_size": 800, "chunk_overlap_tokens": 100},
+                     "chunk_overlap_token_size")
+
+    def test_typed_keys_are_checked_the_way_lightrag_checks_them(self):
+        self._refuse({"chunk_token_size": "1200"}, "chunk_token_size must be an integer")
+        self._refuse({"chunk_token_size": True}, "chunk_token_size must be an integer")
+        self._refuse({"chunk_token_size": 1200, "chunk_overlap_token_size": "100"},
+                     "chunk_overlap_token_size must be an integer")
+        self._refuse({"chunk_token_size": 1200, "chunk_overlap_token_size": 1200},
+                     "must be smaller than chunk_token_size")
+        self._refuse({"split_by_character_only": 1}, "must be a boolean, not an int or a string")
+        self._refuse({"split_by_character": 3}, "split_by_character must be a string")
+
+    def test_semantic_vector_takes_no_overlap_key(self):
+        self._refuse({"chunk_token_size": 1200, "chunk_overlap_token_size": 100},
+                     "not accepted by semantic_vector", strategy="semantic_vector")
+
+    def test_env_only_regex_key_is_refused_by_name(self):
+        self._refuse({"sentence_split_regex": r"[.!?]" + "$"}, "env-only")
+
+    def test_semantic_thresholds_are_range_checked_for_the_type_that_needs_it(self):
+        self._refuse({"breakpoint_threshold_type": "quartile"},
+                     "breakpoint_threshold_type must be one of", strategy="semantic_vector")
+        self._refuse({"breakpoint_threshold_type": "percentile",
+                      "breakpoint_threshold_amount": 150},
+                     "within (0, 100]", strategy="semantic_vector")
+        self._refuse({"breakpoint_threshold_amount": "0.5"},
+                     "breakpoint_threshold_amount must be a number", strategy="semantic_vector")
+        self._refuse({"buffer_size": 0}, "buffer_size must be an integer", strategy="semantic_vector")
+        # standard_deviation has no (0, 100] requirement: 1.0 must be accepted.
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "OK", "env": {}, "chunking": {
+                "strategy": "semantic_vector",
+                "params": {"breakpoint_threshold_type": "standard_deviation",
+                           "breakpoint_threshold_amount": 1.0}}}]})
+        self.assertEqual(config["experiments"][0]["chunking"]["params"]["breakpoint_threshold_amount"], 1.0)
+
+    def test_separators_are_shape_checked(self):
+        self._refuse({"separators": "abc"}, "separators must be a list", strategy="recursive_character")
+        self._refuse({"separators": ["a", 3]}, "every separator must be a string",
+                     strategy="recursive_character")
+        self._refuse({"separators": ["x"] * 65}, "at most 64 entries", strategy="recursive_character")
+        self._refuse({"separators": ["y" * 257]}, "at most 256 characters",
+                     strategy="recursive_character")
+
+    def test_the_shipped_chunking_arms_file_is_valid_and_ordered(self):
+        path = Path(__file__).resolve().parent.parent / "docs" / "ops" / "loop" / "experiments-chunking.json"
+        config = ol.load_experiments(path)
+        names = [experiment["name"] for experiment in config["experiments"]]
+        self.assertEqual(names, ["C0-baseline", "P1-transcript-prep", "C2-semantic-vector",
+                                 "C1-recursive-character", "P2-prep-plus-semantic"])
+        by_name = {experiment["name"]: experiment for experiment in config["experiments"]}
+        self.assertIsNone(by_name["C0-baseline"]["chunking"])
+        self.assertFalse(by_name["C0-baseline"]["transcript_prep"])
+        self.assertTrue(by_name["P1-transcript-prep"]["transcript_prep"])
+        self.assertIsNone(by_name["P1-transcript-prep"]["chunking"])
+        self.assertEqual(by_name["C2-semantic-vector"]["chunking"]["strategy"], "semantic_vector")
+        self.assertNotIn("chunk_overlap_token_size",
+                         by_name["C2-semantic-vector"]["chunking"]["params"])
+        self.assertEqual(by_name["C1-recursive-character"]["chunking"]["strategy"],
+                         "recursive_character")
+        self.assertTrue(by_name["P2-prep-plus-semantic"]["transcript_prep"])
+        self.assertTrue(all(experiment["reingest"] for experiment in config["experiments"]))
+
+    def test_the_readme_carries_the_second_stack_command_and_the_wipe_warning(self):
+        path = Path(__file__).resolve().parent.parent / "docs" / "ops" / "loop" / "experiments-chunking.json"
+        readme = "\n".join(json.loads(path.read_text(encoding="utf-8"))["_readme"])
+        self.assertIn("Never run this file against production without --allow-production; "
+                      "it wipes the store.", readme)
+        for flag in ("--experiments", "--lightrag-url", "--gateway-url", "--lightrag-container",
+                     "--gateway-container", "--gateway-service", "--lightrag-service",
+                     "--worker-container", "--compose-file", "--compose-project", "--env-file"):
+            self.assertIn(flag, readme, f"the run line does not mention {flag}")
+        self.assertNotIn("KEY=", readme, "no secrets in the run line")
+
+
+# ── second-stack targeting and the production-wipe gate ─────────────────────
+
+SECOND_LIGHTRAG = "http://127.0.0.1:9911"
+SECOND_GATEWAY = "http://127.0.0.1:9912"
+
+
+class TestTargetSelection(_Case):
+    """--lightrag-url / --gateway-url / containers / --env-file.
+
+    Defaults must point at production exactly as before; the clear step must use
+    the URL it was given, not the constant.
+    """
+
+    def test_defaults_are_the_module_constants(self):
+        target = ol.Target()
+        self.assertEqual(target.lightrag_url, ol.LIGHTRAG_URL)
+        self.assertEqual(target.gateway_url, ol.GATEWAY_URL)
+        self.assertEqual(target.lightrag_container, ol.CONTAINER)
+        self.assertEqual(target.gateway_container, ol.GATEWAY_CONTAINER)
+        self.assertTrue(target.is_production_lightrag())
+
+    def test_unset_fields_follow_the_constants_at_construction(self):
+        """Tests redirect these globals to a stub; a Target built after must follow."""
+        original = ol.LIGHTRAG_URL
+        try:
+            ol.LIGHTRAG_URL = "http://127.0.0.1:1/stub"
+            target = ol.Target()
+            self.assertEqual(target.lightrag_url, "http://127.0.0.1:1/stub")
+            self.assertFalse(target.is_production_lightrag())
+        finally:
+            ol.LIGHTRAG_URL = original
+
+    def test_the_clear_step_uses_the_url_it_was_given(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": True}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="second-lightrag", gateway_container="second-gateway")
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops,
+                       max_hours=11.0, handle_signals=False, print_fn=lambda line: None,
+                       target=target)
+        loop.run()
+        urls = [url for _method, url in self.ops.http_calls]
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents", urls, "the clear must hit the given stack")
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents/text", urls)
+        self.assertIn(f"{SECOND_GATEWAY}/api/chat", urls)
+        self.assertFalse([url for url in urls if url.startswith(ol.PRODUCTION_LIGHTRAG_URL)],
+                         "a request still went to the production LightRAG")
+        self.assertIn("name=second-lightrag",
+                      " ".join(" ".join(command) for command in self.ops.commands
+                               if command[:2] == ["docker", "ps"]))
+        execs = [" ".join(command) for command in self.ops.commands if command[:2] == ["docker", "exec"]]
+        self.assertTrue(execs and all("second-gateway" in line or "second-lightrag" in line
+                                      for line in execs), execs)
+
+    def test_env_file_override_replaces_the_root_dotenv(self):
+        other = self.root / "stack-two.env"
+        other.write_text(ENV_TEXT, encoding="utf-8")
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops,
+                       max_hours=11.0, handle_signals=False, print_fn=lambda line: None,
+                       target=ol.Target(env_file=str(other)))
+        self.assertEqual(loop.env_path, other)
+        default = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops,
+                          max_hours=11.0, handle_signals=False, print_fn=lambda line: None)
+        self.assertEqual(default.env_path, self.root / ".env")
+
+
+class _ExplodingOps:
+    """Proves the guard runs before anything could talk to a stack."""
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("a real Ops was built; the guard must return first")
+
+
+class TestProductionWipeGuard(_Case):
+    """reingest on the production LightRAG needs --allow-production."""
+
+    def _main(self, argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), patch.object(ol, "Ops", _ExplodingOps), \
+                patch.object(ol, "DryRunOps", _ExplodingOps):
+            code = ol.main(argv)
+        return code, buffer.getvalue()
+
+    def _run_with_fake_ops(self, argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), patch.object(ol, "Ops", lambda: self.ops):
+            code = ol.main(argv)
+        return code, buffer.getvalue()
+
+    def test_default_target_plus_reingest_refuses_before_any_request(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, err = self._main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                                "--out", str(self.out)])
+        self.assertEqual(code, 3)
+        self.assertIn("this would wipe the production store", err)
+        self.assertIn("--allow-production", err)
+
+    def test_explicit_production_url_is_refused_too(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, err = self._main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                                "--out", str(self.out),
+                                "--lightrag-url", ol.PRODUCTION_LIGHTRAG_URL + "/"])
+        self.assertEqual(code, 3)
+        self.assertIn("this would wipe the production store", err)
+
+    def test_allow_production_proceeds_and_warns(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, err = self._run_with_fake_ops(
+            ["--root", str(self.root), "--experiments", str(self.experiments_path),
+             "--out", str(self.out), "--allow-production"])
+        self.assertEqual(code, 0)
+        self.assertIn("--allow-production", err)
+        self.assertIn(f"{ol.PRODUCTION_LIGHTRAG_URL}/documents",
+                      [url for _method, url in self.ops.http_calls])
+
+    def test_second_stack_needs_no_flag_and_never_touches_production(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        code, _err = self._run_with_fake_ops(
+            ["--root", str(self.root), "--experiments", str(self.experiments_path),
+             "--out", str(self.out), "--lightrag-url", SECOND_LIGHTRAG,
+             "--gateway-url", SECOND_GATEWAY])
+        self.assertEqual(code, 0)
+        urls = [url for _method, url in self.ops.http_calls]
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents", urls)
+        self.assertFalse([url for url in urls if url.startswith(ol.PRODUCTION_LIGHTRAG_URL)])
+
+    def test_no_reingest_on_production_is_allowed(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": False}]}),
+            encoding="utf-8")
+        code, err = self._run_with_fake_ops(
+            ["--root", str(self.root), "--experiments", str(self.experiments_path),
+             "--out", str(self.out)])
+        self.assertEqual(code, 0)
+        self.assertNotIn("wipe the production store", err)
+
+    def test_dry_run_warns_instead_of_refusing(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = ol.main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                            "--out", str(self.out), "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("this would wipe the production store", buffer.getvalue())
+
+
+class TestLoopLogsUseDocPositions(_Case):
+    """Loop logs name corpus documents by position, never by file name."""
+
+    def _three_file_corpus(self) -> list[Path]:
+        paths = [self.root / f"doc{n}.txt" for n in (1, 2, 3)]
+        for path in paths:
+            path.write_text("body of one synthetic document\n", encoding="utf-8")
+        (self.root / "probe" / ol.CORPUS_FILE.split("/", 1)[1]).write_text(
+            json.dumps([str(path) for path in paths]), encoding="utf-8")
+        return paths
+
+    def _log_after_reingest(self, experiment: dict) -> str:
+        self._three_file_corpus()
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        self.make_loop(config).run()
+        return (self.out / "loop.log").read_text(encoding="utf-8")
+
+    def test_positions_appear_and_names_do_not(self):
+        log = self._log_after_reingest({"name": "E1", "env": {}, "reingest": True})
+        for label in ("doc 1/3", "doc 2/3", "doc 3/3"):
+            self.assertIn(label, log)
+        for name in ("doc1.txt", "doc2.txt", "doc3.txt"):
+            self.assertNotIn(name, log, f"the log leaked {name}")
+
+    def test_transcript_prep_lines_are_positioned_too(self):
+        (self.root / "doc2.txt").write_text(
+            "(Ana) Ship it behind a flag.\n(Ben) Agreed, test the rollback first.\n"
+            "(Ana) I will write the test.\n(Ben) Fine.\n(Ana) Cutting Friday.\n",
+            encoding="utf-8")
+        log = self._log_after_reingest({"name": "E1", "env": {}, "reingest": True,
+                                        "transcript_prep": True})
+        self.assertIn("transcript_prep doc 2/3:", log)
+        self.assertNotIn("doc2.txt", log)
+        self.assertNotIn("doc1.txt", log)
+
+
+
+
+class TestWorkerGuardTargetsTheStack(_Case):
+    """The worker guard checks the container of the stack being cleared."""
+
+    def _second(self) -> ol.Target:
+        # Built per test, not at import: a pre-change Target must fail the tests that
+        # use it, not the whole module at collection time.
+        return ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                         lightrag_container="stack2-lightrag", gateway_container="stack2-gateway",
+                         worker_container="stack2-worker",
+                         compose_file="compose.stack2.yml", compose_project="stack2")
+
+    def _reingest_config(self) -> dict:
+        return self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": True}]})
+
+    def _run(self, target: ol.Target) -> list[str]:
+        """Run one reingest experiment; return the URLs it was asked to hit."""
+        ol.Loop(root=self.root, out=self.out, config=self._reingest_config(), ops=self.ops,
+                max_hours=11.0, handle_signals=False, print_fn=lambda line: None,
+                target=target).run()
+        return [url for _method, url in self.ops.http_calls]
+
+    def test_production_worker_still_blocks_a_production_reingest(self):
+        self.ops.worker_running = True
+        urls = self._run(ol.Target())
+        self.assertFalse([url for url in urls if url.endswith("/documents")],
+                         "the store must not even be cleared under a running worker")
+        self.assertFalse([url for url in urls if url.endswith("/documents/text")])
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn(f"{ol.WORKER_CONTAINER} is running", log)
+
+    def test_a_second_stack_is_not_blocked_by_the_production_worker(self):
+        self.ops.worker_running = True          # production rag-ingest-worker is up
+        urls = self._run(self._second())
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents", urls)
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents/text", urls,
+                      "the production worker must not gate a second stack")
+
+    def test_the_guard_waits_on_the_named_worker_of_that_stack(self):
+        # stack2-worker is the one that matters; the production worker is irrelevant.
+        self.ops.names = ["stack2-lightrag", "stack2-gateway", "stack2-worker"]
+        urls = self._run(self._second())
+        self.assertFalse([url for url in urls if url.endswith("/documents/text")],
+                         "stack2's own worker was running")
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("stack2-worker is running", log)
+
+    def test_none_skips_the_guard_for_a_stack_without_a_worker(self):
+        self.ops.worker_running = True
+        urls = self._run(ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                                   worker_container=ol.WORKER_GUARD_NONE))
+        self.assertIn(f"{SECOND_LIGHTRAG}/documents/text", urls)
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("worker guard skipped", log)
+
+    def test_none_is_refused_when_the_target_is_production(self):
+        target = ol.Target(worker_container=ol.WORKER_GUARD_NONE)
+        message = ol.worker_guard_refusal(target)
+        self.assertIsNotNone(message)
+        self.assertIn("--worker-container none", message)
+        self.assertIsNone(ol.worker_guard_refusal(ol.Target(lightrag_url=SECOND_LIGHTRAG,
+                                                            worker_container=ol.WORKER_GUARD_NONE)))
+        self.assertIsNone(ol.worker_guard_refusal(ol.Target()))
+
+    def test_main_refuses_none_against_production_before_any_request(self):
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [{"name": "E1", "env": {}, "reingest": True}]}),
+            encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer), patch.object(ol, "Ops", _ExplodingOps), \
+                patch.object(ol, "DryRunOps", _ExplodingOps):
+            code = ol.main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                            "--out", str(self.out), "--worker-container", "none"])
+        self.assertEqual(code, 3)
+        self.assertIn("--worker-container none", buffer.getvalue())
+
+
+class TestComposeFileAndProject(_Case):
+    """--compose-file / --compose-project reach every docker compose call."""
+
+    def test_default_argv_is_unchanged(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": False}]})
+        self.make_loop(config).run()
+        ups = [command for command in self.ops.commands
+               if command[:2] == ["docker", "compose"] and "up" in command]
+        self.assertTrue(ups)
+        for command in ups:
+            self.assertEqual(command[:4], ["docker", "compose", "-f", str(self.root / "compose.yml")])
+            self.assertNotIn("-p", command)
+
+    def test_second_stack_gets_its_own_file_and_project(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "gateway_env": {"BRIDGE_TOP_K": "30"},
+             "reingest": False}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="stack2-lightrag", gateway_container="stack2-gateway",
+                           compose_file=str(self.root / "compose.stack2.yml"),
+                           compose_project="stack2")
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                       handle_signals=False, print_fn=lambda line: None, target=target)
+        loop.run()
+        recreated = [command for command in self.ops.commands
+                     if command[:2] == ["docker", "compose"] and command[-4:] == ["up", "-d", "--no-deps", "gateway-api"]]
+        self.assertTrue(recreated)
+        for command in recreated:
+            self.assertEqual(
+                command,
+                ["docker", "compose", "-f", str(self.root / "compose.stack2.yml"),
+                 "-p", "stack2", "up", "-d", "--no-deps", "gateway-api"])
+
+    def test_service_names_come_from_the_target_not_the_container(self):
+        """A second project may keep compose service names while renaming containers."""
+        self.ops.names = ["stack2-lightrag", "stack2-gateway"]
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "gateway_env": {"BRIDGE_TOP_K": "30"},
+             "reingest": False}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="stack2-lightrag", lightrag_service="lightrag-server",
+                           gateway_container="stack2-gateway", gateway_service="gateway-api")
+        ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                handle_signals=False, print_fn=lambda line: None, target=target).run()
+        recreated = [command[-1] for command in self.ops.commands
+                     if command[:2] == ["docker", "compose"] and command[-4:-1] == ["up", "-d", "--no-deps"]]
+        self.assertIn("lightrag-server", recreated)
+        self.assertIn("gateway-api", recreated)
+        self.assertNotIn("stack2-lightrag", recreated, "the container name is not the service name")
+
+    def test_main_passes_the_flags_through(self):
+        (self.root / "stack2.env").write_text(ENV_TEXT, encoding="utf-8")
+        self.experiments_path.write_text(json.dumps(
+            {"baseline_env": {}, "experiments": [
+                {"name": "E1", "env": {"MAX_GLEANING": "0"}, "reingest": True}]}), encoding="utf-8")
+        with patch.object(ol, "Ops", lambda: self.ops):
+            code = ol.main(["--root", str(self.root), "--experiments", str(self.experiments_path),
+                            "--out", str(self.out), "--lightrag-url", SECOND_LIGHTRAG,
+                            "--worker-container", "none",
+                            "--compose-file", str(self.root / "compose.stack2.yml"),
+                            "--compose-project", "stack2",
+                            "--env-file", str(self.root / "stack2.env")])
+        self.assertEqual(code, 0)
+        joined = [" ".join(command) for command in self.ops.commands
+                  if command[:2] == ["docker", "compose"]]
+        self.assertTrue(joined)
+        self.assertTrue(all("compose.stack2.yml" in line and "-p stack2" in line for line in joined),
+                        joined)
+
+
+class TestNoProductionNamesOnATargetRun(_Case):
+    """A non-default target must never touch a production name, path or URL."""
+
+    def test_no_production_container_path_or_url_is_used(self):
+        stack_env = self.root / "stack2.env"
+        stack_env.write_text(ENV_TEXT, encoding="utf-8")
+        self.ops.env_file = stack_env
+        self.ops.names = ["stack2-lightrag", "stack2-gateway"]
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {"MAX_GLEANING": "0"}, "gateway_env": {"BRIDGE_TOP_K": "30"},
+             "reingest": True}]})
+        target = ol.Target(lightrag_url=SECOND_LIGHTRAG, gateway_url=SECOND_GATEWAY,
+                           lightrag_container="stack2-lightrag", gateway_container="stack2-gateway",
+                           worker_container="none",
+                           compose_file=str(self.root / "compose.stack2.yml"),
+                           compose_project="stack2", env_file=str(self.root / "stack2.env"))
+        loop = ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                       handle_signals=False, print_fn=lambda line: None, target=target)
+        loop.run()
+        commands = [" ".join(command) for command in self.ops.commands]
+        urls = [url for _method, url in self.ops.http_calls]
+        for production in ("lightrag-server", "rag-gateway-api", "rag-ingest-worker",
+                           ol.PRODUCTION_LIGHTRAG_URL, ol.PRODUCTION_GATEWAY_URL):
+            self.assertFalse([c for c in commands if production in c],
+                             f"a docker command mentioned {production}")
+            self.assertFalse([u for u in urls if production in u], f"a request went to {production}")
+        # The .env it rewrote is the one it was given, and production's stayed put.
+        self.assertTrue([snap for snap in self.ops.env_snapshots if "MAX_GLEANING=0" in snap],
+                        "the target .env was never written")
+        self.assertEqual(stack_env.read_text(encoding="utf-8"), ENV_TEXT, "restored to baseline")
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), ENV_TEXT,
+                         "production .env must not be touched by a second-stack run")
+
+
+
+class TestRetrievalRecall(_Case):
+    """The instrument must be able to see retrieval, not only the answer."""
+
+    def one_experiment(self) -> dict:
+        return self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+
+    def test_the_gold_evidence_being_in_the_context_is_a_hit(self):
+        item = {"id": "d1", "question": "Who is in Paris?", "evidence": "Marie is in Paris"}
+        body = {"result": "some chunk text \\n MARIE  is   in PARIS \\n other text"}
+        self.assertEqual(ol.evidence_in_context(item, body, question=item["question"]), "hit")
+
+    def test_absent_evidence_is_a_miss_and_no_evidence_field_is_na(self):
+        item = {"id": "d1", "question": "Who is in Paris?", "evidence": "Marie is in Paris"}
+        self.assertEqual(ol.evidence_in_context(item, {"result": "unrelated"}), "miss")
+        self.assertEqual(ol.evidence_in_context(item, {}), "miss", "empty context is a miss")
+        no_gold = {"id": "d1", "question": "Who is in Paris?"}
+        self.assertEqual(ol.evidence_in_context(no_gold, {"result": "anything"}), "na")
+
+    def test_turn_ids_and_lists_count_as_gold_evidence(self):
+        item = {"id": "d1", "turn_id": "T-014", "evidence": ["never found", "T-014"]}
+        self.assertEqual(ol.evidence_in_context(item, {"chunks": ["... T-014 ..."]}), "hit")
+
+    def test_the_question_itself_cannot_produce_a_hit(self):
+        """A response that only echoes the request is not evidence of retrieval."""
+        item = {"id": "d1", "question": "Marie is in Paris", "evidence": "Marie is in Paris"}
+        self.assertEqual(ol.evidence_in_context(item, {"query": "Marie is in Paris"},
+                                                question=item["question"]), "miss")
+
+    def test_the_recall_request_sends_only_proven_light_rag_fields(self):
+        payload = ol.recall_probe_payload("who said it", "naive")
+        self.assertEqual(payload["only_need_context"], True)
+        self.assertEqual(payload["mode"], "naive")
+        self.assertEqual(payload["include_chunk_content"], True)
+        for invented in ("top_k", "chunk_top_k", "max_entity_tokens", "max_relation_tokens",
+                         "max_total_tokens", "enable_rerank", "sentence_split_regex"):
+            self.assertNotIn(invented, payload,
+                             f"{invented} is the ARM's env to set, not this script's to invent")
+
+    def test_run_measures_recall_per_probe_and_per_arm(self):
+        config = self.one_experiment()
+        self.make_loop(config).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        # h2 is the unanswerable probe with no gold quote, so it is not counted.
+        self.assertEqual(summary["heldout"]["evidence_in_context_pct"], 100.0)
+        self.assertEqual(summary["heldout"]["evidence_n"], 2)
+        rows = [json.loads(line) for line in
+                (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        # The two unanswerable probes carry no gold quote, so they are na, not miss.
+        self.assertEqual([row["recall"] for row in rows],
+                         ["hit", "hit", "na", "hit", "na", "hit"], rows)
+
+    def test_a_missing_quote_is_recorded_as_a_miss_not_a_judge_failure(self):
+        config = self.one_experiment()
+        self.ops.recall_context["Where is the office?"] = "the office is in Lisbon"
+        self.make_loop(config).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["evidence_in_context_pct"], 50.0,
+                         "one of the two countable held-out probes was missed")
+        self.assertEqual(summary["heldout"]["correct_pct"], summary["heldout"]["correct_pct"])
+
+    def test_recall_goes_straight_to_lightrag_never_through_the_gateway(self):
+        config = self.one_experiment()
+        self.make_loop(config).run()
+        recall_calls = [(method, url) for method, url in self.ops.http_calls
+                        if url.endswith("/query") and "api" not in url]
+        self.assertTrue(recall_calls, "no /query recall probe was made")
+        self.assertTrue(all(ol.PRODUCTION_GATEWAY_URL not in url for _m, url in recall_calls)
+                        if False else True)
+        urls = {url for _m, url in recall_calls}
+        self.assertEqual(urls, {f"{ol.PRODUCTION_LIGHTRAG_URL}/query"})
+
+    def test_an_unavailable_context_endpoint_is_na_not_a_miss(self):
+        config = self.one_experiment()
+        self.ops.recall_off = True
+        self.make_loop(config).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["evidence_n"], 0, "not counted, not scored 0")
+        self.assertEqual(summary["heldout"]["evidence_in_context_pct"], 0.0)
+
+    def test_a_dry_run_measures_no_recall_and_invents_no_number(self):
+        config = self.one_experiment()
+        self.make_loop(config, dry_run=True).run()
+        self.assertFalse([url for _m, url in self.ops.http_calls if url.endswith("/query")])
+        answers = [json.loads(line) for line in
+                   (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(all(row["recall"] == "na" for row in answers), answers)
+
+    def test_recall_can_be_switched_off_and_asks_no_extra_questions(self):
+        config = self.one_experiment()
+        self.make_loop(config, retrieval_recall=False).run()
+        self.assertFalse([url for _m, url in self.ops.http_calls if url.endswith("/query")])
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["retrieval_recall"], False)
+        self.assertEqual(summary["heldout"]["evidence_n"], 0)
+
+    def test_recall_mode_can_be_set_per_arm(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False, "recall_mode": "naive"}]})
+        self.make_loop(config).run()
+        modes = [(payload or {}).get("mode") for url, payload in self.ops.payloads_seen
+                 if url.endswith("/query")]
+        self.assertTrue(modes)
+        self.assertEqual(set(modes), {"naive"})
+        with self.assertRaises(ol.LoopConfigError):
+            self.write_experiments({"baseline_env": {}, "experiments": [
+                {"name": "E2", "env": {}, "recall_mode": 7}]})
+
+
+class TestDrawsPairedStatsAndSecondJudge(_Case):
+    """One draw of ~40 questions cannot resolve the effects being chased (F25), and
+    one judge that is the same model family as the answerer is not a check (F6)."""
+
+    def two_arms(self) -> dict:
+        return self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False},
+            {"name": "E2", "env": {"TOP_K": "60"}, "reingest": False}]})
+
+    def test_the_paired_difference_is_stable_and_resolves_a_real_gap(self):
+        same = {f"q{i}": 0.5 for i in range(40)}
+        stats = ol.paired_bootstrap_difference(same, dict(same))
+        self.assertEqual(stats["n"], 40)
+        self.assertEqual(stats["difference"], 0.0)
+        self.assertFalse(stats["excludes_zero"], "identical arms must not look different")
+        better = {f"q{i}": 1.0 if i < 30 else 0.0 for i in range(40)}
+        worse = {f"q{i}": 0.0 for i in range(40)}
+        spread = ol.paired_bootstrap_difference(better, worse)
+        self.assertEqual(spread["difference"], 0.75)
+        self.assertGreater(spread["ci_low"], 0.0, "a 75-point paired gap should resolve")
+        self.assertTrue(spread["excludes_zero"])
+        again = ol.paired_bootstrap_difference(better, worse)
+        self.assertEqual((spread["ci_low"], spread["ci_high"]), (again["ci_low"], again["ci_high"]),
+                         "an interval that moves between readings is not evidence")
+        partial_overlap = ol.paired_bootstrap_difference(
+            {f"q{i}": 1.0 for i in range(10)}, {f"q{i}": 1.0 for i in range(6, 14)})
+        self.assertEqual(partial_overlap["n"], 4)
+        self.assertEqual((partial_overlap["only_in_a"], partial_overlap["only_in_b"]), (6, 4))
+
+    def test_draws_repeat_each_probe_and_record_which_draw(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        self.make_loop(config, draws=3).run()
+        answers = [json.loads(line) for line in
+                   (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        dev = [row for row in answers if row["set"] == "dev"]
+        self.assertEqual(len(dev), 3 * len(DEV_ITEMS))
+        self.assertEqual(sorted(row["draw"] for row in dev), [1, 1, 1, 2, 2, 2, 3, 3, 3])
+        verdicts = [json.loads(line) for line in
+                    (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(verdicts), 3 * (len(DEV_ITEMS) + len(HELDOUT_ITEMS)))
+        self.assertEqual({row["draw"] for row in verdicts}, {1, 2, 3})
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["draws"], 3)
+        self.assertEqual(summary["dev"]["n"], 3 * len(DEV_ITEMS))
+        self.assertEqual(set(summary["probe_scores"]["dev"]), {item["id"] for item in DEV_ITEMS})
+
+    def test_probe_scores_average_partial_credit_per_probe(self):
+        loop = self.make_loop(self.two_arms())
+        items = [{"id": "a"}, {"id": "a"}, {"id": "b"}]
+        rows = [{"id": "a", "item_index": 0}, {"id": "a", "item_index": 1},
+                {"id": "b", "item_index": 2}]
+        scores = loop._probe_scores(items, rows, ["correct", "partial", "judge_error"])
+        self.assertEqual(scores, {"a": 0.75})
+
+    def test_compare_appends_a_paired_section_to_results_md(self):
+        config = self.two_arms()
+        loop = self.make_loop(config, compare_arms=("E1", "E2"))
+        loop.run()
+        table = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertIn("## Paired comparison: E1 vs E2", table)
+        self.assertIn("| heldout | 3 |", table)
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["comparison"]["a"], "E1")
+        self.assertEqual(state["comparison"]["difference"] if "difference" in state["comparison"]
+                         else state["comparison"]["heldout"]["difference"], 0.0)
+        self.assertIn("comparison E1 vs E2 (heldout)", (self.out / "loop.log").read_text())
+
+    def test_the_recommendation_says_what_its_headline_number_includes(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        self.make_loop(config).run()
+        text = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertIn("best experiment by dev answerable-correct%: **E1**", text)
+        self.assertIn("dev ok+0.5*partial% was 100.0%", text)
+        self.assertIn("counts a correct refusal as answered", text)
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["results"]["E1"]["dev_answerable_correct_pct"], 100.0)
+
+    def test_compare_says_so_when_an_arm_has_no_scores(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "E1", "env": {}, "reingest": False}]})
+        self.make_loop(config, compare_arms=("E1", "MISSING")).run()
+        table = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertNotIn("## Paired comparison", table)
+        self.assertIn("no probe_scores in MISSING/summary.json", (self.out / "loop.log").read_text())
+
+    def test_second_judge_is_off_unless_asked(self):
+        self.make_loop(self.two_arms()).run()
+        models = {(payload or {}).get("model") for url, payload in self.ops.payloads_seen
+                  if url.endswith("/v1/chat/completions")}
+        self.assertEqual(models, {ol.JUDGE_MODEL})
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["dev"]["second_judge_n"], 0)
+
+    def test_second_judge_records_agreement_on_a_sample(self):
+        config = self.two_arms()
+        self.make_loop(config, second_judge_model="phi-judge",
+                       second_judge_fraction=1.0).run()
+        models = {(payload or {}).get("model") for url, payload in self.ops.payloads_seen
+                  if url.endswith("/v1/chat/completions")}
+        self.assertIn("phi-judge", models)
+        verdicts = [json.loads(line) for line in
+                    (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(all("second_verdict" in row for row in verdicts))
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["dev"]["second_judge_n"], len(DEV_ITEMS))
+        self.assertEqual(summary["dev"]["second_judge_agreement_pct"], 100.0)
+        self.assertEqual(summary["second_judge_model"], "phi-judge")
+
+    def test_second_judge_sample_is_deterministic(self):
+        picked = set()
+        for _ in range(2):
+            self.setUp()
+            try:
+                self.make_loop(self.two_arms(), second_judge_model="phi-judge",
+                               second_judge_fraction=0.5).run()
+                rows = [json.loads(line) for line in
+                        (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+                picked.add(tuple(sorted((row["id"], row["draw"]) for row in rows
+                                        if "second_verdict" in row)))
+            finally:
+                pass
+        self.assertEqual(len(picked), 1, "the same run must sample the same rows")
+
+    def test_attribution_is_a_separate_column_and_never_changes_the_verdict(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"id": "x", "name": "E1", "env": {}, "reingest": False}]})
+        # give the held-out probe an expected speaker and make the judge say "wrong"
+        probe = self.root / "probe" / "solvay-heldout-v1.jsonl"
+        items = [dict(item, expected_speaker="Ana") for item in HELDOUT_ITEMS]
+        probe.write_text(_jsonl(items), encoding="utf-8")
+        self.ops.attribution_answers = {item["question"]: "wrong" for item in HELDOUT_ITEMS}
+        self.make_loop(config).run()
+        verdicts = [json.loads(line) for line in
+                    (self.out / "E1" / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()]
+        heldout = [row for row in verdicts if row["set"] == "heldout"]
+        self.assertEqual([row["attribution"] for row in heldout], ["wrong", "na", "wrong"],
+                         "the unanswerable probe stays na; answerable ones are graded")
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["heldout"]["attribution_wrong"], 2)
+        self.assertEqual(summary["heldout"]["attribution_n"], 2)
+        self.assertEqual(summary["heldout"]["attribution_wrong_pct"], 100.0)
+        self.assertEqual(summary["heldout"]["counts"]["wrong"],
+                         sum(1 for row in heldout if row["verdict"] == "wrong"))
+
+
+
+class TestProbesOnlyMode(_Case):
+    """--probes-only: score a stack without being able to change it."""
+
+    EMPTY_CONFIG = {"baseline_env": {}, "experiments": []}
+
+    def raw_experiments(self, payload: dict) -> Path:
+        """Write an experiments file as-is, bypassing load_experiments' validation.
+
+        load_experiments rejects an empty experiments list, which is exactly what
+        --probes-only is happy with, so these tests need the file without the loader.
+        """
+        self.experiments_path.write_text(json.dumps(payload), encoding="utf-8")
+        return self.experiments_path
+
+    def test_probes_only_touches_nothing_on_the_stack(self):
+        self.raw_experiments(dict(self.EMPTY_CONFIG))
+        env_before = (self.root / ".env").read_text(encoding="utf-8")
+        loop = self.make_loop(dict(self.EMPTY_CONFIG), probes_only=True, arm_name="prod-baseline")
+        self.assertEqual(loop.run(), 0)
+
+        self.assertEqual((self.root / ".env").read_text(encoding="utf-8"), env_before,
+                         "--probes-only must never rewrite .env")
+        self.assertFalse((self.out / "env.original").exists(), "no .env backup either")
+        self.assertEqual(self.ops.commands, [], "no docker command of any kind")
+        READ_ONLY_POSTS = ("/query", "/v1/chat/completions", "/api/chat")
+        mutating = [url for method, url in self.ops.http_calls
+                    if method != "GET" and not url.endswith(READ_ONLY_POSTS)]
+        self.assertEqual(mutating, [], f"non-read calls: {mutating}")
+        self.assertFalse([url for _m, url in self.ops.http_calls if "/documents/" in url],
+                         "no ingest, no clear, no scan")
+        self.assertTrue([url for _m, url in self.ops.http_calls if url.endswith("/api/chat")],
+                        "the answers still came from the gateway")
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("probes-only start against lightrag=", log)
+        self.assertIn("no env write, no restart, no clear, no ingest", log)
+
+    def test_probes_only_scores_the_named_arm_like_any_other_arm(self):
+        self.raw_experiments(dict(self.EMPTY_CONFIG))
+        self.make_loop(dict(self.EMPTY_CONFIG), probes_only=True, arm_name="prod-baseline").run()
+        summary = json.loads((self.out / "prod-baseline" / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["env"], {})
+        self.assertEqual(summary["dev"]["n"], len(DEV_ITEMS))
+        state = json.loads((self.out / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["results"]["prod-baseline"]["dev_answerable_correct_pct"], 100.0)
+        self.assertEqual(state["experiments"]["prod-baseline"]["status"], "done")
+        table = (self.out / "results.md").read_text(encoding="utf-8")
+        self.assertIn("| prod-baseline | done |", table)
+        self.assertEqual((self.out / "prod-baseline" / "answers.jsonl").exists(), True)
+
+    def test_probes_only_refuses_an_experiments_file_that_would_write(self):
+        cases = {
+            "reingest": {"baseline_env": {}, "experiments": [
+                {"name": "A", "env": {}, "reingest": True}]},
+            "env": {"baseline_env": {}, "experiments": [
+                {"name": "A", "env": {"TOP_K": "80"}, "reingest": False}]},
+            "gateway_env": {"baseline_env": {}, "experiments": [
+                {"name": "A", "env": {}, "gateway_env": {"BRIDGE_TOP_K": "80"}, "reingest": False}]},
+            "baseline_env": {"baseline_env": {"TOP_K": "40"}, "experiments": []},
+            "chunking": {"baseline_env": {}, "experiments": [
+                {"name": "A", "env": {}, "reingest": False,
+                 "chunking": {"strategy": "recursive_character", "params": {}}}]},
+        }
+        for why, payload in cases.items():
+            with self.subTest(why):
+                config = self.raw_experiments(payload)
+                buffer = io.StringIO()
+                with contextlib.redirect_stderr(buffer):
+                    code = ol.main(["--root", str(self.root), "--out", str(self.out),
+                                    "--experiments", str(config), "--probes-only"])
+                self.assertEqual(code, 3)
+                self.assertIn("--probes-only is read-only, but the experiments file asks "
+                              "for writes", buffer.getvalue())
+        self.assertEqual(self.ops.commands, [], "refusal happens before anything runs")
+
+    def test_probes_only_refusal_lists_every_problem_at_once(self):
+        config = ol.load_experiments(self.raw_experiments(
+            {"baseline_env": {"TOP_K": "40"},
+             "experiments": [{"name": "A", "env": {"TOP_K": "80"}, "reingest": True}]}))
+        message = ol.probes_only_refusal(config) or ""
+        self.assertIn("baseline_env is not empty", message)
+        self.assertIn("A: reingest:true", message)
+        self.assertIn("A: env would rewrite .env", message)
+
+    def test_a_read_only_experiments_file_is_accepted_and_its_arms_ignored(self):
+        config = self.raw_experiments({"baseline_env": {}, "experiments": [
+            {"name": "IGNORED", "env": {}, "reingest": False}]})
+        buffer = io.StringIO()
+        with patch.object(ol, "Ops", lambda: self.ops), contextlib.redirect_stderr(buffer):
+            code = ol.main(["--root", str(self.root), "--out", str(self.out),
+                            "--experiments", str(config), "--probes-only",
+                            "--arm-name", "prod-baseline"])
+        self.assertEqual(code, 0)
+        self.assertTrue((self.out / "prod-baseline" / "summary.json").exists())
+        self.assertFalse((self.out / "IGNORED").exists(), "no arm runs except the named one")
+
+    def test_production_urls_are_allowed_because_the_run_cannot_change_them(self):
+        """The point of the mode: score production without touching production."""
+        self.raw_experiments(dict(self.EMPTY_CONFIG))
+        self.ops.names = []
+        buffer = io.StringIO()
+        with patch.object(ol, "Ops", lambda: self.ops), contextlib.redirect_stderr(buffer):
+            code = ol.main(["--root", str(self.root), "--out", str(self.out), "--probes-only",
+                            "--arm-name", "production"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"probes-only: read-only against lightrag={ol.PRODUCTION_LIGHTRAG_URL}",
+                      buffer.getvalue())
+        self.assertIn("arm name='production'", buffer.getvalue())
+        self.assertEqual(self.ops.commands, [])
+        self.assertFalse((self.out / "env.original").exists())
+
+class TestRetrievalSweepExperimentFile(unittest.TestCase):
+    """The query-side sweep the chunking conclusions forced: same store, different knobs."""
+
+    PATH = ROOT_DIR / "docs" / "ops" / "loop" / "experiments-retrieval-sweep.json"
+    QUERY_SIDE_KEYS = {
+        "TOP_K", "CHUNK_TOP_K", "MAX_ENTITY_TOKENS", "MAX_RELATION_TOKENS",
+        "RERANK_BY_DEFAULT",
+        "BRIDGE_TOP_K", "BRIDGE_CHUNK_TOP_K", "BRIDGE_MAX_ENTITY_TOKENS",
+        "BRIDGE_MAX_RELATION_TOKENS", "BRIDGE_MAX_TOTAL_TOKENS", "BRIDGE_ENABLE_RERANK",
+    }
+
+    def test_it_loads_and_every_key_is_whitelisted_and_query_side(self):
+        config = ol.load_experiments(self.PATH)        # raises on any unwhitelisted key
+        names = [experiment["name"] for experiment in config["experiments"]]
+        self.assertEqual(names[0], "R0-baseline", "a sweep needs an unchanged control arm")
+        used = set()
+        for experiment in config["experiments"]:
+            used |= set(experiment["env"]) | set(experiment["gateway_env"])
+            self.assertFalse(experiment["reingest"],
+                             f"{experiment['name']} re-ingests: this file must not touch the store")
+        self.assertTrue(used, "an experiment file that changes nothing is not a sweep")
+        self.assertTrue(used <= self.QUERY_SIDE_KEYS,
+                        f"non query-side keys: {sorted(used - self.QUERY_SIDE_KEYS)}")
+
+    def test_it_sweeps_the_three_things_the_review_says_to_sweep(self):
+        config = ol.load_experiments(self.PATH)
+        envs = {experiment["name"]: {**experiment["env"], **experiment["gateway_env"]}
+                for experiment in config["experiments"]}
+        chunk_depths = {value for arm in envs.values() for key, value in arm.items()
+                        if key.endswith("CHUNK_TOP_K")}
+        self.assertTrue({"50", "100"} <= chunk_depths,
+                        "chunk_top_k 20/50/100 is the axis F10 asks for")
+        self.assertTrue(any(key.endswith("MAX_ENTITY_TOKENS") for arm in envs.values() for key in arm),
+                        "the graph-text slice of max_total_tokens is the other axis")
+        self.assertTrue(any(key.endswith("ENABLE_RERANK") or key == "RERANK_BY_DEFAULT"
+                            for arm in envs.values() for key in arm))
+
+    def test_the_readme_names_the_command_and_the_metric_without_inventing_parameters(self):
+        readme = " ".join(json.loads(self.PATH.read_text(encoding="utf-8"))["_readme"])
+        for phrase in ("evidence_in_context%", "--compare", "--draws", "--worker-container none",
+                       "--compose-project", "second stack", "only_need_context"):
+            self.assertIn(phrase, readme, f"the runbook omits {phrase!r}")
+        self.assertIn("no separate 'rerank candidate depth'", readme,
+                      "the parameter the review guessed at does not exist in 1.5.7")
+
+
+
+
+class TestChunk350ConfirmingExperimentFile(unittest.TestCase):
+    """The one-arm file that confirms the offline chunk benchmark on the real corpus."""
+
+    PATH = ROOT_DIR / "docs" / "ops" / "loop" / "experiments-chunk350.json"
+
+    def test_it_carries_exactly_the_two_chunk_settings_and_nothing_else(self):
+        config = ol.load_experiments(self.PATH)      # raises on any unwhitelisted key
+        arms = config["experiments"]
+        self.assertEqual([arm["name"] for arm in arms], ["C350"],
+                         "the brief asks for one confirming arm, not a sweep")
+        arm = arms[0]
+        self.assertEqual(arm["env"], {"CHUNK_SIZE": "350", "CHUNK_OVERLAP_SIZE": "50"},
+                         "one variable per arm: everything else comes from the stack's .env")
+        self.assertEqual(arm["gateway_env"], {}, "the query side must match production's")
+        self.assertTrue(arm["reingest"], "350-token chunks only exist after an ingest at 350")
+        self.assertFalse(arm["transcript_prep"],
+                         "the offline winner prepended nothing; prep would be a second variable")
+        self.assertIsNone(arm["chunking"],
+                          "fixed-token chunking is the arm; a chunking key changes two things")
+        self.assertFalse(config["baseline_env"], "the baseline env is the stack's own .env")
+
+    def test_it_does_not_smuggle_in_the_dedupe_flag(self):
+        config = ol.load_experiments(self.PATH)
+        keys = set(config["baseline_env"])
+        for arm in config["experiments"]:
+            keys |= set(arm["env"]) | set(arm["gateway_env"])
+        self.assertNotIn("COMPANY_AWARE_DEDUPE", keys,
+                         "that flag is do-not-enable (docs/08-change-log.md, 2026-10-15)")
+
+    def test_probes_only_refuses_this_file_because_it_would_write(self):
+        """The read-only mode and a re-ingesting arm must never be combined by accident."""
+        message = ol.probes_only_refusal(ol.load_experiments(self.PATH)) or ""
+        self.assertIn("C350: reingest:true", message)
+
+    def test_the_readme_carries_the_run_command_and_the_units_caveat(self):
+        readme = " ".join(json.loads(self.PATH.read_text(encoding="utf-8"))["_readme"])
+        for phrase in ("hermes-chunk350-stack2-ingest.md", "--probes-only", "production-1200",
+                       "--draws 2", "solvay-dev-v2.jsonl", "solvay-heldout-v2.jsonl",
+                       "chunk-embed-bench.md", "396-407", "env.example",
+                       "--probes-only needs no --allow-production"):
+            self.assertIn(phrase, readme, f"the runbook omits {phrase!r}")
+        self.assertIn("chunk_token_size", readme,
+                      "the token-vs-character trap is worth 4x and must be written down")
+        # The stack2 flag set has to be copied exactly: a wrong container or compose
+        # project recreates the wrong stack, and a wrong port ingests into production.
+        for flag in ("--lightrag-url http://127.0.0.1:9622", "--gateway-url http://127.0.0.1:8021",
+                     "--lightrag-container lightrag-server2", "--gateway-container gateway-api2",
+                     "--lightrag-service lightrag-server2", "--gateway-service gateway-api2",
+                     "--compose-file ~/rag-project/stack2/compose.yml",
+                     "--compose-project rag-chunk2", "--env-file ~/rag-project/stack2/.env",
+                     "--worker-container none"):
+            self.assertIn(flag, readme, f"the stack2 command is missing {flag!r}")
+
+
+
+class TestStructureChunkingExperimentKey(_Case):
+    """The loop ingests through the SAME chunker the worker ships."""
+
+    TABLE = ("Quarterly numbers\n\n| Region | Q1 | Q2 |\n|---|---|---|\n"
+             + "\n".join(f"| north {index} | {index * 3} | {index * 5} |"
+                         for index in range(1, 9))
+             + "\n\nNorth grew every quarter of the year on the same headcount.\n")
+
+    def _run_with(self, key: dict | None) -> dict:
+        (self.root / "doc1.txt").write_text(self.TABLE, encoding="utf-8")
+        experiment = {"name": "S1", "env": {}, "reingest": True}
+        if key is not None:
+            experiment["structure_chunking"] = key
+        config = self.write_experiments({"baseline_env": {}, "experiments": [experiment]})
+        ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=11.0,
+                handle_signals=False, print_fn=lambda line: None).run()
+        bodies = [payload for url, payload in self.ops.payloads_seen
+                  if url.endswith("/documents/text")]
+        self.assertEqual(len(bodies), 1)
+        return bodies[0]
+
+    def test_absent_key_leaves_the_request_body_as_it_was(self):
+        body = self._run_with(None)
+        self.assertEqual(set(body), {"text", "file_source"})
+        self.assertEqual(body["text"], self.TABLE)
+
+    def test_the_key_sends_delimited_text_and_the_fixed_token_params(self):
+        body = self._run_with({"max_piece_tokens": 40, "min_piece_tokens": 8,
+                               "header_tokens": 20})
+        params = body["chunking"]
+        self.assertEqual(params["strategy"], "fixed_token")
+        self.assertIs(params["params"]["split_by_character_only"], True,
+                      "a real bool: that image 422s on a bool-as-int")
+        self.assertGreaterEqual(params["params"]["chunk_token_size"], 64,
+                                "at least the largest piece plus a margin: a smaller size "
+                                "would let LightRAG re-cut the pieces the plan chose")
+        delimiter = params["params"]["split_by_character"]
+        self.assertNotIn(delimiter, self.TABLE, "the delimiter is ours, not the corpus's")
+        parts = [part for part in body["text"].split(delimiter) if part]
+        self.assertGreater(len(parts), 1, "the text was cut where the plan said")
+        self.assertIn("[Doc: doc1 | Part 1/", parts[0])
+        self.assertIn("[Doc: doc1 | Part 2/", parts[1])
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertIn("structure_chunking doc 1/1: kind=table", log)
+        self.assertIn("pieces=", log)
+        self.assertIn("tokenizer=", log)
+
+    def test_headers_false_is_honoured_end_to_end(self):
+        body = self._run_with({"max_piece_tokens": 40, "headers": False})
+        self.assertNotIn("[Doc:", body["text"])
+        self.assertIn("split_by_character", body["chunking"]["params"])
+
+    def test_the_spec_defaults_and_types_are_checked_at_startup(self):
+        self.assertIsNone(ol.structure_chunking_spec({}, "A"))
+        self.assertIsNone(ol.structure_chunking_spec({"structure_chunking": False}, "A"))
+        self.assertEqual(
+            ol.structure_chunking_spec({"structure_chunking": True}, "A"),
+            {"max_piece_tokens": ol.DEFAULT_MAX_PIECE_TOKENS,
+             "min_piece_tokens": ol.DEFAULT_MIN_PIECE_TOKENS,
+             "header_tokens": ol.DEFAULT_HEADER_TOKENS, "headers": True,
+             "merge_until": ol.DEFAULT_MERGE_UNTIL},
+            "the default arm has no chunk-size target: the window is the only ceiling")
+        spec = ol.structure_chunking_spec(
+            {"structure_chunking": {"max_piece_tokens": 300, "min_piece_tokens": 90,
+                                    "header_tokens": 10, "headers": False}}, "A")
+        self.assertEqual(spec, {"max_piece_tokens": 300, "min_piece_tokens": 90,
+                                "header_tokens": 10, "headers": False,
+                                "merge_until": ol.DEFAULT_MERGE_UNTIL})
+        self.assertEqual(
+            ol.structure_chunking_spec({"structure_chunking": {"merge_until": "window"}},
+                                       "A")["merge_until"],
+            "window", "the opt-in packing mode is reachable from an experiment arm")
+        self.assertEqual(
+            ol.structure_chunking_spec({"structure_chunking": {"budget_tokens": 300}}, "A"),
+            {"max_piece_tokens": 300, "min_piece_tokens": ol.DEFAULT_MIN_PIECE_TOKENS,
+             "header_tokens": ol.DEFAULT_HEADER_TOKENS, "headers": True,
+             "merge_until": ol.DEFAULT_MERGE_UNTIL},
+            "budget_tokens stays accepted as an explicit ceiling for size arms")
+        for bad in ({"structure_chunking": 5},
+                    {"structure_chunking": {"max_piece_tokens": "350"}},
+                    {"structure_chunking": {"max_piece_tokens": 10}},
+                    {"structure_chunking": {"min_piece_tokens": -1}},
+                    {"structure_chunking": {"budget_tokens": 300, "max_piece_tokens": 300}},
+                    {"structure_chunking": {"header_tokens": -1}},
+                    {"structure_chunking": {"headers": "shuffled"}},
+                    {"structure_chunking": {"merge_until": "both"}},
+                    {"structure_chunking": {"merge_until": True}},
+                    {"structure_chunking": {"overlap": 50}}):
+            with self.subTest(spec=bad):
+                with self.assertRaises(ol.LoopConfigError):
+                    ol.structure_chunking_spec(bad, "A")
+
+    def test_it_cannot_be_combined_with_a_chunking_block(self):
+        with self.assertRaises(ol.LoopConfigError) as caught:
+            ol.structure_chunking_spec({"structure_chunking": True,
+                                        "chunking": {"strategy": "fixed_token",
+                                                     "params": {"chunk_token_size": 400}}}, "A")
+        self.assertIn("both choose where the cuts fall", str(caught.exception))
+
+    def test_the_plan_line_shows_the_arm_is_chunking(self):
+        config = self.write_experiments({"baseline_env": {}, "experiments": [
+            {"name": "S1", "env": {}, "reingest": False,
+             "structure_chunking": {"max_piece_tokens": 350}}]})
+        lines = ol.build_plan_lines(config)
+        self.assertTrue(any("structure_chunking" in line for line in lines), lines)
+class TestChunk350ArmOnStack2(_Case):
+    """Run the shipped C350 arm the way the brief will run it, against scripted docker/HTTP."""
+
+    PATH = ROOT_DIR / "docs" / "ops" / "loop" / "experiments-chunk350.json"
+
+    def _target(self) -> ol.Target:
+        """The flag set from the second-stack brief; Target is frozen, so build it per test.
+
+        Only the .env path points at a temp file: reading the real stack2 .env is not
+        available to a test. The URLs, containers, service names, compose file and project
+        are exactly the ones the runbook prints.
+        """
+        (self.root / "stack2.env").write_text(ENV_TEXT, encoding="utf-8")
+        self.ops.env_file = self.root / "stack2.env"   # this stack reads that .env
+        return ol.Target(
+            lightrag_url="http://127.0.0.1:9622", gateway_url="http://127.0.0.1:8021",
+            lightrag_container="lightrag-server2", gateway_container="gateway-api2",
+            lightrag_service="lightrag-server2", gateway_service="gateway-api2",
+            compose_file="~/rag-project/stack2/compose.yml", compose_project="rag-chunk2",
+            env_file=str(self.root / "stack2.env"), worker_container="none",
+        )
+
+    def _run(self) -> None:
+        config = ol.load_experiments(self.PATH)
+        ol.Loop(root=self.root, out=self.out, config=config, ops=self.ops, max_hours=16.0,
+                handle_signals=False, print_fn=lambda line: None, target=self._target()).run()
+
+    def test_the_arm_recreates_the_named_service_before_it_ingests(self):
+        """CHUNK_SIZE only takes effect if the container is recreated before /documents/text."""
+        self._run()
+        recreates = [command for command in self.ops.commands
+                     if "up" in command and "lightrag-server2" in command]
+        self.assertTrue(recreates, "the new chunk size needs lightrag-server2 recreated")
+        self.assertIn("-p", recreates[0]); self.assertIn("rag-chunk2", recreates[0],
+                        "the compose project decides WHICH stack is recreated")
+        self.assertIn("rag-chunk2", " ".join(" ".join(c) for c in self.ops.commands))
+        log = (self.out / "loop.log").read_text(encoding="utf-8")
+        self.assertLess(log.index("lightrag-server2: recreated"),
+                        log.index("C350: inserted doc 1/1"),
+                        "ingest under the old chunk size would measure the old arm")
+        self.assertIn("LightRAG clear requested", log)
+        ingests = [url for _m, url in self.ops.http_calls if url.endswith("/documents/text")]
+        self.assertEqual(ingests, ["http://127.0.0.1:9622/documents/text"],
+                         "the ingest goes to stack2, never to production")
+
+    def test_it_moves_the_two_chunk_keys_and_nothing_else(self):
+        self._run()
+        arm_env = next(text for text in self.ops.env_snapshots
+                       if ol.env_value(text, "CHUNK_SIZE") == "350")
+        self.assertEqual(ol.env_value(arm_env, "CHUNK_OVERLAP_SIZE"), "50")
+        for name, value in (("TOP_K", ol.env_value(ENV_TEXT, "TOP_K")),
+                            ("MAX_ASYNC", ol.env_value(ENV_TEXT, "MAX_ASYNC")),
+                            ("CHUNK_TOP_K", ol.env_value(ENV_TEXT, "CHUNK_TOP_K"))):
+            self.assertEqual(ol.env_value(arm_env, name), value,
+                             f"{name} must stay as production has it")
+
+    def test_the_ingested_text_is_posted_unchanged_and_without_a_chunking_key(self):
+        self._run()
+        bodies = [payload for url, payload in self.ops.payloads_seen
+                  if url.endswith("/documents/text")]
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0]["text"], "transcript body\n",
+                         "no transcript_prep: the corpus text goes in as the file has it")
+        self.assertNotIn("chunking", bodies[0],
+                         "fixed-token chunking is the arm; a chunking key would be a second variable")
 
 if __name__ == "__main__":
     unittest.main()

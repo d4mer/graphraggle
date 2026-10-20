@@ -10,7 +10,11 @@ from typing import Any
 
 from .config import settings
 from .lightrag_client import client
+from .docx_extract import DocxExtractError, extract_docx_payload
+from .embed_tokenizer import EmbedTokenizerError, load_embed_tokenizer
+from .pdf_extract import PdfExtractError, extract_pdf_payload_with_backend
 from .pptx_extract import PptxExtractError, cap_extracted_text, extract_pptx_text
+from .topic_embedder import embedder_from_settings
 from .state_store import (
     build_company_attribution,
     get_document_by_path,
@@ -21,6 +25,18 @@ from .state_store import (
     upsert_document,
     update_document_state,
 )
+from .structure_chunker import (
+    DEFAULT_MAX_PIECE_TOKENS,
+    DEFAULT_MIN_PIECE_TOKENS,
+    DEFAULT_HEADER_TOKENS,
+    chunk_document,
+    chunk_token_size_for_payload,
+    coverage_gaps,
+    lightrag_chunk_token_size,
+    render_for_lightrag,
+)
+from .lightrag_text import pieces_survive
+from .transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
 from .validation import validate_file
 
 SUPPORTED = {".txt", ".md", ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".json", ".html", ".htm"}
@@ -29,6 +45,12 @@ TEXT_EXTENSIONS = {".txt", ".md", ".html", ".htm", ".json", ".csv"}
 # text"). It is extracted with python-pptx into structured text and then
 # submitted through the same /documents/text path.
 PPTX_EXTENSIONS = {".pptx"}
+# PDF and DOCX are extracted by the worker only while STRUCTURE_CHUNKING_ENABLED is on, so
+# that the text reaching LightRAG is already cut at its natural boundaries. With the flag
+# off they keep going to /documents/upload and LightRAG's legacy parser does what it does
+# today. Both are per-type killable: a parser that chokes must not take the ingest down.
+PDF_EXTENSIONS = {".pdf"}
+DOCX_EXTENSIONS = {".docx"}
 TERMINAL_SUCCESS = {"ingested"}
 LIGHTRAG_INTERNAL_DIRS = {"__enqueued__"}
 
@@ -169,9 +191,335 @@ def normalize_text_submission_payload(text: str) -> str:
     return normalized.strip()
 
 
+def prepare_transcript_payload(path: Path, text: str) -> tuple[str, dict[str, Any]]:
+    """Optional transcript preparation, behind ``TRANSCRIPT_PREP_ENABLED``.
+
+    Returns the payload to submit and the worker metadata to record on the row, so
+    a later reindex can tell a prepared document from an unprepared one. Detection
+    is conservative inside :mod:`app.transcript_prep`: text that is not
+    transcript-shaped comes back byte-identical with ``detected=False``. The
+    content hash used for dedupe is never taken from this text - it is computed
+    from the file bytes before this call.
+    """
+    if not settings.transcript_prep_enabled:
+        return text, {}
+    result = prepare_transcript(
+        text,
+        filename=path.name,
+        header_every_tokens=int(
+            settings.transcript_prep_header_every_tokens or DEFAULT_HEADER_EVERY_TOKENS
+        ),
+    )
+    if result.applied:
+        return result.text, {
+            "transcript_prep": "applied",
+            "transcript_prep_headers": result.headers_inserted,
+            "transcript_prep_turns": result.turns,
+            "transcript_prep_speakers": list(result.speakers),
+            "transcript_prep_reason": None,
+            # Counts only, never text: how much of the file the label parser read,
+            # and how much of it it could not. F3 - a skipped document used to be
+            # un-diagnosable from the row alone.
+            "transcript_prep_lines": result.lines_nonempty,
+            "transcript_prep_labels_parsed": result.labels_parsed,
+            "transcript_prep_labels_rejected": result.labels_rejected,
+            "transcript_prep_labels_unparseable": result.labels_unparseable,
+        }
+    return text, {
+        "transcript_prep": "skipped",
+        "transcript_prep_headers": None,
+        "transcript_prep_turns": None,
+        "transcript_prep_speakers": None,
+        "transcript_prep_reason": result.reason,
+        "transcript_prep_lines": result.lines_nonempty,
+        "transcript_prep_labels_parsed": result.labels_parsed,
+        "transcript_prep_labels_rejected": result.labels_rejected,
+        "transcript_prep_labels_unparseable": result.labels_unparseable,
+    }
+
+
+_EMBED_TOKENIZER_CACHE: dict[str, Any] = {}
+
+
+# Vectors for the topic pass, kept for the life of the process. A re-ingest of an
+# unchanged document embeds nothing, and the key is a hash of the text, never the text.
+_TOPIC_VECTOR_CACHE: dict[str, list[float]] = {}
+
+
+def topic_embedder_for_plan() -> tuple[Any | None, str | None]:
+    """The topic-pass embedder, or the reason there is not one (recorded, not swallowed)."""
+    return embedder_from_settings(settings, cache=_TOPIC_VECTOR_CACHE)
+
+
+def topic_options_from_settings() -> dict[str, Any]:
+    return {
+        "threshold": float(settings.structure_chunking_topic_threshold or 0.30),
+        "units_per_block": int(settings.structure_chunking_topic_units_per_window or 6),
+        "max_windows": int(settings.structure_chunking_topic_max_windows or 400),
+    }
+
+
+def embed_tokenizer_for_check() -> tuple[Any | None, str | None]:
+    """The served embedder's tokenizer, if the operator pointed at one. Never downloaded.
+
+    Cached by path: loading a 250k-entry vocabulary per document would cost more than the
+    chunking it is checking. A path that cannot be read is reported once per document as a
+    note, and the check falls back to the chunker's conservative over-count.
+    """
+    path = str(settings.structure_chunking_embed_tokenizer_path or "").strip()
+    if not path:
+        return None, None
+    if path in _EMBED_TOKENIZER_CACHE:
+        return _EMBED_TOKENIZER_CACHE[path], None
+    try:
+        tokenizer = load_embed_tokenizer(path)
+    except EmbedTokenizerError as exc:
+        return None, f"embed tokenizer unavailable: {str(exc)[:160]}"
+    _EMBED_TOKENIZER_CACHE[path] = tokenizer
+    return tokenizer, None
+
+
+def prepare_structure_payload(
+    path: Path, text: str
+) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
+    """Optional structure-aware chunking, behind ``STRUCTURE_CHUNKING_ENABLED``.
+
+    Returns ``(payload, chunking_params, worker_metadata)``. Flag off: byte-identical
+    payload, no params, no metadata, so the request body is exactly what it is today.
+    Flag on: :mod:`app.structure_chunker` chooses every cut and the params tell LightRAG to
+    cut ONLY there (``fixed_token`` + ``split_by_character_only``).
+
+    Three checks stand between a plan and a submission, because an unseen failure here is
+    invisible downstream (truncation and re-cutting both look like "the answer is not in the
+    context"):
+
+    1. **Piece ceiling.** A piece over ``STRUCTURE_CHUNKING_MAX_PIECE_TOKENS`` (the
+       embedder window less a margin) is refused: the chunker warns when it could not fit
+       one, and a warning here means the document contains something uncuttable.
+    2. **Fit.** ``chunk_token_size`` is set to the largest piece plus a margin - if it were
+       left smaller, LightRAG would be free to re-cut our pieces - and the
+       largest piece is measured against the embedder's window in the embedder's own tokens
+       when tokenizer files are configured, or in the chunker's conservative over-count
+       when they are not. A piece over the window would be truncated silently.
+    3. **Coverage.** ``coverage_gaps`` accounts for every word of the source. A gap is
+       recorded, and only falls back when ``STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT`` is set.
+    4. **Survival.** The payload is replayed through an imitation of LightRAG's input
+       sanitiser and split again: the segments must be exactly the planned pieces. This is
+       the guard that would have caught the ``\x1e`` delimiter, which that sanitiser deletes.
+
+    Any failure returns the ORIGINAL text with no params and a recorded reason. The dedupe
+    hash comes from the file bytes before this call, so chunking can never change identity.
+    Metadata is counts and names only - no piece text, no corpus words.
+    """
+    if not settings.structure_chunking_enabled:
+        return text, None, {}
+    piece_window = int(settings.structure_chunking_max_piece_tokens or DEFAULT_MAX_PIECE_TOKENS)
+    floor = int(settings.structure_chunking_min_piece_tokens or DEFAULT_MIN_PIECE_TOKENS)
+    embedder, embedder_note = topic_embedder_for_plan()
+    try:
+        plan = chunk_document(
+            text,
+            filename=path.name,
+            max_piece_tokens=piece_window,
+            min_piece_tokens=floor,
+            until_merge=str(settings.structure_chunking_merge_until or "floor"),
+            topic_embed=embedder,
+            topic_options=topic_options_from_settings(),
+            header_tokens=int(settings.structure_chunking_header_tokens or DEFAULT_HEADER_TOKENS),
+            headers=bool(settings.structure_chunking_headers),
+        )
+        if plan.empty:
+            raise ValueError("chunk plan had no pieces")
+    except Exception as exc:  # the ingest must never depend on this module
+        return text, None, {
+            "structure_chunking": "failed",
+            "structure_chunking_reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+
+    largest = int(plan.stats.get("tokens_max") or 0)
+    coverage = coverage_gaps(text, plan)
+    updates: dict[str, Any] = {
+        "structure_chunking": "applied",
+        "structure_chunking_kind": plan.kind_detected,
+        "structure_chunking_pieces": len(plan.pieces),
+        "structure_chunking_max_piece_tokens": plan.stats.get("max_piece_tokens"),
+        "structure_chunking_min_piece_tokens": plan.stats.get("min_piece_tokens"),
+        "structure_chunking_pieces_merged": plan.stats.get("pieces_merged_up_to_floor", 0),
+        "structure_chunking_units_whole": plan.stats.get("units_whole", 0),
+        "structure_chunking_tokens_p50": plan.stats.get("tokens_p50"),
+        "structure_chunking_tokens_p95": plan.stats.get("tokens_p95"),
+        "structure_chunking_tokens_max": largest,
+        "structure_chunking_dropped_lines": plan.stats.get("dropped_running_lines", 0),
+        "structure_chunking_repeated_words": plan.stats.get("repeated_words", 0),
+        "structure_chunking_tokenizer": plan.stats.get("tokenizer"),
+        "structure_chunking_merge_until": plan.stats.get("merge_until"),
+        "structure_chunking_topic_method": plan.stats.get("topic_method"),
+        "structure_chunking_topic_blocks": plan.stats.get("topic_blocks"),
+        "structure_chunking_topic_boundaries": plan.stats.get("topic_boundaries"),
+        "structure_chunking_topic_embedded": plan.stats.get("topic_embedded"),
+        "structure_chunking_topic_note": embedder_note,
+        "structure_chunking_warnings": list(plan.warnings),
+        "structure_chunking_source_word_tokens": coverage["source_word_tokens"],
+        "structure_chunking_lost_word_tokens": coverage["unaccounted_word_tokens"],
+        "structure_chunking_covered_pct": coverage["covered_pct"],
+        "structure_chunking_reason": None,
+    }
+
+    def fallback(reason: str) -> tuple[str, None, dict[str, Any]]:
+        updates["structure_chunking"] = "fallback"
+        updates["structure_chunking_reason"] = reason[:200]
+        return text, None, updates
+
+    ceiling = int(settings.structure_chunking_max_piece_tokens or 0)
+    if ceiling and largest > ceiling:
+        return fallback(f"largest piece {largest} tokens exceeds "
+                        f"STRUCTURE_CHUNKING_MAX_PIECE_TOKENS={ceiling}")
+
+    entities = int(plan.stats.get("html_entities") or 0)
+    if entities:
+        # LightRAG expands HTML entities (one pass) before it splits, so the stored chunk is
+        # not the text we counted. Usually harmless; it becomes a cut we did not plan when the
+        # entities spell the piece marker, which is what the survival replay refuses.
+        updates["structure_chunking_html_entities"] = entities
+    stripped = {name.split(":", 1)[1]: count for name, count in plan.stats.items()
+                if name.startswith("sanitiser_stripped:")}
+    if stripped:
+        # What the pipeline took out of this document, by codepoint. Invisible in the stored
+        # text, and it changes where a piece reads as ending.
+        updates["structure_chunking_stripped_chars"] = ", ".join(
+            f"{name} x{count}" for name, count in sorted(stripped.items()))
+    measured, basis = largest, f"{plan.stats.get('tokenizer')} estimate"
+    tokenizer, note = embed_tokenizer_for_check()
+    if note:
+        updates["structure_chunking_embed_tokenizer_note"] = note
+    if tokenizer is not None:
+        measured = max(tokenizer.count(piece.render()) for piece in plan.pieces)
+        basis = f"embedder tokens via {tokenizer.name}"
+        updates["structure_chunking_embedder_tokens_max"] = measured
+    embed_window = int(settings.structure_chunking_embed_window_tokens or 0)
+    updates["structure_chunking_fit_basis"] = basis
+    if embed_window and measured > embed_window:
+        return fallback(f"largest piece {measured} {basis} exceeds the {embed_window}-token "
+                        "embedder window; submitting it risks silent truncation")
+
+    if coverage["unaccounted_word_tokens"] and bool(settings.structure_chunking_fail_on_lost_text):
+        return fallback(f"chunk plan failed to account for "
+                        f"{coverage['unaccounted_word_tokens']} word tokens of the source")
+
+    margin = int(settings.structure_chunking_fit_margin_tokens or 0)
+    # There is no chunk-size budget to floor this against: the pieces are whatever the
+    # document's own boundaries produced, so the size we tell LightRAG is exactly the
+    # largest one plus the margin that keeps its own cutting from ever firing. It is
+    # measured in LightRAG's tokenizer family (tiktoken cl100k when installed, the
+    # chunker's conservative over-count otherwise) and NEVER in the embedder's: doc08 in
+    # the stack2 run carried cts 2579 against a piece LightRAG counted at 2592, and under
+    # split_by_character_only that is a hard rejection, not a re-cut.
+    size, size_basis = lightrag_chunk_token_size(plan, margin)
+    updates["structure_chunking_chunk_token_basis"] = size_basis
+    try:
+        payload, params = render_for_lightrag(plan, chunk_token_size=size)
+    except Exception as exc:
+        return fallback(f"render failed: {type(exc).__name__}: {str(exc)[:160]}")
+    delimiter = params["params"]["split_by_character"]
+    # The one claim the request makes about the text: every cut is marked. If the count is
+    # wrong, LightRAG would re-cut somewhere we never chose, and nothing downstream could
+    # tell. Cheap to assert per document, and it catches a delimiter collision, which is the
+    # only way this can silently happen.
+    markers = payload.count(delimiter)
+    updates["structure_chunking_delimiters"] = markers
+    # A join, not a wrap: N pieces carry N-1 markers, and a single-piece document carries
+    # none. Markers at the payload's own edges would be stripped by the input sanitiser.
+    if markers != max(0, len(plan.pieces) - 1):
+        return fallback(f"rendered payload carries {markers} cut markers for "
+                        f"{len(plan.pieces)} pieces: the cuts would not survive the request")
+    # Then size it again from what LightRAG will actually count: the payload's own segments.
+    # The plan and the payload are meant to agree, and when they do not by a whitespace's
+    # worth, this is the number that decides whether the request is accepted (doc08: cts 2579
+    # against a segment LightRAG counted at 2592). It can only ever raise the size.
+    try:
+        payload_size, _ = chunk_token_size_for_payload(payload, delimiter, margin)
+    except Exception as exc:
+        return fallback(f"sizing failed: {type(exc).__name__}: {str(exc)[:160]}")
+    if payload_size > params["params"]["chunk_token_size"]:
+        updates["structure_chunking_chunk_token_payload_gap"] = (
+            payload_size - params["params"]["chunk_token_size"])
+        params["params"]["chunk_token_size"] = payload_size
+    updates["structure_chunking_chunk_token_size"] = params["params"]["chunk_token_size"]
+    # The check the API-boundary test could not make: LightRAG sanitises the whole document
+    # BEFORE splitting (sanitize_text_for_encoding -> strip_control_characters), which deletes
+    # the C0 separators - the \x1e delimiter the first version of this path used. Eight of ten
+    # documents in the stack2 run reached LightRAG as one segment. So replay that step here,
+    # on the bytes we are about to send, and compare the segments with the plan: counts only,
+    # never text. A mismatch is a fallback to the old route, not a gamble on the re-cut.
+    survives, why = pieces_survive(payload, delimiter, [piece.render() for piece in plan.pieces])
+    updates["structure_chunking_sanitiser_check"] = "ok" if survives else why[:200]
+    if not survives:
+        return fallback(f"payload would not survive LightRAG's input sanitiser: {why}")
+    return payload, params, updates
+
+
+def prepare_payload_chain(
+    path: Path, text: str
+) -> tuple[str, dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """The one order that is correct for every route: normalise, transcript prep, chunking.
+
+    transcript_prep labels turns and inserts its headers; the structure chunker then decides
+    where the cuts fall in THAT text, so a turn header is never separated from its turn.
+    """
+    text, prep_updates = prepare_transcript_payload(path, text)
+    text, structure_params, structure_updates = prepare_structure_payload(path, text)
+    return text, prep_updates, structure_params, structure_updates
+
+
 def uses_pptx_extract(path: Path) -> bool:
     """True when this file is extracted by the worker instead of uploaded."""
     return bool(settings.worker_pptx_extract_enabled) and path.suffix.lower() in PPTX_EXTENSIONS
+
+
+def uses_binary_extract(path: Path) -> bool:
+    """True when a PDF/DOCX is parsed by the worker instead of uploaded.
+
+    Deliberately tied to STRUCTURE_CHUNKING_ENABLED: extracting text and then letting
+    LightRAG re-cut it with fixed_token would trade one invisible cut for another, so the
+    route only exists to serve the pre-chunked path. Each type has its own kill switch.
+    """
+    if not settings.structure_chunking_enabled:
+        return False
+    suffix = path.suffix.lower()
+    if suffix in PDF_EXTENSIONS:
+        return bool(settings.worker_pdf_extract_enabled)
+    if suffix in DOCX_EXTENSIONS:
+        return bool(settings.worker_docx_extract_enabled)
+    return False
+
+
+def extract_binary_payload_with_backend(path: Path) -> tuple[str, str | None]:
+    """Byte-guarded extraction of a PDF/DOCX, plus the backend that ran (None for DOCX).
+
+    The backend is recorded on the row because it changes the answer: ``pdftotext
+    -layout`` reproduces the column positions the row reassembly reads and pypdf does not,
+    so two PDFs of the same layout can chunk differently depending on which one ran.
+    Without the field that difference is invisible from the database.
+
+    Raises PdfExtractError / DocxExtractError; the caller decides the fallback (upload),
+    so nothing here can lose a document.
+    """
+    suffix = path.suffix.lower()
+    if suffix in PDF_EXTENSIONS:
+        text, backend_used = extract_pdf_payload_with_backend(
+            path, max_bytes=int(settings.worker_pdf_max_bytes or 0),
+            max_chars=int(settings.worker_pdf_max_chars or 0),
+            backend=str(settings.worker_pdf_text_backend or "auto"))
+    else:
+        text = extract_docx_payload(path, max_bytes=int(settings.worker_docx_max_bytes or 0),
+                                    max_chars=int(settings.worker_docx_max_chars or 0))
+        backend_used = None
+    return normalize_text_submission_payload(text), backend_used
+
+
+def extract_binary_payload(path: Path) -> str:
+    """Submission-ready text only. See :func:`extract_binary_payload_with_backend`."""
+    return extract_binary_payload_with_backend(path)[0]
 
 
 def extract_pptx_payload(path: Path) -> str:
@@ -523,10 +871,20 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
 
     detected_encoding = None
     text_payload = None
+    prepared_chain = False
+    prep_updates: dict[str, Any] = {}
+    structure_params: dict[str, Any] | None = None
+    structure_updates: dict[str, Any] = {}
     if path.suffix.lower() in TEXT_EXTENSIONS:
         try:
             text_payload, detected_encoding = read_text_with_fallbacks(path)
             text_payload = normalize_text_submission_payload(text_payload)
+            # Order matters: transcript_prep labels turns and inserts its headers,
+            # then the structure chunker decides where the cuts fall in that text.
+            text_payload, prep_updates, structure_params, structure_updates = (
+                prepare_payload_chain(path, text_payload)
+            )
+            prepared_chain = True
         except Exception as exc:
             await update_document_state(
                 str(path),
@@ -590,6 +948,37 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
             warn(f"PPTX extraction failed for {path}: {exc.error_code}: {exc}")
             return
 
+    elif uses_binary_extract(path):
+        kind = path.suffix.lower().lstrip(".")
+        try:
+            text_payload, backend_used = extract_binary_payload_with_backend(path)
+        except (PdfExtractError, DocxExtractError) as exc:
+            # Never lose a document: the parser failed, so do what this file did before
+            # the route existed and let LightRAG parse the bytes. The reason is recorded
+            # on the row, because "why is this PDF chunked differently from that one" is
+            # otherwise unanswerable from the database.
+            text_payload = None
+            structure_updates = {
+                "structure_extract": "fallback_upload",
+                "structure_extract_kind": kind,
+                "structure_extract_error": exc.error_code,
+                "structure_extract_reason": str(exc)[:200],
+            }
+            warn(f"{kind.upper()} extraction failed for {path}: {exc.error_code}: {exc}; "
+                 "falling back to /documents/upload")
+        else:
+            structure_updates = {"structure_extract": "worker", "structure_extract_kind": kind}
+            if backend_used:
+                structure_updates["structure_extract_backend"] = backend_used
+
+    if text_payload is not None and not prepared_chain:
+        # Extracted text takes the same preparation order as a text file: transcript
+        # shaping first, then the structure chunker, so both routes submit the same shape.
+        text_payload, prep_updates, structure_params, chain_updates = (
+            prepare_payload_chain(path, text_payload)
+        )
+        structure_updates.update(chain_updates)
+
     if verdict.verdict == "warn":
         warnings_json = merge_warning_metadata(
             warnings_json,
@@ -627,15 +1016,26 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
             }),
         )
 
+    if prep_updates:
+        # Recorded before the HTTP call so both the success upsert and the failure
+        # write-backs carry it: "was this document submitted prepared?"
+        warnings_json = merge_warning_metadata(warnings_json, worker_updates=prep_updates)
+    if structure_updates:
+        # Same reason, one step later: "was this document submitted pre-chunked, and
+        # what did the plan look like?" Counts and names only, never text.
+        warnings_json = merge_warning_metadata(warnings_json, worker_updates=structure_updates)
+
     try:
         if text_payload is not None:
-            resp = await client.post_json(
-                "/documents/text",
-                {
-                    "text": text_payload,
-                    "file_source": str(path),
-                },
-            )
+            body: dict[str, Any] = {
+                "text": text_payload,
+                "file_source": str(path),
+            }
+            if structure_params is not None:
+                # With the flag off this key is absent, so the request body is
+                # byte-identical to what it was before the feature existed.
+                body["chunking"] = structure_params
+            resp = await client.post_json("/documents/text", body)
         else:
             resp = await client.post_file("/documents/upload", str(path))
     except Exception as exc:

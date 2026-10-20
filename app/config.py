@@ -42,6 +42,124 @@ class Settings(BaseSettings):
     # Extracted text is capped before submission; the cap leaves a marker line.
     worker_pptx_max_chars: int = Field(default=2_000_000, alias="WORKER_PPTX_MAX_CHARS")
 
+    # PDF and DOCX take the same route, but only while structure chunking is on: with
+    # STRUCTURE_CHUNKING_ENABLED off they keep going to /documents/upload exactly as they
+    # do today, because extracting them and letting LightRAG re-cut the text would trade one
+    # invisible cut for another. Extraction is per-type killable so a bad parser cannot take
+    # the whole ingest down. Any extraction failure falls back to the upload route: a
+    # document is never lost to a parser.
+    worker_pdf_extract_enabled: bool = Field(default=True, alias="WORKER_PDF_EXTRACT_ENABLED")
+    worker_docx_extract_enabled: bool = Field(default=True, alias="WORKER_DOCX_EXTRACT_ENABLED")
+    # pypdf and python-docx both hold the parsed document in memory; the byte limit is the
+    # guard for the zip-bomb / huge-scan class, and the char cap bounds what is submitted.
+    worker_pdf_max_bytes: int = Field(default=104_857_600, alias="WORKER_PDF_MAX_BYTES")
+    # Which PDF text extractor to use: "auto" prefers poppler's pdftotext -layout (already in
+    # the worker image, and it reproduces column positions as spaces, which is what the row
+    # reassembly reads), then pypdf. Pin one for a reproducible experiment.
+    worker_pdf_text_backend: str = Field(default="auto", alias="WORKER_PDF_TEXT_BACKEND")
+    worker_pdf_max_chars: int = Field(default=2_000_000, alias="WORKER_PDF_MAX_CHARS")
+    worker_docx_max_bytes: int = Field(default=104_857_600, alias="WORKER_DOCX_MAX_BYTES")
+    worker_docx_max_chars: int = Field(default=2_000_000, alias="WORKER_DOCX_MAX_CHARS")
+
+    # Contextual chunk headers + speaker-turn normalisation for transcript-shaped
+    # text, applied to the /documents/text payload before LightRAG ever sees it
+    # (app/transcript_prep.py). LightRAG cuts fixed-size token chunks, so a
+    # transcript's later chunks lose the meeting's title, date and turn structure;
+    # this puts a one-line context header every ~N tokens into the TEXT itself.
+    # Default false: the submitted payload is byte-for-byte what it is today.
+    # The dedupe content hash is always computed on the ORIGINAL file bytes, never
+    # on prepared text, so preparation can never change a document's identity.
+    transcript_prep_enabled: bool = Field(default=False, alias="TRANSCRIPT_PREP_ENABLED")
+    # Rough token distance between context headers. Production LightRAG runs at its
+    # default 1200-token chunks (100 overlap), so 200 puts several headers inside
+    # every chunk LightRAG produces. Tokens are approximated by
+    # app/transcript_prep.py (~4 chars/token) because tiktoken lives in LightRAG's
+    # image, not this venv; the 6x margin below the chunk size absorbs the error.
+    transcript_prep_header_every_tokens: int = Field(
+        default=200, alias="TRANSCRIPT_PREP_HEADER_EVERY_TOKENS"
+    )
+
+    # Structure-aware pre-chunking (app/structure_chunker.py): our code chooses every
+    # cut, and the request tells LightRAG to cut ONLY at those markers (fixed_token +
+    # split_by_character_only). Default false, exactly like TRANSCRIPT_PREP_ENABLED:
+    # with it off the submitted text and request body are what they are today. The
+    # dedupe content hash is still taken from the original file bytes, so chunking
+    # can never change a document's identity.
+    structure_chunking_enabled: bool = Field(default=False,
+                                             alias="STRUCTURE_CHUNKING_ENABLED")
+    # The window, not a budget: a natural unit (a section, a table, a run of turns) is
+    # cut ONLY when it cannot fit this. 7500 = BGE-M3's 8192-token window less a safety
+    # margin, expressed in app/structure_chunker.py's conservative estimate, which
+    # over-counts English prose by ~10-15% and therefore errs small. There is no
+    # chunk-size target any more: the document decides how big a piece is.
+    structure_chunking_max_piece_tokens: int = Field(
+        default=7500, alias="STRUCTURE_CHUNKING_MAX_PIECE_TOKENS")
+    # The merge floor. A unit below this is welded to its neighbour, so a page of
+    # numbered sub-headings becomes a few readable pieces instead of a hundred
+    # fragments. It is a floor, never a cap: nothing is cut for being large until it
+    # cannot fit the window above.
+    structure_chunking_min_piece_tokens: int = Field(
+        default=150, alias="STRUCTURE_CHUNKING_MIN_PIECE_TOKENS")
+    # How far a merge chain runs. "floor" (default) stops it once the piece clears the
+    # floor, so a piece stays a natural unit; "window" lets unrelated short sections chain
+    # into one big piece. A section whose whole extent fits the window is one unit either way.
+    structure_chunking_merge_until: str = Field(
+        default="floor", alias="STRUCTURE_CHUNKING_MERGE_UNTIL")
+
+    # Topic-shift segmentation for documents with no headings and no tables (the flat
+    # transcripts, the "(Name)"-label meetings, the monolithic single-line minutes). The
+    # chunker asks an injected embedder where adjacent windows stop resembling each other
+    # and cuts there, so a piece is one topic of whatever length that topic happens to be.
+    # With no URL configured there is no embedder and the deterministic fallback is used -
+    # cut at unit boundaries near the window - and the state row says which happened.
+    structure_chunking_embed_url: str = Field(default="", alias="STRUCTURE_CHUNKING_EMBED_URL")
+    structure_chunking_embed_model: str = Field(
+        default="bge-m3-mlx-fp16", alias="STRUCTURE_CHUNKING_EMBED_MODEL")
+    # The NAME of the environment variable holding the model server key. The key itself is
+    # never in a setting, a log line or a report.
+    structure_chunking_embed_api_key_env: str = Field(
+        default="OMLX_API_KEY", alias="STRUCTURE_CHUNKING_EMBED_API_KEY_ENV")
+    structure_chunking_embed_timeout_seconds: float = Field(
+        default=15.0, alias="STRUCTURE_CHUNKING_EMBED_TIMEOUT_SECONDS")
+    structure_chunking_embed_batch: int = Field(default=16,
+                                                alias="STRUCTURE_CHUNKING_EMBED_BATCH")
+    # Similarity drop (TextTiling depth) needed to call a place a topic change. Lower cuts
+    # more often. 0.30 is a starting point measured on synthetic vocabularies, NOT on the
+    # corpus: the first real run should print the depth distribution before moving it.
+    structure_chunking_topic_threshold: float = Field(
+        default=0.30, alias="STRUCTURE_CHUNKING_TOPIC_THRESHOLD")
+    structure_chunking_topic_units_per_window: int = Field(
+        default=6, alias="STRUCTURE_CHUNKING_TOPIC_UNITS_PER_WINDOW")
+    structure_chunking_topic_max_windows: int = Field(
+        default=400, alias="STRUCTURE_CHUNKING_TOPIC_MAX_WINDOWS")
+    # The context header is capped separately so a long section path can never eat the
+    # body's room: fields are dropped (path, date, speakers, title last) until it fits.
+    structure_chunking_header_tokens: int = Field(
+        default=25, alias="STRUCTURE_CHUNKING_HEADER_TOKENS")
+    structure_chunking_headers: bool = Field(default=True,
+                                             alias="STRUCTURE_CHUNKING_HEADERS")
+
+    # The fit check: the served embedder's real window, in ITS tokens.
+    # chunk_token_size in the request must be at least the largest piece, or LightRAG is
+    # allowed to re-cut our pieces and the whole exercise means nothing. The margin absorbs
+    # the difference between our conservative estimate and the server's tokenizer.
+    structure_chunking_fit_margin_tokens: int = Field(
+        default=64, alias="STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS")
+    # BGE-M3's window (8192 tokens, dense 1024-dim, served by oMLX). With no tokenizer
+    # files configured the check runs on the chunker's own conservative over-count.
+    structure_chunking_embed_window_tokens: int = Field(
+        default=8192, alias="STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS")
+    # Optional local directory of the SERVED embedder's tokenizer (tokenizer.json or
+    # vocab.txt). Never fetched: app/embed_tokenizer.py refuses a hub id. When it is set,
+    # the fit check is stated in the embedder's own tokens instead of cl100k-style ones.
+    structure_chunking_embed_tokenizer_path: str = Field(
+        default="", alias="STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH")
+    # Make a coverage gap (the chunker failed to account for words that were in the source)
+    # fall back to unchunked submission instead of only recording it. Default false: the gap
+    # is a bug signal, and blocking ingest on a heuristic is a worse outcome than the bug.
+    structure_chunking_fail_on_lost_text: bool = Field(
+        default=False, alias="STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT")
+
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
     rerank_binding_api_key: Optional[str] = Field(default=None, alias="RERANK_BINDING_API_KEY")

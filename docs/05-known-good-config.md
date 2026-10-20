@@ -60,8 +60,29 @@ LLM_BINDING_HOST=http://192.168.1.190:1234/v1
 Embeddings:
 
 ```bash
-EMBEDDING_MODEL=mxbai-embed-large-v1   # dimension 1024
+EMBEDDING_MODEL=bge-m3-mlx-fp16   # dimension 1024, real window 8192 tokens
 # same oMLX server: 192.168.1.190:1234
+```
+
+BGE-M3 is the only embedder since 2026-10-18 (operator decision). mxbai-embed-large-v1 is
+retired: its 512-token window is what made 1200-token chunks fail silently. Nothing in the
+stack should name mxbai any more; older change-log entries keep the name because they
+describe what was measured at the time.
+
+Structure chunking (the worker cuts, LightRAG obeys) — defaults as shipped:
+
+```bash
+STRUCTURE_CHUNKING_ENABLED=true
+STRUCTURE_CHUNKING_MAX_PIECE_TOKENS=7500   # window minus margin; NOT a size target
+STRUCTURE_CHUNKING_MIN_PIECE_TOKENS=150    # merge floor: a smaller unit welds to its neighbour
+STRUCTURE_CHUNKING_MERGE_UNTIL=floor       # floor: one natural unit per piece; window: pack to 7500
+STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS=8192 # BGE-M3's window, used for the fit check
+STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS=64    # headroom added to chunk_token_size
+STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH=   # BGE-M3 tokenizer.json dir; empty = conservative over-count
+STRUCTURE_CHUNKING_EMBED_URL=http://192.168.1.190:1234/v1  # topic cuts only; empty = no topic pass
+STRUCTURE_CHUNKING_EMBED_MODEL=bge-m3-mlx-fp16
+STRUCTURE_CHUNKING_EMBED_API_KEY_ENV=OMLX_API_KEY  # the NAME of the variable, never the key
+STRUCTURE_CHUNKING_TOPIC_THRESHOLD=0.30    # TextTiling depth that counts as a topic change
 ```
 
 Reranker:
