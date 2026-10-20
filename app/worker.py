@@ -375,6 +375,12 @@ def prepare_structure_payload(
         return fallback(f"largest piece {largest} tokens exceeds "
                         f"STRUCTURE_CHUNKING_MAX_PIECE_TOKENS={ceiling}")
 
+    entities = int(plan.stats.get("html_entities") or 0)
+    if entities:
+        # LightRAG expands HTML entities (one pass) before it splits, so the stored chunk is
+        # not the text we counted. Usually harmless; it becomes a cut we did not plan when the
+        # entities spell the piece marker, which is what the survival replay refuses.
+        updates["structure_chunking_html_entities"] = entities
     stripped = {name.split(":", 1)[1]: count for name, count in plan.stats.items()
                 if name.startswith("sanitiser_stripped:")}
     if stripped:

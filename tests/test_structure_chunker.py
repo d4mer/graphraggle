@@ -11,6 +11,7 @@ All fixtures are synthetic; this suite never reads corpus, probe or LightRAG dat
 
 from __future__ import annotations
 
+import html as _html
 import json
 import os
 import sys
@@ -536,6 +537,9 @@ class TestInvariants(unittest.TestCase):
                         f"the pipeline cannot touch")
         survives, why = pieces_survive(rendered, delimiter, [p.render() for p in plan.pieces])
         self.assertTrue(survives, f"{name} b{budget}: {why}")
+        self.assertEqual(sanitize_like_lightrag(rendered), rendered,
+                         f"{name} b{budget}: the payload is not a fixed point of the real "
+                         f"sanitize_text_for_encoding, so planned text is not stored text")
         self.assertNotIn(delimiter, sanitize_like_lightrag(rendered).replace(delimiter, ""),
                          f"{name} b{budget}: a body carries marker-shaped text")
         return plan
@@ -1175,6 +1179,38 @@ class TestBinaryRoutes(unittest.TestCase):
         self.assertNotEqual(got["meta"]["structure_chunking_sanitiser_check"], "ok",
                             "the reason is recorded, not just the fact of the refusal")
         self.assertNotIn("chunking", got["json_body"])
+
+    def test_the_worker_reports_entity_expansion_and_still_ingests(self):
+        path = self.docs / "escaped.txt"
+        path.write_text(_paragraphs("alpha") + "\n\n" + ENTITY_MARKER + "\n\n"
+                        + _paragraphs("beta"), encoding="utf-8")
+        got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "applied",
+                         "an escaped marker changes which marker we use, never whether we ingest")
+        self.assertEqual(got["meta"]["structure_chunking_html_entities"], 10)
+        marker = got["json_body"]["chunking"]["params"]["split_by_character"]
+        self.assertNotEqual(marker, DELIMITER_CANDIDATES[0])
+        self.assertEqual(got["meta"]["structure_chunking_sanitiser_check"], "ok")
+
+    def test_a_payload_the_entities_would_recut_is_not_submitted(self):
+        # The picker refuses the default marker for this document, so a renderer that picks it
+        # anyway is the shape the replay has to stop: the reader would cut one piece too many.
+        def escaped_marker(plan, delimiter=None, *, chunk_token_size=None):
+            body = DELIMITER_CANDIDATES[0].join(piece.render() for piece in plan.pieces)
+            return body, {"strategy": "fixed_token",
+                          "params": {"chunk_token_size": 900,
+                                     "split_by_character": DELIMITER_CANDIDATES[0],
+                                     "split_by_character_only": True}}
+
+        path = self.docs / "escaped.txt"
+        path.write_text(_paragraphs("alpha", blocks=3) + "\n\n" + ENTITY_MARKER +
+                        "\n\n" + _paragraphs("beta", blocks=1), encoding="utf-8")
+        with patch.object(worker, "render_for_lightrag", escaped_marker):
+            got = self._submit(path)
+        self.assertEqual(got["meta"]["structure_chunking"], "fallback")
+        self.assertIn("entities", got["meta"]["structure_chunking_reason"])
+        self.assertNotIn("chunking", got["json_body"])
+
 
     def test_control_characters_are_taken_out_at_plan_time_and_reported(self):
         # A form feed rides in on a page break and a NUL rides in on a bad decode. Both are
@@ -2126,10 +2162,19 @@ class TestDelimiterSurvival(unittest.TestCase):
 
     def test_an_explicit_delimiter_the_sanitiser_would_delete_is_refused(self):
         plan = chunk_document(TRANSCRIPT, filename="m.txt", budget_tokens=60)
-        for marker in ("\x1e", "\n\n\x1e\n\n", "\ufeff", "\u200b", "\x00x"):
+        for marker in ("\x1e", "\n\n\x1e\n\n", "\x00x", "\u00ad\x0bx"):
             with self.assertRaises(StructureChunkerError, msg=marker) as caught:
                 pick_delimiter(plan, marker)
             self.assertIn("sanitiser", str(caught.exception), marker)
+
+    def test_a_format_character_delimiter_is_no_longer_refused_for_survival(self):
+        # The earlier refusal said the sanitiser strips U+FEFF and U+200B. It does not - the
+        # golden fixture keeps them (idx 37-47) - so refusing on that basis was a false claim.
+        # They are still not OUR markers: is_conservative_marker refuses them.
+        plan = chunk_document(TRANSCRIPT, filename="m.txt", budget_tokens=60)
+        for marker in ("\n\n\ufeff\n\n", "\n\n\u200b\n\n"):
+            self.assertEqual(pick_delimiter(plan, marker), marker)
+            self.assertFalse(is_conservative_marker(marker), marker)
 
     def test_a_whitespace_only_delimiter_is_refused_too(self):
         plan = chunk_document(TRANSCRIPT, filename="m.txt", budget_tokens=60)
@@ -2261,6 +2306,115 @@ class TestChunkTokenSizeFollowsLightRagNotTheEmbedder(unittest.TestCase):
     def test_an_empty_payload_cannot_be_sized(self):
         with self.assertRaises(StructureChunkerError):
             chunk_token_size_for_payload("   ", "\n\n<<<CHUNK-BREAK>>>\n\n", 64)
+
+
+# ── what the image does to the text before it splits (parity consequences) ──
+
+ENTITY_MARKER = ("&#10;&#10;&#60;&#60;&#60;CHUNK-BREAK&#62;&#62;&#62;&#10;&#10;")
+
+
+def _paragraphs(word: str, blocks: int = 4, words: int = 90) -> str:
+    return "\n\n".join(f"## Section {index}\n\n" + " ".join(
+        f"{word}{index} lane depot tariff customs origin papers" for _ in range(words))
+        for index in range(1, blocks + 1))
+
+
+class TestEntitiesCannotInventACut(unittest.TestCase):
+    """``sanitize_text_for_encoding`` unescapes BEFORE it splits, so entities are cuts too.
+
+    A document of escaped markup can spell our marker without containing it. The picker sees
+    through that, and the pre-submit replay is the gate that refuses the request if anything
+    still slips through.
+    """
+
+    def test_a_marker_that_only_exists_after_unescaping_is_not_picked(self):
+        doc = _paragraphs("alpha") + "\n\n" + ENTITY_MARKER + "\n\n" + _paragraphs("beta")
+        plan = chunk_document(doc, filename="escaped.txt")
+        marker = pick_delimiter(plan)
+        self.assertNotEqual(marker, DELIMITER_CANDIDATES[0],
+                            "the default marker appears once the entities expand")
+        self.assertTrue(is_conservative_marker(marker), marker)
+        self.assertNotIn(marker, ENTITY_MARKER)
+        rendered, params = render_for_lightrag(plan)
+        self.assertTrue(pieces_survive(rendered, params["params"]["split_by_character"],
+                                      [p.render() for p in plan.pieces])[0])
+
+    def test_the_plan_counts_the_entities_the_image_will_expand(self):
+        plan = chunk_document(_paragraphs("alpha") + "\n\n" + ENTITY_MARKER,
+                              filename="escaped.txt")
+        self.assertEqual(plan.stats.get("html_entities"), 10)
+
+    def test_an_explicit_delimiter_reached_only_through_entities_is_refused(self):
+        plan = chunk_document(_paragraphs("alpha") + "\n\n" + ENTITY_MARKER,
+                              filename="escaped.txt")
+        with self.assertRaises(StructureChunkerError) as caught:
+            pick_delimiter(plan, DELIMITER_CANDIDATES[0])
+        self.assertIn("unescaped", str(caught.exception))
+
+    def test_a_document_carrying_both_forms_of_every_candidate_still_escalates(self):
+        # One body holding every candidate in its entity-encoded form. The literals are absent,
+        # so only a picker that unescapes before it chooses can see the collision.
+        def encode(text):
+            return (text.replace("&", "&amp;").replace("\n", "&#10;")
+                        .replace("<", "&#60;").replace(">", "&#62;"))
+        joined = "\n".join(encode(candidate) for candidate in DELIMITER_CANDIDATES)
+        plan = sc.ChunkPlan(pieces=[sc.Piece(body=joined, header=None, kind="paragraph")],
+                            kind_detected="plain")
+        marker = pick_delimiter(plan)
+        self.assertTrue(is_conservative_marker(marker), marker)
+        self.assertNotIn(marker, joined)
+        expanded = _html.unescape(joined)
+        for candidate in DELIMITER_CANDIDATES:
+            self.assertIn(candidate, expanded, "the fixture lost its collision")
+        self.assertNotIn(marker, expanded)
+        self.assertIn("<<<CHUNK-BREAK-", marker, "escalation, not a control character")
+
+class TestStoredTextIsThePlannedText(unittest.TestCase):
+    """Planned piece == stored chunk, for the characters real documents actually carry."""
+
+    def test_zero_width_characters_stay_and_the_pieces_still_round_trip(self):
+        # OrderBook.docx carries 46 x U+200B. The image keeps them, so the plan keeps them:
+        # stripping them in the extractor to compensate would break the equality instead.
+        body = " ".join(f"alpha{index}\u200b depot tariff customs" for index in range(120))
+        plan = chunk_document("## One\n\n" + body + "\n\n## Two\n\n" + body.replace(
+            "alpha", "beta"), filename="orderbook.txt")
+        kept = sum(piece.body.count("\u200b") for piece in plan.pieces)
+        self.assertEqual(kept, body.count("\u200b") * 2,
+                         "zero-width characters were stripped from the plan")
+        self.assertEqual(plan.stats.get("sanitiser_chars_removed"), None,
+                         "nothing was taken out, so nothing is reported")
+        rendered, params = render_for_lightrag(plan)
+        self.assertTrue(pieces_survive(rendered, params["params"]["split_by_character"],
+                                      [p.render() for p in plan.pieces])[0])
+        self.assertEqual(sanitize_like_lightrag(rendered), rendered)
+
+    def test_carriage_returns_survive_the_sanitiser_even_though_the_chunker_uses_lines(self):
+        # The image never folds CRLF. Our line-based planning drops the CRs when it reassembles,
+        # which is a chunker decision, not a sanitiser surprise - and the payload that goes out
+        # is exactly what comes back.
+        doc = ("## One\r\n\r\n" + " ".join(f"gamma{index} depot tariff customs"
+                                               for index in range(120)) +
+               "\r\nnext\r\nline\r\n")
+        plan = chunk_document(doc, filename="crlf.txt")
+        rendered, params = render_for_lightrag(plan)
+        self.assertEqual(sanitize_like_lightrag(rendered), rendered,
+                         "the stored field is the payload we sent, byte for byte")
+        self.assertTrue(pieces_survive(rendered, params["params"]["split_by_character"],
+                                      [p.render() for p in plan.pieces])[0])
+        self.assertEqual(plan.stats.get("sanitiser_chars_removed"), None)
+
+    def test_an_entity_in_ordinary_text_is_recorded_and_the_payload_still_survives(self):
+        doc = _paragraphs("at") .replace("lane depot", "AT&amp;T depot")
+        plan = chunk_document(doc, filename="entities.txt")
+        self.assertGreater(plan.stats.get("html_entities", 0), 0)
+        rendered, params = render_for_lightrag(plan)
+        ok, why = pieces_survive(rendered, params["params"]["split_by_character"],
+                                [p.render() for p in plan.pieces])
+        self.assertTrue(ok, why)
+        self.assertNotEqual(sanitize_like_lightrag(rendered), rendered,
+                            "the stored text differs from the payload only by the expansion")
+        self.assertEqual(len(sanitize_like_lightrag(rendered).split(
+            params["params"]["split_by_character"])), len(plan.pieces))
 
 
 if __name__ == "__main__":

@@ -174,31 +174,48 @@ coverage gate is what keeps them from being merged into one.
 
 The delimiter is a promise: under `split_by_character_only` it is the **only** cut LightRAG
 will make, so it has to arrive intact. LightRAG sanitises the whole document field
-(`sanitize_text_for_encoding` → `strip_control_characters`) *before* splitting: the C0 range
-except tab and newline, DEL, lone surrogates and zero-width characters are deleted. A marker
-made of `` therefore arrives as nothing — the eight-of-ten single-segment failure in the
-stack2 run. So:
+(`sanitize_text_for_encoding`, `lightrag/utils.py:5529-5566`) *before* splitting, in this order:
+strip the field, `html.unescape` **once**, delete lone surrogates and U+FFFE/U+FFFF, delete the
+C0 range except tab, newline and **CR**, then strip again. It keeps every zero-width and format
+character (U+00AD, U+200B-U+200F, U+2060, U+202A-U+202E, U+FEFF, U+FFF9 and friends), it keeps
+carriage returns, and it never normalises unicode. A marker built from the ASCII record
+separator (U+001E) therefore arrives as nothing - the eight-of-ten single-segment failure in the
+stack2 run.
 
-- markers are **printable only**: newline plus ASCII letters, digits, `<`, `>`, `-`. Default
-  `
+`app/lightrag_text.py` is a **parity** implementation, not an imitation: 62 fixed strings were
+run through the real function inside `lightrag-server2` and recorded as hex
+(`tests/fixtures/sancmp_tests.json`, `sancmp_real.json`), and `tests/test_sanitiser_parity.py`
+asserts all 62 byte for byte. That fixture is the oracle. If the image changes, re-run the
+comparison and change the module from the new fixture, not from memory of the source. So:
 
-<<<CHUNK-BREAK>>>
-
-`; when every candidate is already in the text, a longer marker is
-  derived from the document's sha256, so two runs of one file keep comparable pieces;
-- an explicit delimiter that the pipeline would strip is **refused**, not obeyed;
+- markers are **printable only**: newline plus ASCII letters, digits, `<`, `>`, `-`. The default
+  is `<<<CHUNK-BREAK>>>` with a blank line on each side; when every candidate is already in the
+  text, a longer marker is derived from the document's sha256, so two runs of one file keep
+  comparable pieces;
+- an explicit delimiter built from characters the function deletes is **refused**, not obeyed;
 - the payload is a **join, never a wrap**: the field is stripped before it is split, so a marker
   at either edge loses its newlines and the payload stops containing the delimiter the request
   named. `N` pieces carry `N-1` markers;
-- the plan is built over the **normalised** text, so planned text and stored text are one string,
-  and `structure_chunking_stripped_chars` names the codepoints that were taken out (a form feed
-  from a page break is invisible in the output and moves where a piece reads as ending);
-- before submitting, the worker replays the pipeline offline — sanitise, split on the delimiter,
-  compare the segments with the plan — and falls back to today's route on any mismatch.
+- the plan is built over the text with those **deletions already applied** - never the unescape,
+  which must run exactly once, in the image, and never the field strip - so planned text and
+  stored text are one string, and `structure_chunking_stripped_chars` names the codepoints taken
+  out (a form feed from a page break is invisible in the output and moves where a piece reads as
+  ending). Zero-width characters such as the 46 U+200B in `OrderBook.docx` **stay**: they are in
+  the stored chunk, so they stay in the plan, and the extractor is not asked to compensate;
+- entities are counted, never expanded here: `structure_chunking_html_entities` says how many
+  `html.unescape` will expand. Usually harmless. When the entities *spell the marker* - the
+  marker's word with its angle brackets and its newlines written as numeric character references
+  - they are a cut the reader makes and we did not, so the picker skips that marker and the
+  replay refuses the payload;
+- before submitting, the worker replays the pipeline offline - sanitise, split on the delimiter,
+  compare the segments with the **stored form** of each piece - and falls back to today's route on
+  any mismatch. The comparison is exact, not stripped: the function's strip bites at the payload's
+  two outer edges only (first piece lstripped, last rstripped, interior untouched).
 
 State-row fields for this path: `structure_chunking_delimiters` (markers in the payload),
 `structure_chunking_sanitiser_check` (`ok`, or the reason it refused),
-`structure_chunking_stripped_chars`, `structure_chunking_chunk_token_basis`,
+`structure_chunking_stripped_chars`, `structure_chunking_html_entities`,
+`structure_chunking_chunk_token_basis`,
 `structure_chunking_chunk_token_size`, `structure_chunking_chunk_token_payload_gap`.
 
 `chunk_token_size` is LightRAG's own budget and is counted the way **LightRAG** counts

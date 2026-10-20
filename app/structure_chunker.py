@@ -91,13 +91,14 @@ information rather than to the extra tokens.
 from __future__ import annotations
 
 import hashlib
+import html
 import math
 import re
 from collections import Counter
 from . import topic_segment
-from .lightrag_text import (is_conservative_marker, is_survivable_delimiter,
-                            normalise_for_lightrag, pieces_survive,
-                            stripped_characters)
+from .lightrag_text import (entity_expansions, is_conservative_marker,
+                            is_survivable_delimiter, normalise_for_lightrag,
+                            pieces_survive, stripped_characters)
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 
@@ -1462,6 +1463,12 @@ def chunk_document(text: str, *, filename: str = "",
             stats.bump(f"sanitiser_stripped:{name}", count)
         stats.bump("sanitiser_chars_removed", sum(report.values()) or len(text) - len(cleaned))
         text = cleaned
+    entities = entity_expansions(text)
+    if entities:
+        # LightRAG expands these on the way in (one pass), so the stored chunk is not the text
+        # we counted, character for character. Counted here so a reader can price the gap; the
+        # delimiter pick and the pre-submit replay are what keep it from inventing a cut.
+        stats.bump("html_entities", entities)
     raw_lines = [line for line in text.splitlines() if not _HEADER_RE.match(line.rstrip())]
     stats.bump("lines_in", len([line for line in text.splitlines() if line.strip()]))
     if len(raw_lines) != len(text.splitlines()):
@@ -1695,13 +1702,25 @@ def pick_delimiter(plan: ChunkPlan, explicit: str | None = None) -> str:
     chunks. Choosing from candidates that are absent, and refusing an explicit one
     that is present, is what keeps the promise that our cut list is the cut list.
 
-    Two refusals were added after the stack2 run. An explicit delimiter built from
-    characters the pipeline strips (``\x1e`` above all) is refused rather than obeyed, because
-    it arrives as nothing. And when every candidate is already in the text, the picker builds
-    a longer printable marker from the document's own sha256 - deterministic, so re-running one
-    file picks the same delimiter - instead of reaching for a control character.
+    Three refusals were added after the stack2 run. An explicit delimiter built from
+    characters the pipeline deletes (``\x1e`` above all) is refused rather than obeyed, because
+    it arrives as nothing. A candidate that only appears ONCE THE TEXT IS UNESCAPED is also
+    refused: ``sanitize_text_for_encoding`` runs ``html.unescape`` before it splits, so
+    ``&#10;&#10;&#60;&#60;&#60;CHUNK-BREAK&#62;&#62;&#62;&#10;&#10;`` is a cut in the reader even
+    though it is not one in the file. And when every candidate is already in the text, the
+    picker builds a longer printable marker from the document's own sha256 - deterministic, so
+    re-running one file picks the same delimiter - instead of reaching for a control character.
+
+    This check runs over the piece bodies and their unescaped renders. It is an early refusal,
+    not the gate: :func:`pieces_survive` re-runs the same test on the exact payload about to be
+    sent, and that is what stops the request.
     """
     joined = "\n".join(piece.body for piece in plan.pieces)
+    # What the reader sees before it splits: our renders, entities expanded.
+    expanded = "\n".join(html.unescape(piece.render()) for piece in plan.pieces)
+
+    def absent(marker: str) -> bool:
+        return marker not in joined and marker not in expanded
     if explicit is not None:
         # One refusal for both shapes of the same mistake. A whitespace-only marker is
         # refused because the pipeline strips the field before splitting it, which is also
@@ -1712,16 +1731,17 @@ def pick_delimiter(plan: ChunkPlan, explicit: str | None = None) -> str:
                 "ASCII letters, digits, '<', '>', '-' get through sanitize_text_for_encoding "
                 "intact, and a stripped or whitespace-only delimiter turns the whole document "
                 "into one segment")
-        if explicit in joined:
+        if not absent(explicit):
             raise StructureChunkerError(
-                "delimiter occurs inside the document: split_by_character_only would cut "
-                "where this plan did not. Choose another delimiter.")
+                "delimiter occurs inside the document - or appears once its HTML entities are "
+                "unescaped, which LightRAG does before splitting: split_by_character_only "
+                "would cut where this plan did not. Choose another delimiter.")
         return explicit
     digest = hashlib.sha256(joined.encode("utf-8", "replace")).hexdigest()
     for candidate in DELIMITER_CANDIDATES + tuple(
             f"\n\n<<<CHUNK-BREAK-{digest[:length]}>>>\n\n"
             for length in _HASH_DELIMITER_LENGTHS):
-        if candidate not in joined and is_conservative_marker(candidate):
+        if absent(candidate) and is_conservative_marker(candidate):
             return candidate
     raise StructureChunkerError(
         "no candidate delimiter is absent from this document; refusing to guess")

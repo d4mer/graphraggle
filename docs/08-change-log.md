@@ -286,3 +286,44 @@ Tests: `tests/test_lightrag_text.py` (14) plus delimiter, sizing and worker repl
 `tests/test_structure_chunker.py`; the shape-invariant helper now replays the sanitiser for
 **every** fixture at three budgets. Suite: 1148 passed, 174 subtests. Eleven sabotage controls,
 all red, tree restored byte-identical.
+
+## 2026-10-20 — the sanitiser imitation is now a parity implementation (golden fixture)
+
+Hermes ran the real `lightrag.utils.sanitize_text_for_encoding` inside `lightrag-server2` over
+62 fixed strings and compared it with `sanitize_like_lightrag`: **18 of 62 differed**. Attempt 2
+of the ingest brief stopped at that gate, as designed, and nothing was ingested. The imitation
+had been written from the documented behaviour, and the documentation was not the function.
+
+What the image actually does, in order (`utils.py:5529-5566`):
+
+1. `text.strip()` — the whole field
+2. `html.unescape(text)` — **one** pass (`&amp;lt;` → `&lt;`)
+3. delete lone surrogates and `U+FFFE`/`U+FFFF`
+4. delete C0 except `\t` `\n` **and `\r`**, plus DEL
+5. `text.strip()`
+
+So the earlier imitation was wrong in both directions: it folded CR (the image keeps every
+carriage return) and it deleted zero-width/format characters (the image keeps all of them,
+including the 46 `U+200B` in `OrderBook.docx`), and it never expanded entities.
+
+- `app/lightrag_text.py` rewritten to that order. Parity is asserted over the fixture pair
+  `tests/fixtures/sancmp_tests.json` + `sancmp_real.json` in `tests/test_sanitiser_parity.py`:
+  **62/62 byte-identical** (inputs and outputs travel as hex; lone surrogates are decoded with
+  `surrogatepass`).
+- `normalise_for_lightrag` (plan time) applies the **deletions only** — never the unescape, which
+  must run exactly once in the image, and never the field strip. Format characters stay in the
+  plan because they stay in the stored chunk.
+- Entities can **invent a cut**: `&#10;&#10;&#60;&#60;&#60;CHUNK-BREAK&#62;&#62;&#62;&#10;&#10;`
+  is not a marker in the file and is one after step 2. `pick_delimiter` now tests every candidate
+  against the unescaped text as well, and `pieces_survive` refuses any payload whose delimiter
+  count changes under unescaping — falling back to `/documents/upload` with
+  `structure_chunking_reason` naming the entity hazard. `structure_chunking_html_entities` records
+  how many expansions to expect.
+- The replay compares **exactly**: `_stored_form` models the real function's strip at the
+  payload's two outer edges only (first piece lstripped, last rstripped, interior untouched).
+
+Suite: 1179 passed, 2 warnings, 236 subtests (62 of them the golden parity) in 6.8s. Controls:
+`/tmp/parity_controls.py` — 15 sabotages, **13 RED**, 2 honestly green: removing the *leading*
+field strip, and removing both strips, change nothing on the fixture — for this composition
+`strip ∘ f` and `f ∘ strip` agree, verified over 9,261 generated strings, so the fixture cannot
+pin step 1 on its own.
