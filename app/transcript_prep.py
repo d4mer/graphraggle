@@ -165,6 +165,42 @@ _NON_SPEAKER_LABELS = frozenset({
     " ingredients", "ingredients", "directions", "instructions", "materials",
 })
 
+# A key/value or record list reads like a one-voice transcript to any label
+# grammar: one "label" heads every line and what follows it is a value, not
+# speech. These nouns name a property of a thing rather than an agent, so a line
+# that opens with one is a field, never a turn (this is the same family as
+# _NON_SPEAKER_LABELS above, and the reason "Q:"/"A:" was never a speaker).
+# Human ROLES are deliberately absent: in minutes and depositions "Chair:",
+# "Witness:" and "Counsel:" really are speakers, and a real voice is worth more
+# than a missed field name.
+_FIELD_KEY_LABELS = frozenset({
+    "vendor", "vendors", "supplier", "suppliers", "contact", "contacts",
+    "status", "price", "prices", "cost", "costs", "total", "totals", "amount",
+    "quantity", "qty", "unit", "units", "model", "serial", "sku", "part",
+    "parts", "item", "items", "description", "descriptions", "category",
+    "brand", "size", "sizes", "weight", "colour", "color", "address",
+    "city", "region", "country", "phone", "email", "account", "invoice",
+    "order", "shipment", "delivery", "budget", "rate", "rates", "tariff",
+    "depot", "lane", "reference-number", "part-number",
+})
+
+# A turn has something said in it. When a document is shaped like a list (every
+# field's lines in one block, no field coming back), the bodies decide whether it
+# is still a transcript: the median labelled body of a list is a value, and the
+# median body of anybody's speech is a sentence or more. Six words is the ceiling
+# - well above "depot 0." and well below a turn of real speech.
+_LIST_MAX_MEDIAN_VALUE_WORDS = 6
+
+# The line shape that makes a field key visible for DIAGNOSIS: the noun the label
+# parser rejected because it is an attribute, counted so a skipped document says
+# why (numbers only, never words from the file). The optional prefix follows
+# _TURN_PATTERNS - a bracketed or bare timestamp, or ">>" - and this is an rf string
+# so {_TS} really interpolates; the {{1,30}} braces are the name's own repeat count.
+_FIELD_KEY_LINE = re.compile(
+    rf"^\s*(?:\[{_TS}\][ \t]*-?[ \t]*|{_TS}[ \t]+|>>[ \t]*)?"
+    rf"(?P<name>[^\W\d_][\w'’.\-]{{1,30}})[ \t]*:"
+)
+
 # A turn label in parentheses that is a stage direction or a prose
 # parenthetical, not a speaker. Counted as content, never as a speaker label.
 _NON_SPEAKER_PARENS = frozenset({
@@ -354,6 +390,9 @@ def _clean_name(raw: str) -> str | None:
     if not name or len(name) > 40:
         return None
     if name.lower() in _NON_SPEAKER_LABELS:
+        return None
+    # "Vendor: depot 0." is a field, not somebody speaking.
+    if name.lower() in _FIELD_KEY_LABELS:
         return None
     # A label that ends in punctuation or contains a path/URL fragment is not a name.
     if "://" in name or name.endswith((",", ";", ".")) or "?" in name:
@@ -824,6 +863,9 @@ def prepare_transcript(
     unparseable_labels = 0
     label_counts: dict[str, int] = {}
     paren_counts: dict[str, int] = {}
+    label_order: list[str] = []
+    body_word_counts: list[int] = []
+    field_key_lines = 0
     cue_lines = 0
     nonempty = 0
     for raw in lines:
@@ -838,10 +880,12 @@ def prepare_transcript(
             speaker, body, style = parsed
             label_lines += 1
             label_counts[speaker.lower()] = label_counts.get(speaker.lower(), 0) + 1
+            label_order.append(speaker.lower())
             if style == "paren":
                 paren_label_lines += 1
                 paren_counts[speaker.lower()] = paren_counts.get(speaker.lower(), 0) + 1
             if body:
+                body_word_counts.append(len(body.split()))
                 turns.append(_Turn(speaker=speaker, words=body.split()))
             else:
                 turns.append(_Turn(speaker=speaker))
@@ -861,6 +905,11 @@ def prepare_transcript(
                 continue
         if _is_noise(line):
             continue
+        field_key = _FIELD_KEY_LINE.match(line)
+        if parsed is None and field_key and field_key.group("name").lower() in _FIELD_KEY_LABELS:
+            # The label parser refused it as an attribute noun; keep the count so
+            # the skip can be diagnosed as a key/value list rather than "no labels".
+            field_key_lines += 1
         if turns:
             turns[-1].words.extend(line.split())
         else:
@@ -875,6 +924,21 @@ def prepare_transcript(
     render_style = "paren" if paren_label_lines >= max(3, label_lines - paren_label_lines) else "colon"
     repeat_required = 2
     repeated = any(count >= repeat_required for count in label_counts.values())
+    # A conversation comes back to a voice; a list read top to bottom does not. If
+    # every label's lines sit in ONE contiguous block (three "Vendor:" lines, then
+    # two "Contact:" lines), the document is a key/value list and every field name
+    # would become a speaker in every header. Counting the label runs is the whole
+    # test: the runs are the blocks, and a block never comes back. A person CAN
+    # speak in one unbroken block, so the shape alone is not enough: the bodies have
+    # to be values rather than speech (median below the value ceiling) before the
+    # document is left alone on shape alone.
+    label_runs = [key for index, key in enumerate(label_order)
+                  if index == 0 or label_order[index - 1] != key]
+    returns_to_a_voice = len(label_runs) > len(set(label_runs))
+    bodies_are_values = bool(body_word_counts) and (
+        sorted(body_word_counts)[len(body_word_counts) // 2] <= _LIST_MAX_MEDIAN_VALUE_WORDS
+    )
+    field_list_shape = bool(body_word_counts) and not returns_to_a_voice and bodies_are_values
     # Detection is deliberately conservative; a document that fails any of these
     # is handed to LightRAG untouched. The density gate is 20% of non-empty lines
     # (was 30%), which is what lets a transcript with long label-less continuation
@@ -884,6 +948,7 @@ def prepare_transcript(
         and distinct >= 2
         and repeated
         and label_lines >= 0.20 * nonempty
+        and not field_list_shape
     )
     # One voice, repeated enough to be a recording rather than a labelled list.
     single_voice = (
@@ -902,7 +967,11 @@ def prepare_transcript(
     coverage = f"+unparseable({unparseable_labels})" if unparseable_labels else ""
     if not detected:
         reason = "no-speaker-labels"
-        if label_lines and distinct < 2:
+        if field_key_lines and not label_lines:
+            reason = f"field-key-labels({field_key_lines}/{nonempty})"
+        elif label_lines and distinct >= 2 and repeated and field_list_shape:
+            reason = f"key-value-list({distinct}/{label_lines})"
+        elif label_lines and distinct < 2:
             reason = f"one-speaker-only({label_lines} labels)"
         elif label_lines and not repeated:
             reason = f"no-recurring-speaker({label_lines} labels)"

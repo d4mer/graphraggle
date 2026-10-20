@@ -162,6 +162,31 @@ We lost two days on the rollback rehearsal as well.
 Action items are tracked in the board, not here.
 """
 
+# A key/value list: field names head the lines, values follow them, and nobody is
+# speaking. Grouped by field, which is how such a list is written by hand.
+KEY_VALUE_GROUPED = """Vendor: depot 0.
+Vendor: depot 1.
+Vendor: depot 2.
+Contact: Maria Lopez.
+Contact: Peter Hall.
+Status: closed.
+Status: open.
+"""
+
+# The same list with one field, which is the shape that reads as a one-voice
+# recording to a label grammar.
+KEY_VALUE_ONE_FIELD = "".join(f"Vendor: depot {index}.\n" for index in range(6))
+
+# Field names no lexicon knows, so only the shape can give it away: every field's
+# lines sit in one block, and no field ever comes back after another spoke.
+KEY_VALUE_UNKNOWN_FIELDS = """Depota: north of the river.
+Depota: south of the river.
+Lanea: east gate.
+Lanea: west gate.
+Tariffa: flat per mile.
+Tariffa: flat per lane.
+"""
+
 
 def _content_tokens(text: str) -> list[str]:
     """Words of the content lines, with each line's own speaker label removed.
@@ -227,6 +252,63 @@ class TestDetection(unittest.TestCase):
         result = prep.prepare_transcript(text, filename="standup.txt")
         self.assertTrue(result.detected, result.reason)
         self.assertEqual(result.speakers, ("Alice",))
+
+    def test_a_key_value_list_is_left_untouched(self):
+        """Field names are not speakers: nothing is prepared, and the reason says why."""
+        for name, text in (("grouped", KEY_VALUE_GROUPED),
+                           ("one-field", KEY_VALUE_ONE_FIELD),
+                           ("unknown-fields", KEY_VALUE_UNKNOWN_FIELDS)):
+            result = prep.prepare_transcript(text, filename="Depot_list.txt")
+            with self.subTest(name):
+                self.assertFalse(result.detected, result.reason)
+                self.assertFalse(result.applied)
+                self.assertEqual(result.text, text, "the file was modified")
+                self.assertTrue("key-value-list" in result.reason
+                                or "field-key-labels" in result.reason,
+                                f"reason did not name it: {result.reason}")
+
+    def test_a_grouped_field_list_is_named_as_a_list_even_when_repeated(self):
+        result = prep.prepare_transcript(KEY_VALUE_UNKNOWN_FIELDS,
+                                         filename="Depot_list.txt")
+        self.assertFalse(result.detected, result.reason)
+        self.assertEqual(result.labels_parsed, 6)
+        self.assertIn("key-value-list", result.reason)
+
+    def test_field_key_labels_are_counted_for_the_diagnosis(self):
+        result = prep.prepare_transcript(KEY_VALUE_ONE_FIELD, filename="Depot_list.txt")
+        self.assertFalse(result.detected, result.reason)
+        self.assertEqual(result.labels_parsed, 0)
+        self.assertEqual(result.speakers, ())
+        self.assertIn("field-key-labels", result.reason)
+
+    def test_a_timestamped_key_value_list_is_named_for_its_field_keys(self):
+        """The diagnosis pattern must interpolate _TS, not carry a literal "{_TS}"."""
+        text = "".join(f"[00:{index:02d}] Vendor: depot {index}.\n" for index in range(6))
+        result = prep.prepare_transcript(text, filename="Depot_list.txt")
+        self.assertFalse(result.detected, result.reason)
+        self.assertFalse(result.applied)
+        self.assertEqual(result.text, text, "the file was modified")
+        self.assertEqual(result.labels_parsed, 0)
+        self.assertIn("field-key-labels", result.reason)
+        for line in ("Vendor: depot 0.", ">> Vendor: depot 0.", "   Vendor: depot 0.",
+                     "[00:01] Vendor: depot 0.", "[00:01:04.500] Vendor: depot 0.",
+                     "00:01 Vendor: depot 0."):
+            with self.subTest(line=line):
+                match = prep._FIELD_KEY_LINE.match(line)
+                self.assertIsNotNone(match, "the line shape is not recognised")
+                self.assertEqual(match.group("name"), "Vendor")
+
+    def test_a_voice_that_returns_after_another_still_makes_a_transcript(self):
+        """The list rule must not eat a transcript where each speaker has a block."""
+        text = """Alice: We should ship the bridge change behind a flag.
+Alice: The rollback path needs a test before the freeze.
+Alice: I will write it tonight, the plan is to cut on Friday.
+Bob: Agreed on the flag, and the freeze starts that night anyway.
+Bob: I will own the release note and the rehearsal on Monday.
+Bob: Nothing else blocks the cut as far as I can tell today.
+"""
+        result = prep.prepare_transcript(text, filename="standup_2026-10-09.txt")
+        self.assertTrue(result.detected, result.reason)
 
 
 class TestNormalisation(unittest.TestCase):

@@ -265,7 +265,7 @@ _CAPTION = re.compile(r"^\s*(?:table|figure|fig\.|exhibit|ex\.)[ \t]*[\divx]+[:.
 
 def _is_all_caps_heading(line: str) -> bool:
     stripped = line.strip()
-    if not stripped or len(stripped) > 60 or _TERMINAL.match(stripped):
+    if not stripped or len(stripped) > 60 or _TERMINAL.search(stripped):
         return False
     words = stripped.split()
     if not 1 <= len(words) <= 6:

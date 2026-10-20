@@ -332,3 +332,37 @@ Suite: 1179 passed, 2 warnings, 236 subtests (62 of them the golden parity) in 6
 field strip, and removing both strips, change nothing on the fixture — for this composition
 `strip ∘ f` and `f ∘ strip` agree, verified over 9,261 generated strings, so the fixture cannot
 pin step 1 on its own.
+
+## 2026-10-20 — all-caps headings and key/value lists (two chunker defects)
+
+- `app/structure_chunker.py` `_is_all_caps_heading` used `_TERMINAL.match(stripped)`. `_TERMINAL`
+  is `[.!?\u2026]$`, so `.match` can only ever succeed on a one-character string: an all-caps
+  **sentence** ("FREIGHT COSTS ROSE IN MARCH.") passed the terminal test and became a heading,
+  opening a section and writing itself into every header of the pieces under it
+  (`Section: FREIGHT COSTS ROSE IN MARCH.`). Now `.search`, as every other use of `_TERMINAL`
+  already was. `"FREIGHT COSTS"` is still a heading; `"FREIGHT COSTS."` is not.
+- `app/transcript_prep.py` read a capitalised key/value list as a transcript: `Vendor: depot 0.`
+  ×N is one label heading every line, which is exactly what the `single_voice` gate accepts as a
+  one-voice recording. Two rules, each with its own test:
+  1. **Field keys are not speakers** (`_FIELD_KEY_LABELS`, rejected in `_clean_name`, the same
+     family that already refused `Note:` and `Q:`/`A:`): attribute nouns — vendor, contact,
+     status, price, quantity, model, serial, depot, tariff … Human **roles** are deliberately
+     absent (`Chair:`, `Witness:`, `Counsel:` are speakers in minutes and depositions).
+  2. **A conversation comes back to a voice; a list does not.** When every label's lines sit in
+     one contiguous block and no label ever returns after another intervened, and the median
+     labelled body is a value rather than speech (≤ 6 words), the document is left alone even if
+     no lexicon knows the field names.
+  Both report the cause: `field-key-labels(n/lines)` and `key-value-list(labels/lines)`.
+  Trade-off, stated plainly: a grouped list whose field names are unknown AND whose lines
+  alternate record-by-record is still read as a transcript (it is structurally a conversation),
+  and a two-voice transcript where each voice speaks exactly once in one unbroken block of short
+  turns is now left untouched. A field noun used as a form of address loses its turns.
+
+Suite: 1185 passed, 2 warnings, 239 subtests in 6.8s (baseline before the two fixes: 1179 passed,
+2 warnings, 236 subtests). Red before the fix:
+`test_an_all_caps_line_ending_in_a_full_stop_is_not_a_heading`,
+`test_an_all_caps_sentence_does_not_open_a_section`,
+`test_a_key_value_list_is_left_untouched` (3 subtests),
+`test_field_key_labels_are_counted_for_the_diagnosis`,
+`test_a_grouped_field_list_is_named_as_a_list_even_when_repeated`. No existing expectation was
+edited: the only pre-existing test touching the changed branch still passes as written.

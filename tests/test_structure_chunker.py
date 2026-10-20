@@ -37,6 +37,7 @@ from app.structure_chunker import (              # noqa: E402
     tokenizer_name,
     token_count,
     _content_words,
+    _is_all_caps_heading,
     _is_heading,
     coverage_gaps,
     body_words,
@@ -208,6 +209,37 @@ class TestRules(unittest.TestCase):
         self.assertTrue(headed)
         self.assertTrue(any("Section: Procurement policy / Scope" in (piece.header or "")
                             for piece in headed))
+
+    def test_an_all_caps_line_ending_in_a_full_stop_is_not_a_heading(self):
+        # _TERMINAL is anchored at "$", so ".match" only ever succeeds on a
+        # one-character string: an all-caps SENTENCE used to pass as a heading.
+        self.assertFalse(_is_all_caps_heading("FREIGHT COSTS."))
+        self.assertFalse(_is_all_caps_heading("FREIGHT COSTS ARE RISING."))
+        self.assertFalse(_is_all_caps_heading("FREIGHT COSTS?"))
+        self.assertFalse(_is_all_caps_heading("FREIGHT COSTS\u2026"))
+        self.assertFalse(_is_heading("FREIGHT COSTS ARE RISING."))
+        # ... while a real all-caps heading still is one.
+        self.assertTrue(_is_all_caps_heading("FREIGHT COSTS"))
+        self.assertTrue(_is_heading("FREIGHT COSTS"))
+
+    def test_an_all_caps_sentence_does_not_open_a_section(self):
+        text = ("# Procurement policy\n\n"
+                "The company buys freight services from approved vendors only, and every "
+                "purchase above the threshold needs a written approval from the finance lead.\n\n"
+                "FREIGHT COSTS ROSE IN MARCH.\n\n"
+                "Fuel surcharges and a depot shortage lasted six weeks and we recorded the "
+                "whole amount in the ledger before the board meeting.\n\n"
+                "Approved forwarders may invoice monthly on the contracted lanes listed in "
+                "the annex.\n")
+        for budget in (60, 90, 120):
+            plan = chunk_document(text, filename="Caps.md", budget_tokens=budget,
+                                  header_tokens=20)
+            for piece in plan.pieces:
+                self.assertNotIn("FREIGHT COSTS ROSE IN MARCH.", piece.section_path,
+                                 f"budget {budget}: caps sentence became a section")
+                self.assertNotIn("Section: FREIGHT", piece.header or "")
+            joined = "\n".join(piece.body for piece in plan.pieces)
+            self.assertIn("FREIGHT COSTS ROSE IN MARCH.", joined)
 
     def test_a_list_travels_with_its_lead_in_when_it_fits(self):
         plan = chunk_document(NESTED_LISTS, filename="Lists.txt", budget_tokens=200,
