@@ -1,0 +1,35 @@
+name: lead
+version: "1.0"
+description: >-
+  Orchestrator seat. Plans work, writes briefs, delegates implementation and
+  testing to the worker via the rig queue, verifies results, and is the only
+  seat that commits and pushes to GitHub.
+
+defaults:
+  runtime: claude-code
+
+profiles:
+  default:
+    summary: Standard operations profile.
+    uses:
+      skills: []
+      guidance: [role]
+      subagents: []
+      plugins: []
+      runtime_resources: []
+
+resources:
+  guidance:
+    - id: role
+      path: guidance/role.md
+
+startup:
+  files:
+    - path: guidance/role.md
+      delivery_hint: send_text
+      required: true
+    - path: startup/context.md
+      delivery_hint: send_text
+      required: true
+      applies_on: [fresh_start]
+  actions: []

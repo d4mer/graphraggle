@@ -1,0 +1,45 @@
+version: "0.2"
+name: graphraggle
+summary: >-
+  GraphRAG implementation team. Lead owns the project end to end and delegates
+  implementation and testing to the worker seat. Code lives in this repo and is
+  pushed to github.com/d4mer/graphraggle.
+
+permission_policy: builtin:open
+
+docs:
+  - path: README.md
+  - path: TODO.md
+  - path: docs/INDEX.md
+
+pods:
+  - id: orch
+    label: Orchestration
+    summary: End-to-end owner of the project.
+    members:
+      - id: lead
+        agent_ref: "local:agents/lead"
+        profile: default
+        runtime: claude-code
+        cwd: "."
+    edges: []
+
+  - id: dev
+    label: Development
+    summary: Executes work and testing handed down by the lead.
+    members:
+      - id: worker
+        agent_ref: "local:agents/worker"
+        profile: default
+        runtime: pi
+        model: strata/qwen3.8-flash
+        cwd: "."
+    edges: []
+
+edges:
+  - kind: delegates_to
+    from: orch.lead
+    to: dev.worker
+  - kind: can_observe
+    from: dev.worker
+    to: orch.lead
