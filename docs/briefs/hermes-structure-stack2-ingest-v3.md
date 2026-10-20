@@ -1,6 +1,6 @@
 # Hermes brief: stack2 structure ingest, attempt 3 (sanitiser parity) (chunkrun9, printable delimiter)
 
-**Status: DRAFT - NOT APPROVED. Do not start until the lead sends the go.** Supersedes the failed first attempt in
+**Status: APPROVED by the operator on 2026-10-20 (steps 0-4 as written; action 5, production queries, is NOT approved).** Supersedes the failed first attempt in
 `briefs-hermes-structure-stack2-ingest.md` (read its Hard rules, Checkpoints and Report sections; they all still apply,
 unchanged, including: production untouched, counts only, action 5 NOT approved). Stack2 only.
 
