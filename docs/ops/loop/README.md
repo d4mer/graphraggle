@@ -122,7 +122,7 @@ extracting them only to let LightRAG re-cut the text would trade one invisible c
 
 | setting | default | meaning |
 |---|---|---|
-| `WORKER_PDF_EXTRACT_ENABLED` / `WORKER_DOCX_EXTRACT_ENABLED` | true | per-type kill switch (still requires `STRUCTURE_CHUNKING_ENABLED`) |
+| `WORKER_PDF_EXTRACT_ENABLED` / `WORKER_DOCX_EXTRACT_ENABLED` | false | per-type opt-in (both also require `STRUCTURE_CHUNKING_ENABLED`) |
 | `WORKER_PDF_TEXT_BACKEND` | `auto` | `auto` prefers poppler's `pdftotext -layout` (already in the image, and it reproduces column positions, which is what the row reassembly reads), then `pypdf`. Which one ran is recorded as `structure_extract_backend` |
 | `WORKER_PDF_MAX_BYTES` / `_MAX_CHARS`, `WORKER_DOCX_MAX_BYTES` / `_MAX_CHARS` | 104857600 / 2000000 | byte and character guards |
 | `STRUCTURE_CHUNKING_MAX_PIECE_TOKENS` | 7500 | the **window**: the only reason to cut, and it is the embedder window minus margin, not a size target |

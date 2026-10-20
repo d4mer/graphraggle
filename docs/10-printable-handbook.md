@@ -128,7 +128,7 @@ RERANK_MODEL=jina-reranker-v3-mlx
 ```
 
 ```yaml
-image: ghcr.io/hkuds/lightrag:v1.4.15
+image: ghcr.io/hkuds/lightrag:v1.5.7
 ```
 
 ## Known Rules

@@ -48,8 +48,8 @@ class Settings(BaseSettings):
     # invisible cut for another. Extraction is per-type killable so a bad parser cannot take
     # the whole ingest down. Any extraction failure falls back to the upload route: a
     # document is never lost to a parser.
-    worker_pdf_extract_enabled: bool = Field(default=True, alias="WORKER_PDF_EXTRACT_ENABLED")
-    worker_docx_extract_enabled: bool = Field(default=True, alias="WORKER_DOCX_EXTRACT_ENABLED")
+    worker_pdf_extract_enabled: bool = Field(default=False, alias="WORKER_PDF_EXTRACT_ENABLED")
+    worker_docx_extract_enabled: bool = Field(default=False, alias="WORKER_DOCX_EXTRACT_ENABLED")
     # pypdf and python-docx both hold the parsed document in memory; the byte limit is the
     # guard for the zip-bomb / huge-scan class, and the char cap bounds what is submitted.
     worker_pdf_max_bytes: int = Field(default=104_857_600, alias="WORKER_PDF_MAX_BYTES")
