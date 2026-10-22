@@ -1,7 +1,7 @@
 # Hermes brief: production-vs-stack2 retrieval comparison (same 100 probes, read-only)
 
-**Status: DRAFT. NOT APPROVED by the operator. Do not start. This is "action 5" of the structure ingest
-brief, which the operator has not approved. Production is only READ (queries, no writes). Never `--allow-production`.**
+**Status: APPROVED by the operator on 2026-10-22 (this action only: the read-only 100-probe run against production
+`:9621`). The cutover brief is NOT approved. Production is only READ (queries, no writes). Never `--allow-production`.**
 Approval prompts appear in your pane; the operator must be at the terminal and pick the time window.
 Report to `~/rag-project/docs/ops/runs/recall-production-vs-stack2.md` (files, not `rig send`); STATUS on line 1.
 
