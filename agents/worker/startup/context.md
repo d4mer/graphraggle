@@ -1,27 +1,22 @@
 # worker seat — durable context
 
-Last updated: 2026-10-20 15:00Z. **My work is INTEGRATED**: the lead committed both rounds as
-`f7051e6` ("Chunker fixes: all-caps heading rejects terminal punctuation; key/value lists no longer
-read as a one-voice transcript", 5 files, +219/−2) and fast-forwarded `master` to it. I re-ran the
-suite in the main checkout at `f7051e6` (bare env): **1186 passed, 2 warnings, 245 subtests in
-6.76s**. Nothing of mine is uncommitted anywhere; `../graphraggle-fixes` (`worker/chunker-fixes`)
-is clean at `f7051e6` and merged — the lead decides on worktree/branch removal, I left them.
-`master` is one commit ahead of `origin/master`; the lead was waiting on the operator for the push
-(its prompt showed "push master to origin"). **I never push.**
-Wake escalations `qitem-20261020125709-0e908a00` and `qitem-20261020131709-ec45ab53` closed by me
-as `no-follow-on` with evidence (they fire every ~15 min because the lead never closes its two
-stale rows — it cannot be nudged). **As of 13:17Z the push has NOT happened**: `master` = `f7051e6`,
-`origin/master` = `a9138dd` (ahead 1), and `rig capture orch-lead@graphraggle` shows that seat
-parked with an **unsubmitted** line `push master to origin` in its prompt.
-**Nothing else in my queue; do not invent work.**
+Last updated: 2026-10-21 07:50Z. **Current row `qitem-20261021073708-b5cb3ead` (docs/05 defaults)
+is handed off** — successor `qitem-20261021074501-050f5ab8` carries the full report as its body
+(use `--body-file` on handoff; that is what the lead now expects). Worktree
+`/home/maverick/work/graphraggle-docs05`, branch `worker/docs05` off `master` `39ce48b`, **uncommitted**:
+`docs/05-known-good-config.md` (+22/−3), `docs/08-change-log.md` (+26), new
+`tests/test_docs_defaults_match_config.py`. Suite there: **1189 passed, 2 warnings, 248 subtests**
+(baseline at `39ce48b`: 1186/245).
+
+Earlier work **is integrated**: the lead committed my chunker fixes as `f7051e6` and master has
+moved on since (`39ce48b` = DRAFT Hermes briefs; `c8480d9` = rig spec/agent specs). Nothing of mine
+is uncommitted outside the docs05 worktree. **Nothing else in my queue; do not invent work.**
 
 ## Queue state
 
-`rig queue list --owned` → `[]`. Two rows remain active and both belong to the lead
-(`qitem-20261020113144-5da7594a`, `qitem-20261020123931-48e82ca6`) — they are **stale, not
-undelivered**: the work was committed as `f7051e6`. I annotated both with that evidence and
-recommended the lead close them (not my rows, so I did not). Do not invent work; wait for a row
-from `orch-lead@graphraggle` or for the operator.
+`rig queue list --owned` → `[]`. Active rows are the lead's: `qitem-20261021074501-050f5ab8`
+(my docs/05 hand-back, body = my report) and `qitem-recovery-45db4492066282a3` (OpenRig recovery,
+not mine). Do not invent work; wait for a row from `orch-lead@graphraggle` or for the operator.
 Watchdog `parked-owner-consumer` (job `01M4AYEG0WK885GGJPDGRNVGD5`) is daemon-registered, not mine
 to cancel.
 
