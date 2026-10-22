@@ -366,3 +366,29 @@ Suite: 1185 passed, 2 warnings, 239 subtests in 6.8s (baseline before the two fi
 `test_field_key_labels_are_counted_for_the_diagnosis`,
 `test_a_grouped_field_list_is_named_as_a_list_even_when_repeated`. No existing expectation was
 edited: the only pre-existing test touching the changed branch still passes as written.
+
+## 2026-10-21 — docs/05 "defaults as shipped" corrected to what `app/config.py` actually defaults
+
+`docs/05-known-good-config.md` documented `STRUCTURE_CHUNKING_ENABLED=true` and
+`STRUCTURE_CHUNKING_EMBED_URL=http://192.168.1.190:1234/v1` in a block headed "defaults as
+shipped". Both are wrong: `structure_chunking_enabled` defaults to **false** and
+`structure_chunking_embed_url` to **empty** (empty = no topic pass, deterministic fallback). An
+operator reading the doc would have believed the worker structure-chunks out of the box, and that
+topic-shift cuts were running.
+
+- The block is now labelled **code defaults as shipped**, with the source named
+  (`app/config.py`, verified 2026-10-21), and the production values moved to a separate,
+  explicitly labelled **"to turn it on"** block: `STRUCTURE_CHUNKING_ENABLED=true`,
+  `WORKER_PDF_EXTRACT_ENABLED=true`, `WORKER_DOCX_EXTRACT_ENABLED=true`, plus the embed URL.
+- Recorded in the same place: `WORKER_PPTX_EXTRACT_ENABLED` ships **true**, so with structure
+  chunking on the worker already extracts `.pptx` itself, while `.pdf` and `.docx` stay on
+  `/documents/upload` until their flags are set. That asymmetry is the easy one to get wrong.
+- No other doc states a default for these flags wrongly (checked `docs/ops/loop/README.md`
+  setting table, `docs/08-change-log.md`, the Hermes briefs, `packet-27-pptx-extract.md`,
+  `README.md`, `scripts/README.md`, `compose.yml`). Only `docs/05` needed changing; **no code
+  default was touched.**
+- New `tests/test_docs_defaults_match_config.py` parses that block and compares it with the
+  `Field(default=...)` of the matching `Settings` alias, so the block and the code cannot drift
+  apart silently again. It was red before the doc fix - it named both mismatches.
+
+Suite: 1189 passed, 2 warnings, 248 subtests (baseline 1186/245 at `39ce48b`).
