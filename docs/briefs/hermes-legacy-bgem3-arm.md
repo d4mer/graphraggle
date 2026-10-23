@@ -1,7 +1,9 @@
 # Hermes brief: third arm - production's legacy chunking re-ingested with BGE-M3 (isolate the embedder), then the same 100 probes
 
-**Status: DRAFT. NOT APPROVED by the operator. Do not start.** Scratch stack only; production is **not touched at all**
-in this brief (not even queries). Approval prompts appear in your pane; the operator will be at the terminal.
+**Status: APPROVED by the operator on 2026-10-23 (this action only: the scratch legacy-chunking BGE-M3 arm and its
+100-probe run). The cutover brief is NOT approved.** Scratch stack only; production is **not touched at all**
+in this brief (not even queries).
+Approval prompts appear in your pane; the operator will be at the terminal.
 Report to `~/rag-project/docs/ops/runs/legacy-bgem3-arm.md` (files, not `rig send`); STATUS on line 1.
 
 ## Why this run exists
