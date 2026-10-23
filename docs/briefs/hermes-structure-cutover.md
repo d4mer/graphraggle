@@ -13,18 +13,21 @@ same 10 documents as 110 legacy fixed-1200/100 chunks (1,566 entities, 1,964 rel
 serve the structure-ingested store and makes the production worker cut new documents the same way. It is justified
 only by the retrieval comparison (`hermes-production-vs-stack2-recall.md`); the operator decides after reading it.
 
-## Decisions the lead must settle before approval (left blank on purpose)
-1. **Code to deploy.** Not chunkrun9. `master` has three later changes to the runtime code (all-caps heading check
-   `.search`, key/value-list detection in `transcript_prep`, PDF/DOCX extract flags default **false**). Tag name and
-   commit: `____` (the lead creates the tag; build from the tag, never a branch tip). Phase 1 proves the tag cuts the 10
-   documents into the same pieces stack2 stored.
-2. **How the data gets there.** Option A (recommended, fast): swap stack2's LightRAG store into production, with the
-   state DB reconciled so the worker does not resubmit anything. Option B: re-ingest on production, about 3.2 hours with
-   retrieval degraded while the store is empty. Default is A unless phase 2 shows the state DB cannot be reconciled
-   safely. Chosen: `____`.
-3. **Production's embedder.** `docs/05` says BGE-M3 has been the only embedder since 2026-10-18. Phase 0 records what
-   production's LightRAG actually runs. If it is still a different model, the swap must include the embedding switch in
-   the same window (stack2's embedding settings), because queries would otherwise embed with the wrong model.
+## Decisions (PROPOSED by the lead; the operator confirms or changes each before approval)
+Evidence: `recall-production-vs-stack2.md` and `legacy-bgem3-arm.md` (A production 85, B legacy+BGE-M3 83, C stack2 91).
+Embedder effect B-A = -2 (noise); chunking effect C-B = +8 (95% bootstrap 0 to 16, sign test p=0.077); all of the gain is on
+the structure probe sets, Solvay probes show no gain. The case for cutover is the chunker, on structure-heavy documents.
+1. **Code to deploy: tag `structure-cutover-1` at commit `f7051e6`'s tree as of master** (the last runtime-code commit;
+   later master commits are docs/briefs only). The lead creates the tag after approval; build from the tag, never a branch tip.
+   Hermes gets it by `git bundle` from the lead, sha256 verified; nothing is pushed to origin without the operator.
+   Phase 1 proves the tag cuts the 10 documents into the same 129 pieces stack2 stored (chunkrun9 = `0047a69` differs from
+   the tag by the heading `.search`, key/value-list detection, and the PDF/DOCX extract defaults).
+2. **Data path: Option A** (swap stack2's store into production, state DB reconciled). Option B (re-ingest, ~3.2 h of degraded
+   retrieval, one more LLM-extraction draw) only if phase 2 shows the state DB cannot be reconciled safely.
+3. **Embedder: production runs mxbai-embed-large-v1, not BGE-M3** (container from 2026-10-13, never switched). The swap
+   carries BGE-M3 vectors (dim 1024), so the same window must apply stack2's embedding settings to production's
+   `.env`, otherwise queries embed with the wrong model against BGE-M3 vectors. Arm B shows the switch alone is neutral, so
+   it is a requirement of the data swap, not a benefit. Phase 0 re-confirms production's embedder before anything else.
 
 ## Hard rules
 - Phases 0 to 2 change nothing in production: no `.env` edit, no restart, no write to `lightrag_store/`,
