@@ -1,8 +1,8 @@
 # Hermes brief: cut production over to the structure-ingested store (stack2 -> production)
 
-**Status: DRAFT. NOT APPROVED by the operator. Do not start anything. Phases 0 to 2 are read-only or scratch-only and
-need their own approval; phase 3 changes production and needs a separate, explicit "go" from the operator for
-phase 3 itself. The lead fills in the commit/tag and the open choices below before asking for approval.**
+**Status: PHASES 0 TO 2 APPROVED by the operator on 2026-10-26 (decisions 1 to 3 as proposed below). PHASE 3 IS NOT
+APPROVED: it changes production and needs a separate, explicit "go for phase 3" from the operator. Do not start phase 3
+and do not touch production in phases 0 to 2.**
 Approval prompts appear in your pane; the operator will be at the terminal for phase 3.
 Report to `~/rag-project/docs/ops/runs/structure-cutover.md` (files, not `rig send`); STATUS on line 1.
 
