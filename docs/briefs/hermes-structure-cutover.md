@@ -17,14 +17,15 @@ only by the retrieval comparison (`hermes-production-vs-stack2-recall.md`); the 
 Evidence: `recall-production-vs-stack2.md` and `legacy-bgem3-arm.md` (A production 85, B legacy+BGE-M3 83, C stack2 91).
 Embedder effect B-A = -2 (noise); chunking effect C-B = +8 (95% bootstrap 0 to 16, sign test p=0.077); all of the gain is on
 the structure probe sets, Solvay probes show no gain. The case for cutover is the chunker, on structure-heavy documents.
-1. **Code to deploy: tag `structure-cutover-1` at commit `f7051e6`'s tree as of master** (the last runtime-code commit;
-   later master commits are docs/briefs only). The lead creates the tag after approval; build from the tag, never a branch tip.
+1. **Code to deploy: tag `structure-cutover-1` on commit `f7051e6`** (the last runtime-code commit; every later master
+   commit is docs, briefs, rig scaffolding or a test, nothing under `app/`). The lead creates the tag after approval; build from the tag, never a branch tip.
    Hermes gets it by `git bundle` from the lead, sha256 verified; nothing is pushed to origin without the operator.
    Phase 1 proves the tag cuts the 10 documents into the same 129 pieces stack2 stored (chunkrun9 = `0047a69` differs from
    the tag by the heading `.search`, key/value-list detection, and the PDF/DOCX extract defaults).
 2. **Data path: Option A** (swap stack2's store into production, state DB reconciled). Option B (re-ingest, ~3.2 h of degraded
    retrieval, one more LLM-extraction draw) only if phase 2 shows the state DB cannot be reconciled safely.
-3. **Embedder: production runs mxbai-embed-large-v1, not BGE-M3** (container from 2026-10-13, never switched). The swap
+3. **Embedder: production is believed to run mxbai-embed-large-v1, not BGE-M3** (container from 2026-10-13, never switched;
+   the repo cannot confirm it, only phase 0 can). The swap
    carries BGE-M3 vectors (dim 1024), so the same window must apply stack2's embedding settings to production's
    `.env`, otherwise queries embed with the wrong model against BGE-M3 vectors. Arm B shows the switch alone is neutral, so
    it is a requirement of the data swap, not a benefit. Phase 0 re-confirms production's embedder before anything else.
