@@ -24,8 +24,8 @@ the structure probe sets, Solvay probes show no gain. The case for cutover is th
    the tag by the heading `.search`, key/value-list detection, and the PDF/DOCX extract defaults).
 2. **Data path: Option A** (swap stack2's store into production, state DB reconciled). Option B (re-ingest, ~3.2 h of degraded
    retrieval, one more LLM-extraction draw) only if phase 2 shows the state DB cannot be reconciled safely.
-3. **Embedder: production is believed to run mxbai-embed-large-v1, not BGE-M3** (container from 2026-10-13, never switched;
-   the repo cannot confirm it, only phase 0 can). The swap
+3. **Embedder: production runs mxbai-embed-large-v1, not BGE-M3** (container from 2026-10-13, never switched; confirmed
+   from the running container env and host `.env` in `recall-production-vs-stack2.md`, 2026-10-22; phase 0 re-confirms). The swap
    carries BGE-M3 vectors (dim 1024), so the same window must apply stack2's embedding settings to production's
    `.env`, otherwise queries embed with the wrong model against BGE-M3 vectors. Arm B shows the switch alone is neutral, so
    it is a requirement of the data swap, not a benefit. Phase 0 re-confirms production's embedder before anything else.
@@ -48,6 +48,8 @@ the structure probe sets, Solvay probes show no gain. The case for cutover is th
    RestartCount; `/health` of gateway and LightRAG.
 2. Production LightRAG env that matters (names and values, no keys): embedding model/dim/max_token_size/binding,
    rerank, query params, CHUNK_SIZE / CHUNK_OVERLAP_SIZE if set. Same for stack2. List every difference.
+   Note: any query to production's LightRAG rewrites its `kv_store_llm_response_cache.json` (seen in the 2026-10-22 recall
+   run). Phase 0 itself sends no queries; expect that file's mtime to move only if something queries production.
 3. State DB: documents by status, rows sharing a sha256 with another row, rows with `retry_count > 0`, and the
    **schema** (table and column names) of every table the worker reads or writes. Counts only, no content.
 4. LightRAG: documents by status, and counts of chunks / entities / relations in production's store (read-only).
