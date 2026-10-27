@@ -1,6 +1,7 @@
 # Hermes brief: why does the tag cut the S/4 PDF differently? (read-only checks, counts only)
 
-**Status: DRAFT. NOT APPROVED by the operator. Do not start anything.** Everything below is read-only on production
+**Status: APPROVED by the operator on 2026-10-27 (this action only: the read-only diagnosis checks below). The cutover
+phases 2 and 3 are NOT approved.** Everything below is read-only on production
 (nothing at all touches production) and scratch-only elsewhere. Approval prompts appear in your pane.
 Report to `~/rag-project/docs/ops/runs/s4-pdf-split-diagnosis.md` (files, not `rig send`); STATUS on line 1.
 
