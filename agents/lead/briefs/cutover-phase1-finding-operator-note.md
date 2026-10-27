@@ -24,20 +24,26 @@ Phase 0 passed. Phase 1 failed its gate: the tag `structure-cutover-1` (commit `
   `f7051e6` itself changed chunker behaviour compared with the validated build. The brief's phase 1 exists to catch
   exactly this, and it did.
 
-## Most likely cause (not yet confirmed)
-`f7051e6` made the all-caps heading rule stricter (a line with terminal punctuation anywhere is no longer a heading).
-Fewer headings means fewer, larger pieces, which matches 106 down to 98. The worker has been asked to confirm this and to
-rule out the other two differences (key/value-list detection, extract defaults). Result expected in a few hours.
+## Most likely cause (worker's diagnosis, 2026-10-27, ~80% confidence, not yet confirmed on the real PDF)
+The text handed to the chunker probably differed: the PDF is extracted by `pdftotext -layout` when poppler is present
+and by `pypdf` otherwise, and the row-rejoining step differs by 803 rows versus 0 on this corpus, enough to move every
+boundary. Only the PDF differs (8 transcripts and the DOCX are byte-exact), which fits. The stricter heading rule in
+`f7051e6` is now the unlikely cause (~5%): on synthetic text at the shipped window it changed the unit plan but not one
+stored piece. A second candidate (~15%) is `transcript_prep` having run in one run and not the other. My earlier guess
+(the heading rule) was wrong. The worker added a counts-only tool (`scripts/chunk_boundary_diff.py`, on master) so
+Hermes can settle it on the real PDF without any text in a report. Two cheap read-only checks decide it (drafted in
+`docs/briefs/hermes-s4-pdf-split-diagnosis.md`, needs your approval).
 
 ## Options
 1. **Cut over with the exact validated build** (tag `0047a69` or its merge `9e1e308`). Reproduces 129/129 and keeps the
    91/100 evidence honest. Gives up the later heading fix and the key/value fix. Fastest.
 2. **Keep the tag `f7051e6` and re-ingest the PDF on stack2 under it**, then re-run the 100 probes. Measures the build you
    would actually ship. Costs roughly a day of oMLX time and is one more non-deterministic extraction draw.
-3. **Hold** until the worker's diagnosis says whether the new cut is a strict fix or a behaviour change.
+3. **Hold** until the two read-only checks above say whether the cause is the extractor, `transcript_prep`, or the chunker.
 
-My recommendation: option 3 first (hours, no cost), then choose between 1 and 2 on its answer. If the fix is clearly a
-bug fix and the operator wants the newer chunker in production, option 2; otherwise option 1.
+My recommendation: option 3 first (read-only, about an hour), then choose. If the cause is the extractor, the fix is to
+pin the PDF backend and the 91/100 result likely still stands for the tag (option 2 only if the replay still differs
+after pinning); if it is the chunker, option 1 or a re-ingest.
 
 ## Also found in phase 0 (for phase 3, no decision needed now)
 - The production ingest-worker has no BGE-M3 tokenizer mount; phase 3 needs a read-only mount.
@@ -45,4 +51,5 @@ bug fix and the operator wants the newer chunker in production, option 2; otherw
 - Production still runs mxbai-embed-large-v1; the swap forces BGE-M3 in the same window.
 
 ## Reply needed
-"Hold" (wait for the diagnosis), "option 1", or "option 2". Phases 2 and 3 stay unstarted until you choose.
+"Approve the diagnosis checks" (the read-only brief to Hermes, then I report and you choose), or "option 1", or "option 2".
+Phases 2 and 3 stay unstarted until you choose.
