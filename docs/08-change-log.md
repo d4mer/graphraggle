@@ -435,3 +435,40 @@ the code: 18 tests (the graded-schema, per-arm-column, driver-measurement and pa
 ones), proven by `git stash push -- scripts/overnight_loop.py` and restored byte-identical.
 No existing test expectation was edited: `git diff --numstat` shows `tests/test_overnight_loop.py`
 +91/-0.
+
+## 2026-10-27 — `scripts/chunk_boundary_diff.py`: counts-only A/B of the chunker across two commits
+
+A replay through tag `structure-cutover-1` (`f7051e6`) cut the S/4 PDF into 98 pieces where the
+stored build (`0047a69`, chunkrun9) stored 106, with **zero sha overlap**, while eight text
+transcripts and a DOCX came back byte-exact. Comparing two builds over one document needs a tool
+that can be pasted into a report, so this adds one. No app/ behaviour changed.
+
+- `scripts/chunk_boundary_diff.py` — two commit-ishes (exported with `git archive` into a temp dir,
+  so the working tree is never the thing under test) or two repo trees, one document, and **counts
+  only**: pieces per side, per-piece length + sha256, the first diverging index, how many pieces are
+  identical at the same index, sha OVERLAP between the sides, and per differing position the
+  character offsets and lengths on both sides. `--only-function` mode reports heading-detector
+  disagreements as (line number, character length, verdict_left, verdict_right) with **no line text**.
+  `--env KEY=VALUE` (repeatable) pins the child environment. Standard library only.
+- Each side runs in its **own interpreter** rooted at its own checkout. `app.structure_chunker`
+  imports its siblings relatively, so one process can never hold both versions.
+- Digest of the finding, measured on invented text (280-line PDF-like document, 20 planted all-caps
+  lines ending in a full stop): the rule change flips exactly those 20 lines
+  (`_is_all_caps_heading` 40 → 20, composite `_is_heading` 60 → 40) and moves `units_whole` 50 → 30,
+  but at the shipped window (`max_piece_tokens` 7500) it changed **no stored piece** — 10 pieces per
+  side, identical at every index. Only when the window binds does it move cuts (budget 200: 41 pieces
+  per side, 0 overlap). Piece **counts** never differed between the two builds at any budget tested,
+  so "stricter heading rule means fewer pieces" is not the mechanism here.
+- Same commit, only the extracted text differing (page marks dropped, column runs collapsed, some
+  wrapped lines joined): 10 pieces per side, **0 identical, 0 sha overlap**, p50 2,318/2,279 chars —
+  the audit's signature. `extract_pdf_text_with_backend` (`app/pdf_extract.py:201`) says why:
+  `pdftotext -layout` reproduces the column positions the row reassembly reads (Hermes measured 803
+  rows rejoined with poppler, 0 with pypdf), and the backend is recorded on the row as
+  `structure_extract_backend` (`app/worker.py:972`).
+- New `tests/test_chunk_boundary_diff.py` (18 tests) compares the two real commits over invented
+  text and asserts the report leaks no input text, no fixture word, and no line content.
+
+Suite: **1250 passed, 2 warnings, 248 subtests** (baseline at `b462f24`: 1232/248; two new files,
+no existing test edited). The patch also applies to a `git archive` export of `master` and there
+runs **1242 passed, 8 skipped** - the eight skips are the end-to-end class, which needs both
+comparison commits and skips by design without git history.
