@@ -392,3 +392,46 @@ topic-shift cuts were running.
   apart silently again. It was red before the doc fix - it named both mismatches.
 
 Suite: 1189 passed, 2 warnings, 248 subtests (baseline 1186/245 at `39ce48b`).
+
+## 2026-10-26 — retrieval is now graded, not just present-or-absent (`scripts/ranking_metrics.py`)
+
+`evidence_in_context` answered one binary question, so the recall comparisons
+(production 85, stack2 91, legacy+BGE-M3 83) could not say whether the evidence sat near the
+top of the returned context, whether a multi-fact probe got all of its facts or one of three,
+or whether the best evidence outranked merely supporting evidence.
+
+- New `scripts/ranking_metrics.py`: pure arithmetic, no I/O, **imports nothing from this repo**
+  so the Thinkpad helpers `probe/run_stack2_recall.py` / `run_prod_recall.py` can adopt it
+  unchanged. `recall_fraction`, `graded_recall_fraction`, `first_hit_rank`, `reciprocal_rank`,
+  `average_precision`, `ndcg_at_k` (gain `2^grade - 1` over the `log2(position + 1)` discount,
+  divided by the ideal ordering), `hit_at_k`, and `score_probe` for the whole row at once.
+  Each gold quote is credited **once**, in the first returned string that contains it.
+- The unit is the returned **string**, not a page: this corpus has no page numbers, so the
+  reference instrument's "graded relevant page" has no counterpart here.
+- `normalise_quote` and the response walk **moved into that module** and are re-exported by
+  `overnight_loop` (`context_strings` now delegates to `ranking_metrics.context_units`). One
+  definition of "the same text" for the loop, `chunk_embed_bench.py` and any future helper -
+  a pinned test asserts all three hold the same function object.
+- Probe schema: optional `evidence_grades`, ints 0-2 aligned with the `evidence` list
+  (2 = contains the answer, 1 = partly relevant, 0 = irrelevant). Absent, short, or out of
+  range means 2, which is what an ungraded probe already asserted, so **every existing probe
+  file scores exactly as before**. Turn-identifier keys (`turn_id`, `evidence_turn`,
+  `evidence_ids`) never take a grade slot.
+- Per arm, over the gold-evidence probes only: `evidence_recall`, `graded_recall`, `mrr`,
+  `average_precision`, `hit@1`, `hit@5`, `ndcg@5`, `any_hit_pct`, `all_hit_pct` (so this
+  instrument and the Hermes helpers, which require EVERY quote, can be reconciled rather than
+  argued about). `evidence_in_context_pct` is **unchanged and still gates the run**; na never
+  becomes a 0.0. `--compare` now also bootstraps `evidence_recall` and `mrr` per probe.
+- Deliberate gap, pinned by a test: the binary check joins the returned strings, so a gold
+  quote straddling a unit boundary is a hit there and a miss per unit. The gate keeps the join,
+  the rank metrics need the unit, and both numbers are reported so the difference is visible.
+- **Unverified, and marked as such in every output:** rank means "position in the response
+  walk". Nobody has confirmed that LightRAG lists chunks in retrieval order under
+  `only_need_context`, so `summary.json` carries `"rank_order": "unverified-order"` and the
+  comparison section says so. Confirming it against a real response is a stack-side job.
+
+Suite: **1232 passed, 2 warnings, 248 subtests** (baseline 1189/248 at `87abcd7`). Red before
+the code: 18 tests (the graded-schema, per-arm-column, driver-measurement and paired-interval
+ones), proven by `git stash push -- scripts/overnight_loop.py` and restored byte-identical.
+No existing test expectation was edited: `git diff --numstat` shows `tests/test_overnight_loop.py`
++91/-0.

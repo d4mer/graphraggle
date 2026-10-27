@@ -118,7 +118,20 @@ finding it answers:
   returned. That splits retrieval failures from synthesis failures without any
   judge. It sends no top_k/chunk_top_k/token budgets: the container env the arm set
   is what is being measured. ``--no-retrieval-recall`` skips it; a probe with no
-  gold quote is ``na``, never a miss. Reported as ``evidence in context%``.
+  gold quote is ``na``, never a miss. Reported as ``evidence in context%``, which is
+  the binary success gate and is NOT changed by anything below.
+* Graded retrieval quality (``scripts/ranking_metrics.py``): the same recall probe
+  response is also scored per returned STRING (unit), so an arm can be told apart
+  from one that buries the evidence. Per arm, over the probes that carry evidence
+  only: ``evidence_recall`` (mean fraction of a probe's gold quotes found), ``mrr``,
+  ``ndcg@5``, ``hit@1``, ``hit@5``, ``average_precision``, ``graded_recall``, plus
+  ``any_hit_pct``/``all_hit_pct`` so this instrument and the Thinkpad recall helpers
+  (which require EVERY quote) can be reconciled. A probe may grade its quotes with
+  the optional ``evidence_grades`` list (ints 0-2, aligned with ``evidence``; 2 =
+  contains the answer, 1 = partly relevant, 0 = irrelevant); missing or malformed
+  means all 2, so every existing probe file scores exactly as before. Rank numbers
+  carry ``"rank_order": "unverified-order"``: rank is position in the response walk,
+  and nobody has confirmed that LightRAG lists chunks in retrieval order.
 * Attribution (F4): the content rubric no longer folds speaker attribution in, and
   a separate judge call grades it right/wrong/na, reported as its own columns.
   Only probes with ``expected_speaker`` are graded, so an existing probe set is
@@ -149,13 +162,16 @@ Outputs, all under --out:
                    comparison section when --compare was given
     env.original   the untouched copy of <root>/.env (chmod 600)
     <name>/answers.jsonl, verdicts.jsonl, summary.json (verdict rows also carry
-                   draw, attribution and recall; summaries carry probe_scores)
+                   draw, attribution and recall; answer rows carry recall_metrics;
+                   summaries carry probe_scores and probe_ranking_metrics)
 
-Stdlib only (urllib, json, subprocess, argparse, time, pathlib, re) plus one
-first-party import: ``app.transcript_prep``, the same transcript preprocessor the
-ingest worker uses, so an experiment measures exactly what production would send.
-That module is itself stdlib-only and reads no settings. Every side effect goes
-through the Ops class so the tests can replace it with a fake: no network, no
+Stdlib only (urllib, json, subprocess, argparse, time, pathlib, re) plus three
+first-party imports: ``app.transcript_prep`` and ``app.structure_chunker``, the same
+transcript preprocessor and chunker the ingest worker uses, so an experiment
+measures exactly what production would send, and the sibling
+``scripts/ranking_metrics.py``, which is pure arithmetic and imports nothing back.
+Those modules are themselves stdlib-only and read no settings. Every side effect
+goes through the Ops class so the tests can replace it with a fake: no network, no
 docker, no sleeping in tests.
 """
 
@@ -193,6 +209,25 @@ from app.structure_chunker import (
     render_for_lightrag,
 )
 from app.transcript_prep import DEFAULT_HEADER_EVERY_TOKENS, prepare_transcript
+
+# The sibling script dir is sys.path[0] when this file is run as
+# scripts/overnight_loop.py, but not when a test imports it from the repo root,
+# so make the import of the ranking-metric module work either way.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+# Pure arithmetic on graded evidence, no I/O. normalise_quote and the response walk
+# live THERE and are re-exported here, so this file, chunk_embed_bench.py and the
+# Thinkpad recall helpers cannot drift to different definitions of a match.
+from ranking_metrics import (  # noqa: E402
+    ECHO_KEYS as _RECALL_ECHO_KEYS,
+    RANK_ORDER_MARKER,
+    context_units as ranked_units,
+    mean_metric,
+    normalise_quote,
+    score_probe,
+)
 
 # ── Configuration surface ───────────────────────────────────────────────────
 
@@ -1089,13 +1124,9 @@ def recall_probe_payload(question: str, mode: str = "mix") -> dict[str, Any]:
     }
 
 
-# Keys whose values are the request echoed back, not retrieved material: matching
-# them would score a hit for the question itself.
-_RECALL_ECHO_KEYS = frozenset({
-    "query", "question", "mode", "response_type", "model", "status", "message",
-    "only_need_context", "only_need_prompt", "stream", "include_references",
-    "include_chunk_content",
-})
+# Keys whose values are the request echoed back, not retrieved material. The set
+# itself lives in ranking_metrics.ECHO_KEYS (imported above as _RECALL_ECHO_KEYS)
+# so the ordered extractor and the binary check share one definition.
 
 
 def context_strings(payload: Any, *, skip: str = "") -> list[str]:
@@ -1105,30 +1136,11 @@ def context_strings(payload: Any, *, skip: str = "") -> list[str]:
     extractor refuses to guess an envelope: it walks the JSON and returns every
     string. That is a superset of the context and the chunk content, so a "hit"
     always means the gold text really was somewhere in what the stack returned.
+
+    It is the ordered walk in ``ranking_metrics.context_units``, unchanged: the
+    binary check below joins it, the rank metrics treat each entry as one unit.
     """
-    found: list[str] = []
-
-    def walk(node: Any, key: str | None) -> None:
-        if isinstance(node, str):
-            if key in _RECALL_ECHO_KEYS:
-                return
-            if node and node != skip:
-                found.append(node)
-        elif isinstance(node, list):
-            for entry in node:
-                walk(entry, key)
-        elif isinstance(node, dict):
-            for name, value in node.items():
-                walk(value, str(name))
-
-    walk(payload, None)
-    return found
-
-
-def normalise_quote(text: Any) -> str:
-    """Public: scripts/chunk_embed_bench.py scores recall with the SAME normalisation."""
-    normalised = re.sub(r"\s+", " ", str(text or "")).strip().lower()
-    return normalised.strip('"\u2018\u2019\u201c\u201d\'` ')
+    return ranked_units(payload, skip=skip, echo_keys=_RECALL_ECHO_KEYS)
 
 
 def gold_evidence_of(item: dict[str, Any]) -> list[str]:
@@ -1146,6 +1158,49 @@ def gold_evidence_of(item: dict[str, Any]) -> list[str]:
         elif isinstance(raw, (list, tuple)):
             values.extend(str(entry) for entry in raw)
     return [value for value in (normalise_quote(value) for value in values) if len(value) >= 4]
+
+
+# "evidence_grades": optional, one int per entry of the probe's "evidence" list.
+# 2 = the quote contains the answer, 1 = partly relevant, 0 = irrelevant. Absent,
+# short, or out of range means 2, which is what an ungraded probe already asserted,
+# so probe files written before this key exist are scored unchanged.
+GRADE_VALUES = (2, 1, 0)
+
+
+def evidence_grades_of(item: dict[str, Any]) -> list[int] | None:
+    """The probe's own grade list, cleaned; None when the probe does not carry one."""
+    raw = item.get("evidence_grades")
+    if not isinstance(raw, (list, tuple)):
+        return None
+    grades: list[int] = []
+    for value in raw:
+        grades.append(value if isinstance(value, int) and not isinstance(value, bool)
+                     and value in GRADE_VALUES else 2)
+    return grades
+
+
+def gold_evidence_with_grades(item: dict[str, Any]) -> list[tuple[str, int]]:
+    """(normalised quote, grade) pairs, aligned the way ``gold_evidence_of`` collects them.
+
+    Grades index the probe's own ``evidence`` list positionally, so a probe listing
+    three quotes grades them in that order; turn-identifier keys carry no grades and
+    default to 2. A quote too short to be evidence is dropped, exactly as in
+    ``gold_evidence_of``, and the grade slot it occupied is dropped with it.
+    """
+    grades = evidence_grades_of(item)
+    pairs: list[tuple[str, int]] = []
+    for key in ("evidence", "evidence_turn", "turn_id", "evidence_ids", "gold_span"):
+        raw = item.get(key)
+        values = [raw] if isinstance(raw, str) else (
+            [str(entry) for entry in raw] if isinstance(raw, (list, tuple)) else []
+        )
+        for index, value in enumerate(values):
+            grade = (grades[index] if key == "evidence" and grades is not None
+                     and index < len(grades) else 2)
+            normalised = normalise_quote(value)
+            if len(normalised) >= 4:
+                pairs.append((normalised, grade))
+    return pairs
 
 
 def evidence_in_context(item: dict[str, Any], payload: Any, *, question: str = "") -> str:
@@ -1300,6 +1355,37 @@ def score_set(
                         if (rows_extra[index] if index < len(rows_extra) else {}).get("recall") == "miss")
     recall_n = recall_hits + recall_misses
 
+    # Graded retrieval quality on the SAME recall probe response. Averaged only over
+    # the rows that carry gold evidence and got an answer: a gold-less probe is na
+    # and a missing stack is na, and neither may become a 0.0 that drags an arm down.
+    # rank-based values stay marked unverified-order (see ranking_metrics): nobody
+    # has confirmed that LightRAG lists chunks in the order it retrieved them.
+    metric_rows = [
+        rows_extra[index].get("recall_metrics")
+        for index in range(len(pairs))
+        if isinstance(rows_extra[index].get("recall_metrics"), dict)
+    ] if rows_extra else []
+    ranking = {
+        "ranking_measured_n": len(metric_rows),
+        "evidence_recall": mean_metric([row.get("evidence_recall") for row in metric_rows]),
+        "graded_recall": mean_metric([row.get("graded_recall") for row in metric_rows]),
+        "mrr": mean_metric([row.get("mrr") for row in metric_rows]),
+        "average_precision": mean_metric([row.get("average_precision") for row in metric_rows]),
+        "hit@1": mean_metric([row.get("hit@1") for row in metric_rows]),
+        "hit@5": mean_metric([row.get("hit@5") for row in metric_rows]),
+        "ndcg@5": mean_metric([row.get("ndcg@k") for row in metric_rows]),
+        # Reported side by side so this instrument and the Thinkpad helpers, which
+        # require EVERY gold quote, can be reconciled instead of argued about. None
+        # when nothing was measured: 0.0 would read as a measured failure.
+        "any_hit_pct": (
+            rate(sum(1 for row in metric_rows if row.get("any_hit")), len(metric_rows))
+            if metric_rows else None),
+        "all_hit_pct": (
+            rate(sum(1 for row in metric_rows if row.get("all_hit")), len(metric_rows))
+            if metric_rows else None),
+        "rank_order": RANK_ORDER_MARKER if metric_rows else None,
+    }
+
     # Second judge (finding F6): the same model family grades its own answers.
     # Agreement is measured only where both judges graded the same row.
     second_judge_n = 0
@@ -1352,6 +1438,7 @@ def score_set(
         "attribution_wrong_pct": rate(attribution_counts["wrong"], attribution_n),
         "evidence_n": recall_n,
         "evidence_in_context_pct": rate(recall_hits, recall_n),
+        **ranking,
         "second_judge_n": second_judge_n,
         "second_judge_agreement_pct": rate(second_judge_agree, second_judge_n),
         "by_type": by_type,
@@ -2278,17 +2365,41 @@ class Loop:
         return body
 
     def _recall_for(self, item: dict[str, Any]) -> str:
-        """hit/miss/na for one probe. A stack that will not answer is na, not miss."""
+        """hit/miss/na for one probe. A stack that will not answer is na, not miss.
+
+        The success gate still reads only this. ``_recall_measurement`` is what the
+        driver actually calls: the same response, graded further.
+        """
+        return self._recall_measurement(item)[0]
+
+    def _recall_measurement(self, item: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        """(hit/miss/na, graded measurement for the same response) for one probe.
+
+        One /query pays for both: the binary joined check that gates the run, and
+        the per-unit rank numbers that say WHERE the evidence sat. The two are not
+        identical by construction - the binary check joins the strings, so a quote
+        spanning two units is a hit there and a miss per unit - and both numbers are
+        reported so the gap is visible. ``None`` metrics means na: no gold quote, or
+        no answer from the stack.
+        """
+        question = str(item.get("question") or "")
         if not gold_evidence_of(item):
-            return "na"
+            return "na", None
         try:
             body = self._attempt(
                 lambda: self._ask_for_recall(item), what=f"recall {item.get('id')}", attempts=2
             )
         except (StepError, RuntimeError, OSError) as exc:
             self.log(f"recall probe {item.get('id')}: unavailable ({exc})")
-            return "na"
-        return evidence_in_context(item, body, question=str(item.get("question") or ""))
+            return "na", None
+        verdict = evidence_in_context(item, body, question=question)
+        gold = gold_evidence_with_grades(item)
+        metrics = score_probe(
+            [quote for quote, _grade in gold],
+            context_strings(body, skip=question),
+            [grade for _quote, grade in gold],
+        )
+        return verdict, metrics
 
     def _run_set(self, items: list[dict[str, Any]], concurrency: int) -> list[dict[str, Any]]:
         """Ask every probe ``draws`` times, tagging each row with its draw.
@@ -2322,6 +2433,7 @@ class Loop:
                     "latency": 0.0,
                     "error": None,
                     "recall": "na",
+                    "recall_metrics": None,
                 }
                 try:
                     answer, latency = self._attempt(
@@ -2332,7 +2444,7 @@ class Loop:
                 except StepError as exc:
                     row["error"] = str(exc)
                 if self.retrieval_recall and not self.dry_run:
-                    row["recall"] = self._recall_for(item)
+                    row["recall"], row["recall_metrics"] = self._recall_measurement(item)
                 results[slot] = row
                 self.heartbeat()
 
@@ -2358,6 +2470,34 @@ class Loop:
             score = {"correct": 1.0, "partial": 0.5}.get(verdict, 0.0)
             totals.setdefault(str(row.get("id")), []).append(score)
         return {key: mean_of(values) for key, values in totals.items()}
+
+    # The two rank measures worth a paired interval: one says whether the evidence
+    # was there at all (fraction of gold quotes), the other says how high it sat.
+    PAIRED_RANKING_METRICS = ("evidence_recall", "mrr")
+
+    def _probe_ranking_metrics(self, rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+        """Per-probe mean of each rank measure across draws, {measure: {probe_id: value}}.
+
+        Only rows that carry a gold quote AND got a recall answer are included, so a
+        probe nobody can answer stays na in a paired comparison rather than becoming
+        a zero for the arm that happened to refuse it.
+        """
+        collected: dict[str, dict[str, list[float]]] = {
+            metric: {} for metric in self.PAIRED_RANKING_METRICS
+        }
+        for row in rows:
+            metrics = row.get("recall_metrics")
+            if not isinstance(metrics, dict):
+                continue
+            ident = str(row.get("id"))
+            for metric in self.PAIRED_RANKING_METRICS:
+                value = metrics.get(metric)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    collected[metric].setdefault(ident, []).append(float(value))
+        return {
+            metric: {key: mean_of(values) for key, values in mapping.items()}
+            for metric, mapping in collected.items()
+        }
 
     # ── step 5: judge ──────────────────────────────────────────────────────
 
@@ -2418,7 +2558,10 @@ class Loop:
         extras: list[dict[str, Any]] = []
         for row in results:
             item = items[int(row.get("item_index", 0))]
-            extra: dict[str, Any] = {"draw": row.get("draw", 1), "recall": row.get("recall", "na")}
+            extra: dict[str, Any] = {
+                "draw": row.get("draw", 1), "recall": row.get("recall", "na"),
+                "recall_metrics": row.get("recall_metrics"),
+            }
             if row.get("error"):
                 verdicts.append(JUDGE_ERROR)
                 extra["attribution"] = "na"
@@ -2473,7 +2616,8 @@ class Loop:
         exp_dir = self.out / experiment["name"]
         answers = [
             {"set": set_name,
-             **{key: row.get(key) for key in ("id", "type", "question", "answer", "latency", "error", "draw", "recall")}}
+             **{key: row.get(key) for key in ("id", "type", "question", "answer", "latency",
+                                             "error", "draw", "recall", "recall_metrics")}}
             for row in rows
         ]
         judged = []
@@ -2559,6 +2703,10 @@ class Loop:
                 "dev": self._probe_scores(dev_items, dev_rows, dev_verdicts),
                 "heldout": self._probe_scores(heldout_items, heldout_rows, heldout_verdicts),
             },
+            "probe_ranking_metrics": {
+                "dev": self._probe_ranking_metrics(dev_rows),
+                "heldout": self._probe_ranking_metrics(heldout_rows),
+            },
         }
         self.ops.write_json_atomic(self.out / name / "summary.json", summary)
         if self.judge_truncated:
@@ -2580,6 +2728,11 @@ class Loop:
             "refusal_accuracy_pct": summary["heldout"]["refusal_accuracy_pct"],
             "heldout_answerable_correct_pct": summary["heldout"]["answerable_correct_pct"],
             "heldout_evidence_in_context_pct": summary["heldout"]["evidence_in_context_pct"],
+            # Graded retrieval, over gold-evidence probes only. null means na (no
+            # gold quote or no answer), never a measured zero.
+            "heldout_evidence_recall": summary["heldout"]["evidence_recall"],
+            "heldout_mrr": summary["heldout"]["mrr"],
+            "heldout_ndcg_at_5": summary["heldout"]["ndcg@5"],
             "heldout_attribution_wrong_pct": summary["heldout"]["attribution_wrong_pct"],
             "draws": self.draws,
             "latency_p50": summary["all_latencies_p50"],
@@ -2599,6 +2752,14 @@ class Loop:
             f"(ok {heldout['ok_pct']}%), "
             f"halluc {heldout['hallucination_pct']}%, refusal {heldout['refusal_accuracy_pct']}"
         )
+        if heldout["ranking_measured_n"]:
+            self.log(
+                f"{name}: heldout retrieval over {heldout['ranking_measured_n']} measured "
+                f"probe rows: evidence_recall {heldout['evidence_recall']}, mrr "
+                f"{heldout['mrr']}, ndcg@5 {heldout['ndcg@5']}, hit@1 {heldout['hit@1']}, "
+                f"hit@5 {heldout['hit@5']}, any_hit {heldout['any_hit_pct']}%, all_hit "
+                f"{heldout['all_hit_pct']}% [{heldout['rank_order']}]"
+            )
         self.save_state()
         return summary
 
@@ -2825,6 +2986,30 @@ class Loop:
                 cleaned[str(set_name)] = {str(key): float(value) for key, value in mapping.items()}
         return cleaned
 
+    def _arm_ranking_metrics(self, name: str) -> dict[str, dict[str, dict[str, float]]] | None:
+        """Read one arm's per-probe rank measures back out of its summary.json.
+
+        Absent in a summary written before these measures existed: the caller skips
+        the ranking rows rather than comparing against nothing.
+        """
+        try:
+            summary = self.ops.read_json(self.out / name / "summary.json")
+        except (OSError, json.JSONDecodeError):
+            return None
+        block = summary.get("probe_ranking_metrics") if isinstance(summary, dict) else None
+        if not isinstance(block, dict):
+            return None
+        cleaned: dict[str, dict[str, dict[str, float]]] = {}
+        for set_name, measures in block.items():
+            if not isinstance(measures, dict):
+                continue
+            cleaned[str(set_name)] = {
+                str(metric): {str(key): float(value) for key, value in mapping.items()
+                              if isinstance(value, (int, float)) and not isinstance(value, bool)}
+                for metric, mapping in measures.items() if isinstance(mapping, dict)
+            }
+        return cleaned
+
     def _report_comparison(self) -> None:
         """Paired difference between the two named arms, appended to results.md.
 
@@ -2871,8 +3056,18 @@ class Loop:
             "same two arms always give the same numbers.",
             "",
         ]
+        measures = self._ranking_comparison_rows(left, right, lines)
+        lines += [
+            "evidence_recall is the fraction of a probe's gold quotes that came back; "
+            "mrr is 1 over the position of the first returned string carrying any of "
+            "them. Both are paired over the probes that carry gold evidence, so their "
+            "n can be smaller than the score table's. mrr's position is UNVERIFIED "
+            "order: position in the response walk, not a confirmed retrieval ranking.",
+            "",
+        ]
         self.ops.append_text(self.results_path, "\n".join(lines) + "\n")
-        self.state["comparison"] = {"a": left, "b": right, "draws": self.draws, **summary}
+        self.state["comparison"] = {"a": left, "b": right, "draws": self.draws,
+                                    **summary, "measures": measures}
         self.save_state()
         for set_name, stats in summary.items():
             self.log(
@@ -2881,6 +3076,55 @@ class Loop:
                 f"95% CI [{stats['ci_low']}, {stats['ci_high']}], "
                 f"{'resolved' if stats['excludes_zero'] else 'not resolved'}"
             )
+        for set_name, by_measure in measures.items():
+            for metric, stats in by_measure.items():
+                self.log(
+                    f"comparison {left} vs {right} ({set_name} {metric}): difference "
+                    f"{stats['difference']:+.4f} over {stats['n']} probes, "
+                    f"95% CI [{stats['ci_low']}, {stats['ci_high']}], "
+                    f"{'resolved' if stats['excludes_zero'] else 'not resolved'}"
+                )
+
+    def _ranking_comparison_rows(
+        self, left: str, right: str, lines: list[str]
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        """Append the paired rank-metric rows to ``lines``; return them for state.json.
+
+        The binary hit could not tell an arm that found the evidence from one that
+        found it and buried it, so the same paired bootstrap is run on
+        ``evidence_recall`` and ``mrr``. An arm whose summary predates these measures
+        contributes nothing, and no row is invented for it.
+        """
+        a_metrics = self._arm_ranking_metrics(left)
+        b_metrics = self._arm_ranking_metrics(right)
+        measures: dict[str, dict[str, dict[str, Any]]] = {}
+        lines += [
+            "| set | measure | probes paired | mean A | mean B | difference | 95% CI | resolved |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        if not a_metrics or not b_metrics:
+            missing = left if not a_metrics else right
+            lines.append(
+                f"| n/a | rank metrics | 0 | | | | | skipped: no probe_ranking_metrics "
+                f"in {missing}/summary.json |"
+            )
+            return measures
+        for set_name in ("dev", "heldout"):
+            by_measure: dict[str, dict[str, Any]] = {}
+            for metric in ("evidence_recall", "mrr"):
+                a = (a_metrics.get(set_name) or {}).get(metric) or {}
+                b = (b_metrics.get(set_name) or {}).get(metric) or {}
+                stats = paired_bootstrap_difference(a, b)
+                by_measure[metric] = stats
+                lines.append(
+                    f"| {set_name} | {metric} | {stats['n']} | {stats['mean_a']} "
+                    f"| {stats['mean_b']} | {stats['difference']} "
+                    f"| [{stats['ci_low']}, {stats['ci_high']}] "
+                    f"| {'yes' if stats['excludes_zero'] else 'not resolved'} |"
+                )
+            measures[set_name] = by_measure
+        lines.append("")
+        return measures
 
     # ── finalise ───────────────────────────────────────────────────────────
 

@@ -85,6 +85,10 @@ class FakeOps(ol.Ops):
         # Retrieval-recall stub: what the LightRAG /query context contains per
         # question, and what the attribution judge answers per question.
         self.recall_context: dict[str, str] = {}
+        # A raw /query response per question, for tests that need the gold quote to
+        # sit in a LATER returned unit than the first one. Takes precedence over
+        # recall_context, which only ever fills the single "result" string.
+        self.recall_payload: dict[str, Any] = {}
         self.recall_off = False
         self.attribution_answers: dict[str, str] = {}
         self.advance_per_call = 0.0
@@ -175,6 +179,8 @@ class FakeOps(ol.Ops):
             if self.recall_off:
                 return 500, {"error": "context endpoint unavailable"}
             question = str((payload or {}).get("query") or "")
+            if question in self.recall_payload:
+                return 200, self.recall_payload[question]
             return 200, {"status": "success", "result": self._context_for(question)}
         if url.endswith("/api/chat"):
             question = payload["messages"][-1]["content"]
@@ -3143,6 +3149,73 @@ class TestRetrievalRecall(_Case):
         self.assertEqual([row["recall"] for row in rows],
                          ["hit", "hit", "na", "hit", "na", "hit"], rows)
 
+    def test_the_same_response_also_scores_graded_retrieval_columns(self):
+        """One recall probe pays for the binary gate AND the graded numbers."""
+        self.make_loop(self.one_experiment()).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        heldout = summary["heldout"]
+        # h1 and h3 carry gold; h2 is unanswerable, so it is na here too and is not
+        # allowed to pull an arm's numbers down toward zero.
+        self.assertEqual(heldout["ranking_measured_n"], 2)
+        self.assertEqual(heldout["evidence_recall"], 1.0)
+        self.assertEqual(heldout["mrr"], 1.0)
+        self.assertEqual(heldout["hit@1"], 1.0)
+        self.assertEqual(heldout["hit@5"], 1.0)
+        self.assertEqual(heldout["ndcg@5"], 1.0)
+        self.assertEqual(heldout["any_hit_pct"], 100.0)
+        self.assertEqual(heldout["all_hit_pct"], 100.0)
+        self.assertEqual(heldout["rank_order"], "unverified-order")
+        self.assertEqual(heldout["evidence_in_context_pct"], 100.0,
+                         "the binary success gate is untouched by any of this")
+        self.assertEqual(set(summary["probe_ranking_metrics"]["heldout"]["mrr"]), {"h1", "h3"},
+                         "the na probe is not in a paired comparison either")
+
+    def test_evidence_further_down_the_response_lowers_the_rank_not_the_gate(self):
+        """The whole point of the instrument: present-but-buried must look different."""
+        self.ops.recall_payload["Where is the office?"] = {
+            "status": "success",
+            "result": ["unrelated chunk one", "unrelated chunk two",
+                       "the office is in Brussels"],
+        }
+        self.make_loop(self.one_experiment()).run()
+        summary = json.loads((self.out / "E1" / "summary.json").read_text(encoding="utf-8"))
+        heldout = summary["heldout"]
+        self.assertEqual(heldout["evidence_in_context_pct"], 100.0,
+                         "the quote is still somewhere in the context")
+        self.assertEqual(heldout["evidence_recall"], 1.0, "recall does not depend on order")
+        # h1's gold sits in unit 3 (mrr 1/3, ndcg 0.5), h3's in unit 1 (mrr 1, ndcg 1).
+        self.assertEqual(heldout["mrr"], 0.6667)
+        self.assertEqual(heldout["ndcg@5"], 0.75)
+        self.assertEqual(heldout["hit@1"], 0.5)
+        self.assertEqual(heldout["hit@5"], 1.0)
+        self.assertEqual(heldout["any_hit_pct"], 100.0)
+        self.assertEqual(heldout["all_hit_pct"], 100.0,
+                         "all_hit counts QUOTES found, not where they were found")
+
+    def test_answer_rows_carry_the_measure_and_a_na_probe_carries_none(self):
+        self.make_loop(self.one_experiment()).run()
+        rows = [json.loads(line) for line in
+                (self.out / "E1" / "answers.jsonl").read_text(encoding="utf-8").splitlines()]
+        by_id = {(row["set"], row["id"]): row for row in rows}
+        self.assertIsNone(by_id[("heldout", "h2")]["recall_metrics"],
+                          "no gold quote: na, and no invented measurement")
+        metrics = by_id[("heldout", "h1")]["recall_metrics"]
+        self.assertEqual(metrics["first_hit_rank"], 1)
+        self.assertEqual(metrics["gold_n"], 1)
+        self.assertTrue(metrics["all_hit"])
+        self.assertEqual(metrics["rank_order"], "unverified-order")
+
+    def test_an_arm_summary_written_without_the_measures_reads_as_absent(self):
+        loop = self.make_loop(self.one_experiment())
+        (self.out / "E1").mkdir(parents=True, exist_ok=True)
+        (self.out / "E1" / "summary.json").write_text(
+            json.dumps({"heldout": {"evidence_in_context_pct": 50.0}}), encoding="utf-8")
+        self.assertIsNone(loop._arm_ranking_metrics("E1"))
+        lines: list[str] = []
+        self.assertEqual(loop._ranking_comparison_rows("E1", "E1", lines), {})
+        self.assertIn("no probe_ranking_metrics", "\n".join(lines),
+                      "a skipped ranking row must say why, silently absent is not evidence")
+
     def test_a_missing_quote_is_recorded_as_a_miss_not_a_judge_failure(self):
         config = self.one_experiment()
         self.ops.recall_context["Where is the office?"] = "the office is in Lisbon"
@@ -3267,6 +3340,24 @@ class TestDrawsPairedStatsAndSecondJudge(_Case):
         self.assertEqual(state["comparison"]["difference"] if "difference" in state["comparison"]
                          else state["comparison"]["heldout"]["difference"], 0.0)
         self.assertIn("comparison E1 vs E2 (heldout)", (self.out / "loop.log").read_text())
+
+    def test_compare_adds_paired_intervals_for_the_graded_measures(self):
+        """The binary hit could not tell found from found-and-buried; these can."""
+        self.make_loop(self.two_arms(), compare_arms=("E1", "E2")).run()
+        table = (self.out / "results.md").read_text(encoding="utf-8")
+        for row in ("| dev | evidence_recall |", "| dev | mrr |",
+                    "| heldout | evidence_recall |", "| heldout | mrr |"):
+            self.assertIn(row, table)
+        self.assertIn("UNVERIFIED order", table,
+                      "the interval on a rank number must say the order is unconfirmed")
+        state = self.state()
+        self.assertEqual(state["comparison"]["measures"]["heldout"]["mrr"]["n"], 2)
+        self.assertEqual(state["comparison"]["measures"]["dev"]["evidence_recall"]["n"], 2)
+        self.assertEqual(state["comparison"]["measures"]["heldout"]["mrr"]["difference"], 0.0)
+        self.assertEqual(state["comparison"]["heldout"]["difference"], 0.0,
+                         "the existing score comparison row is unchanged")
+        log = (self.out / "loop.log").read_text()
+        self.assertIn("comparison E1 vs E2 (heldout mrr)", log)
 
     def test_the_recommendation_says_what_its_headline_number_includes(self):
         config = self.write_experiments({"baseline_env": {}, "experiments": [
