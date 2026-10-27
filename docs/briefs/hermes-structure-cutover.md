@@ -1,8 +1,11 @@
 # Hermes brief: cut production over to the structure-ingested store (stack2 -> production)
 
-**Status: PHASES 0 TO 2 APPROVED by the operator on 2026-10-26 (decisions 1 to 3 as proposed below). PHASE 3 IS NOT
-APPROVED: it changes production and needs a separate, explicit "go for phase 3" from the operator. Do not start phase 3
-and do not touch production in phases 0 to 2.**
+**Status: PHASES 0 TO 2 APPROVED by the operator on 2026-10-26. PHASE 3 IS NOT APPROVED: it changes production and
+needs a separate, explicit "go for phase 3" from the operator. Do not start phase 3 and do not touch production in
+phases 0 to 2. REVISED 2026-10-27 (operator chose option 1): the code to deploy is now tag `structure-cutover-2` on
+`0047a69`, the exact build that made stack2's store. Phase 0 already passed and is not repeated (see the note under
+phase 0). Phase 1 is re-run against the new tag; the earlier replay against `structure-cutover-1` (`f7051e6`) failed
+on the S/4 PDF only and is superseded.**
 Approval prompts appear in your pane; the operator will be at the terminal for phase 3.
 Report to `~/rag-project/docs/ops/runs/structure-cutover.md` (files, not `rig send`); STATUS on line 1.
 
@@ -17,11 +20,16 @@ only by the retrieval comparison (`hermes-production-vs-stack2-recall.md`); the 
 Evidence: `recall-production-vs-stack2.md` and `legacy-bgem3-arm.md` (A production 85, B legacy+BGE-M3 83, C stack2 91).
 Embedder effect B-A = -2 (noise); chunking effect C-B = +8 (95% bootstrap 0 to 16, sign test p=0.077); all of the gain is on
 the structure probe sets, Solvay probes show no gain. The case for cutover is the chunker, on structure-heavy documents.
-1. **Code to deploy: tag `structure-cutover-1` on commit `f7051e6`** (the last runtime-code commit; every later master
-   commit is docs, briefs, rig scaffolding or a test, nothing under `app/`). The lead creates the tag after approval; build from the tag, never a branch tip.
-   Hermes gets it by `git bundle` from the lead, sha256 verified; nothing is pushed to origin without the operator.
-   Phase 1 proves the tag cuts the 10 documents into the same 129 pieces stack2 stored (chunkrun9 = `0047a69` differs from
-   the tag by the heading `.search`, key/value-list detection, and the PDF/DOCX extract defaults).
+1. **Code to deploy: tag `structure-cutover-2` on commit `0047a69`** (chunkrun9, the build that produced stack2's store).
+   The lead created the tag; build from the tag, never a branch tip. Hermes gets it by `git bundle` from the lead, sha256
+   verified; nothing is pushed to origin without the operator. Why not `f7051e6`: Hermes' phase 1 replay and the
+   `s4-pdf-split-diagnosis.md` report showed `f7051e6` cuts the S/4 PDF into 98 pieces from the same text where `0047a69`
+   gives the stored 106 (13 all-caps-heading verdicts flip), so the 91/100 evidence was not measured on it. With
+   `TRANSCRIPT_PREP_ENABLED` false the heading rule is the only functional difference between the two commits. The
+   later fix can ship after its own validation. Everything outside `app/` (Dockerfile, requirements, compose) is
+   identical between the two commits; the suite at `0047a69` passes (1179 tests).
+   Phase 1 proves the tag cuts the 10 documents into the same 129 pieces stack2 stored. Expected: 129/129, because the
+   diagnosis already reproduced the stored 106 PDF pieces from this commit byte-exactly.
 2. **Data path: Option A** (swap stack2's store into production, state DB reconciled). Option B (re-ingest, ~3.2 h of degraded
    retrieval, one more LLM-extraction draw) only if phase 2 shows the state DB cannot be reconciled safely.
 3. **Embedder: production runs mxbai-embed-large-v1, not BGE-M3** (container from 2026-10-13, never switched; confirmed
@@ -44,6 +52,10 @@ the structure probe sets, Solvay probes show no gain. The case for cutover is th
   approval; report it.
 
 ## Phase 0: pre-flight, read-only
+PASSED 2026-10-26 (report `structure-cutover.md`); not repeated for the revised tag because the build inputs
+(`requirements.txt`, Dockerfile, compose) are identical between `f7051e6` and `0047a69`. Findings that still apply to phase 3:
+production runs mxbai-embed-large-v1; the production ingest-worker has no BGE-M3 tokenizer mount (add a read-only mount);
+the tag's extract defaults are true at `0047a69`, but phase 3 still sets them explicitly.
 1. Record what runs now: `docker ps` lines for gateway-api, ingest-worker, lightrag-server, open-webui; image ids/tags;
    RestartCount; `/health` of gateway and LightRAG.
 2. Production LightRAG env that matters (names and values, no keys): embedding model/dim/max_token_size/binding,
