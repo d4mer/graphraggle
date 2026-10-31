@@ -86,3 +86,32 @@ When the installer changes materially:
 2. document the reason for the change
 3. verify the smoke test still passes
 4. commit the installer change separately when possible
+
+## `make_synthetic_company.py`
+
+GL-07: generates an invented company's document set so cross-company retrieval,
+attribution, scoping and duplicate handling can be tested before a real second
+company exists. Everything it writes is invented; it never reads `source_docs/`,
+`lightrag_store/` or `state/`, and it refuses to write inside the repo.
+
+```bash
+# default company (Northwind Chemicals) into /home/maverick/work/synthetic-co/
+.venv/bin/python scripts/make_synthetic_company.py
+
+# the second company, same seed: the cross-company shared file is then identical bytes
+.venv/bin/python scripts/make_synthetic_company.py --company "Contoso Pharma"
+
+# a scratch corpus, and the shared file on its own for a duplicate test
+.venv/bin/python scripts/make_synthetic_company.py --seed 7 --out /tmp/synth
+.venv/bin/python scripts/make_synthetic_company.py --seed 7 --emit-shared-file /tmp/shared.txt
+
+# force two companies apart on unique topics
+.venv/bin/python scripts/make_synthetic_company.py --company "Contoso Pharma" \
+    --forbid-unique-topic "unique:tanker fleet telematics"
+```
+
+Same `--seed` plus same `--company` plus same flags gives byte-identical files. Each
+company directory carries a `manifest.json`: the topic map, every planted fact with
+the document that holds it, the unanswerable facts, the duplicate map, and generated
+scoped / cross-company / unanswerable probe shapes. Counts and invented facts only -
+it is a mechanics test set, not evidence about any real company.
