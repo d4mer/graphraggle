@@ -1,8 +1,13 @@
 # Hermes brief — GL-07 + GL-08: ingest the synthetic companies on stack2 and test duplicate handling (Plane GRAG-62, GRAG-63)
 
-DRAFT, send only when (1) the worker has delivered the generator and the lead has copied the synthetic files to the Thinkpad, and (2) your probe brief and depth test are reported
+DRAFT, send only when (1) [DONE 2026-10-31: generator merged on master 3f8a2d1; 31 synthetic files staged at ~/rag-project/staging-synthetic/{Northwind Chemicals,Contoso Pharma,_shared-file-copy}, each company with manifest.json] and (2) your probe brief and depth test are reported
 (stack2 is shared). Operator priority: accuracy over speed. Stack2 ONLY; production untouched (docker-inspect + .env-mtime snapshot start vs end, diff empty).
 The documents are synthetic (invented companies "Northwind Chemicals" and "Contoso Pharma", invented facts), so you may read them; the manifest lists planted facts.
+
+## Notes
+- Company folder names contain spaces: copy with quoted paths or arrays, never a bare glob.
+- Expect the shared file (`shared-between-companies/cutover-freeze-checklist.txt` in each company; same bytes also in `_shared-file-copy/`) to be skipped as duplicate_content with the flag OFF: that is the GL-08 evidence.
+- The worker could not run 2 tests needing pypdf and python-docx (not installed on sigma). In a venv that has them run `pytest tests/test_make_synthetic_company.py -q` from the repo at master 3f8a2d1 and report whether the 2 skips become passes.
 
 ## Do
 1. Snapshot stack2 (store + state DB, sha256). Record before-counts.
