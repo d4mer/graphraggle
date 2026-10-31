@@ -42,6 +42,6 @@ Hermes cannot message lead: it writes ~/rag-project/docs/ops/runs/structure-cuto
 - Never push or change production without the operator; Hermes executes production changes only on an explicit GO.
 
 ## Access notes
-understory: curl POST http://192.168.1.185:3800/mcp (JSON-RPC memory_add/memory_query). Plane: ssh macbookm1.local, tokens in
+Knowledge base: Prism MCP (mcp__prism__*, on sigma http://192.168.1.195:3800/mcp); understory is stopped since 2026-10-29. Update Prism at every milestone: current page /projects/graphraggle/structure-cutover-2-live-2026-10-31.md. Plane: ssh macbookm1.local, tokens in
 ~/plane-selfhost/plane-mcp/agent-tokens.env, project bfd4e9a9-1ffb-4813-88f8-e44fc3ddd354. Hermes approval dialogs appear only in its
 tmux pane (memory hermes-approval-dialogs).
