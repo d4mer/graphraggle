@@ -28,7 +28,7 @@ The GO-LIVE MOMENT is the timestamp of the operator's written "go live" reply to
 - GL-02 attribution: every cited source reads [Company: document]; cross-company answers are grouped by company.
 - GL-01 DECIDED: gateway detects a company name in the question. GL-02 DECIDED: [Company: document] per source, grouped by company. GL-03 DECIDED 2026-10-31: ok% at least 88 on a NEW held-out set per company, 0 hallucinations (or at most 1 explained), refusal correctness at least 90%, plus gate G4c.
 - GL-04 DECIDED 2026-10-31: no speed target. Accuracy over speed, using the tools we have (no hardware or model changes). The latency gate becomes a completion gate: every answer finishes inside the configured timeouts with 0 rerank fallbacks and 0 timeouts end to end, because a fallback or timeout silently costs accuracy.
-- GL-05 part 1 DECIDED 2026-10-31: the operator is the only user for now; no other users will be admitted. Part 2 OPEN: which second-company documents may be used for testing on stack2 (only Hermes reads them).
+- GL-05 part 1 DECIDED 2026-10-31: the operator is the only user for now; no other users will be admitted. Part 2 DECIDED: start with SYNTHETIC second-company data on stack2 (proves the mechanics, not real-world quality). Real second-company documents are still required before the final checks (G4c, G5, G8) and before go-live; the operator names them when available.
 - GL-06 freeze: push tag `structure-cutover-2` (0047a69).
 
 ## 3. Tasks, in order
