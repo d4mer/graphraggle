@@ -20,15 +20,15 @@ GraphRaggle is READY TO GO LIVE at the instant all of these are true:
 1. Every task GL-01 to GL-35 is Done and every gate G1 to G12 (section 4) is PASS, each with an evidence line in `docs/ops/runs/readiness-gates.md` (counts, ids, hashes, timings; no corpus text).
 2. The lead has written `STATUS: READY FOR GO-LIVE <UTC timestamp>` as line 1 of that file, after re-running G2, G4, G5 and G6 within the previous 24 hours.
 3. The last step, key rotation (GL-34), has completed and G12 passes after it.
-The GO-LIVE MOMENT is the timestamp of the operator's written "go live" reply to that line (GL-36). Before it: pilot users only. After it: normal user admission and
-normal ingestion of new companies. A later gate failure sets the status to NOT READY and pauses admission and ingestion.
+The GO-LIVE MOMENT is the timestamp of the operator's written "go live" reply to that line (GL-36). Before it: the operator only, as today. After it: normal ingestion of new companies through the runbook
+(user admission is not planned; the operator is the only user for now). A later gate failure sets the status to NOT READY and pauses admission and ingestion.
 
 ## 2. Operator decisions (block the work)
 - GL-01 scoping: how a user limits a question to one company. Recommendation: the gateway detects a company name in the question and narrows retrieval to it; no name means all companies.
 - GL-02 attribution: every cited source reads [Company: document]; cross-company answers are grouped by company.
 - GL-01 DECIDED: gateway detects a company name in the question. GL-02 DECIDED: [Company: document] per source, grouped by company. GL-03 DECIDED 2026-10-31: ok% at least 88 on a NEW held-out set per company, 0 hallucinations (or at most 1 explained), refusal correctness at least 90%, plus gate G4c.
 - GL-04 DECIDED 2026-10-31: no speed target. Accuracy over speed, using the tools we have (no hardware or model changes). The latency gate becomes a completion gate: every answer finishes inside the configured timeouts with 0 rerank fallbacks and 0 timeouts end to end, because a fallback or timeout silently costs accuracy.
-- GL-05 pilot users, and which second-company documents may be used for testing on stack2 (only Hermes reads them).
+- GL-05 part 1 DECIDED 2026-10-31: the operator is the only user for now; no other users will be admitted. Part 2 OPEN: which second-company documents may be used for testing on stack2 (only Hermes reads them).
 - GL-06 freeze: push tag `structure-cutover-2` (0047a69).
 
 ## 3. Tasks, in order
@@ -61,7 +61,7 @@ Restore drill from deltahome; rollback drill of `compose.rollback-cutover.yml` o
 GSK leftovers (quarantine of 56 files, sealed deltahome `graphraggle-20261012`, OpenWebUI 0.11.4 tar, chat history); permissions `.env` 600 and `compose.yml` 640.
 
 ### H. Production window and soak: GL-30 to GL-33
-Apply final code and settings in one reviewed window; full regression on production; second company's first batch through the runbook; 72-hour soak with pilot users and no changes.
+Apply final code and settings in one reviewed window; full regression on production; second company's first batch through the runbook; 72-hour soak with the operator as the only user plus scripted Hermes query traffic, and no changes.
 
 ### I. Go-live: GL-34 to GL-36
 GL-34 key rotation (operator's last step); GL-35 readiness check and the READY line (lead); GL-36 the operator's written "go live".
@@ -80,7 +80,7 @@ GL-34 key rotation (operator's last step); GL-35 readiness check and the READY l
 | G7 Ingest safety | Snapshot and verifier drilled; all five failure cases end clean | drill logs |
 | G8 Live ingest | A real new-company batch ingested through the runbook; verifier clean; regression unchanged | GL-32 report |
 | G9 Monitoring | An alert fires in a test and reaches the operator | alert test |
-| G10 Soak | 72 h with pilot users: 0 outages, 0 failed documents, error rate under 1%, no open high-severity defect | daily counts |
+| G10 Soak | 72 h with the operator's own queries plus scripted query traffic run by Hermes (no other users): 0 outages, 0 failed documents, error rate under 1%, 0 rerank fallbacks, no open high-severity defect | daily counts |
 | G11 Hygiene | GSK items decided and executed; no plaintext secrets outside .env; permissions correct | file audit (names only) |
 | G12 Key | Rotation done; old key rejected; a query works through Open WebUI | test after GL-34 |
 
