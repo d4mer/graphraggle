@@ -78,6 +78,35 @@ Flags:
 2. `--force` sets `force=true` on each `/ingest/reindex` call
 3. dry-run is default; no API write calls are made without `--apply`
 
+## `probe_set_check.py`
+
+Validates a probe set against its source documents before it is used to score a run. It
+prints COUNTS ONLY - no question text, no quotes - so the report is safe to paste into a
+ticket. Probe files themselves are never committed.
+
+```bash
+.venv/bin/python scripts/probe_set_check.py <questions.jsonl> \
+  --answer-key <answer-key.jsonl> --source-dir <dir of source documents> \
+  --forbid-overlap-with <already-consumed-set.jsonl> [...] \
+  --run-set <merged-for-the-runner.jsonl>
+```
+
+What it checks:
+
+1. question rows carry no answers, ids are unique and are not reused by an earlier set
+2. every evidence quote is a verbatim substring of its cited source (whitespace-folded)
+   and every key phrase sits inside that quote, so the answer is gradeable from it
+3. `unanswerable` / `near-miss` rows carry 3-6 absent terms and a distinctive phrase that
+   occurs in NO source, so a refusal cannot be scored as a miss
+4. overlap against already-consumed sets: the longest normalised run shared with an
+   earlier question or evidence quote, reported as a number (default ceiling 40)
+5. the answer key and the question file agree row by row, and `--run-set` writes the
+   merged question+answer file the scoring runner consumes
+
+Gate constants `GRAGGLE_PROBE_MAX_EVIDENCE_CHARS` (300) and `GRAGGLE_PROBE_OVERLAP_LIMIT`
+(40) are overridable by environment variable or flag without editing the file.
+Exit code 0 = clean, 1 = failure list printed in the report.
+
 ## Versioning Practice
 
 When the installer changes materially:
