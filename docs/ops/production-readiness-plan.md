@@ -26,8 +26,8 @@ normal ingestion of new companies. A later gate failure sets the status to NOT R
 ## 2. Operator decisions (block the work)
 - GL-01 scoping: how a user limits a question to one company. Recommendation: the gateway detects a company name in the question and narrows retrieval to it; no name means all companies.
 - GL-02 attribution: every cited source reads [Company: document]; cross-company answers are grouped by company.
-- GL-03 accuracy bar. Recommendation: ok% at least 88 on a NEW held-out set per company, 0 hallucinations (or at most 1 explained), refusal correctness at least 90%, plus gate G4c.
-- GL-04 latency bar. Recommendation: p50 at most 60 s, p95 at most 120 s.
+- GL-01 DECIDED: gateway detects a company name in the question. GL-02 DECIDED: [Company: document] per source, grouped by company. GL-03 DECIDED 2026-10-31: ok% at least 88 on a NEW held-out set per company, 0 hallucinations (or at most 1 explained), refusal correctness at least 90%, plus gate G4c.
+- GL-04 DECIDED 2026-10-31: no speed target. Accuracy over speed, using the tools we have (no hardware or model changes). The latency gate becomes a completion gate: every answer finishes inside the configured timeouts with 0 rerank fallbacks and 0 timeouts end to end, because a fallback or timeout silently costs accuracy.
 - GL-05 pilot users, and which second-company documents may be used for testing on stack2 (only Hermes reads them).
 - GL-06 freeze: push tag `structure-cutover-2` (0047a69).
 
@@ -51,11 +51,11 @@ Fresh held-out set per company (at least 30 each, unanswerables included); a sco
 Pre-ingest snapshot script with off-host copy; post-ingest verifier with numeric pass criteria; failure drills (corrupt PDF, empty DOCX, 0-byte file, duplicate, oversize); ingest runbook including onboarding a new company.
 
 ### E. Quality and latency (each change needs its own operator GO and is A/B-tested on stack2 first): GL-19 to GL-22
-Rerank HTTP timeout patch; EMBEDDING_TIMEOUT raise and reranker throughput re-test; choose final settings (RELATED_CHUNK_NUMBER, timeouts) against GL-03/GL-04 on the Solvay, scoped
-and cross-company sets (R=3 gave 29/34 held-out at p50 about 244 s, too slow); validate or drop the heading fix `f7051e6`.
+Rerank HTTP timeout patch (needed so slow reranks complete instead of hitting the 300 s wall); EMBEDDING_TIMEOUT raise and reranker throughput re-test; choose final settings (RELATED_CHUNK_NUMBER, timeouts) by ACCURACY against GL-03 on the Solvay, scoped
+and cross-company sets, with 0 fallbacks and 0 timeouts (R=3 gave 29/34 held-out vs 27/34 at R=1, but p95 283 s and one fallback, so timeouts must be raised first); validate or drop the heading fix `f7051e6`.
 
 ### F. Recovery and operations: GL-23 to GL-27
-Restore drill from deltahome; rollback drill of `compose.rollback-cutover.yml` on stack2; monitoring and alerts that reach the operator; backup schedule (nightly local, weekly off-host, OpenWebUI data included); rule for who may use the shared Sigma model during user hours.
+Restore drill from deltahome; rollback drill of `compose.rollback-cutover.yml` on stack2; monitoring and alerts that reach the operator; backup schedule (nightly local, weekly off-host, OpenWebUI data included); rule for who may use the shared Sigma model during user hours (still useful: contention causes timeouts, which cost accuracy).
 
 ### G. Hygiene: GL-28, GL-29
 GSK leftovers (quarantine of 56 files, sealed deltahome `graphraggle-20261012`, OpenWebUI 0.11.4 tar, chat history); permissions `.env` 600 and `compose.yml` 640.
@@ -76,7 +76,7 @@ GL-34 key rotation (operator's last step); GL-35 readiness check and the READY l
 | G4b Attribution | Labelled probes: every cited source carries the right company; mis-attribution 0; a file in two companies is retrievable and attributed to both | probe counts |
 | G4c Cross-company | At least 80% of cross-company answers cite every company holding evidence, grouped by company, 0 invented links | probe counts and Hermes judgment |
 | G5 Accuracy | Fresh held-out set per company at the GL-03 bar | probe counts |
-| G6 Latency | p50/p95 within GL-04 on Solvay, scoped and cross-company sets under normal Sigma load; 0 of 100 ending in rerank fallback | timings, log scan |
+| G6 Completion | On the Solvay, scoped and cross-company sets: every answer completes, 0 rerank fallbacks, 0 timeouts at any hop (Open WebUI, gateway, LightRAG, reranker, LLM); timings are recorded but have no target | log scan, probe results |
 | G7 Ingest safety | Snapshot and verifier drilled; all five failure cases end clean | drill logs |
 | G8 Live ingest | A real new-company batch ingested through the runbook; verifier clean; regression unchanged | GL-32 report |
 | G9 Monitoring | An alert fires in a test and reaches the operator | alert test |
@@ -91,7 +91,7 @@ GL-34 key rotation (operator's last step); GL-35 readiness check and the READY l
 - The lead keeps `master` clean, commits briefs the same day, and updates Prism and the Plane tasks at the end of each group.
 
 ## 6. Timeline and risks
-Best case about 17 days elapsed, set by the 72-hour soak and Sigma contention. Large PDFs and the second company's ingest can lengthen it.
+Best case about 17 days elapsed, set by the 72-hour soak. Large PDFs and the second company's ingest can lengthen it.
 Main risks: (1) attribution and scoping need real gateway and chunk-header code (days, not hours), and entity merging across companies may blur company-specific facts;
-(2) latency may not reach the GL-04 bar on this hardware, since cross-company queries retrieve more; (3) the shared Sigma model can invalidate timing runs;
+(2) with no speed target, answers may take minutes: every timeout in the chain (Open WebUI, gateway, LightRAG, reranker) must be raised consistently or answers will be cut off; (3) the shared Sigma model can invalidate timing runs;
 (4) `COMPANY_AWARE_DEDUPE` was kept off for a reason, so GL-08 must prove it before it is enabled.
