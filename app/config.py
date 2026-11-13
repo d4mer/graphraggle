@@ -227,6 +227,13 @@ class Settings(BaseSettings):
     # collide with it. Applies to the gateway /query pipeline only.
     chunk_top_k: int = Field(default=16, alias="GATEWAY_CHUNK_TOP_K")
     citation_top_k: int = Field(default=12, alias="CITATION_TOP_K")
+    # M1 from the GL-08 unanswerable-probe investigation: record whether the identifier the
+    # QUESTION named appears verbatim (token match) in the evidence the answer was written
+    # from. FLAG ONLY - it never changes the answer, the citations or the status code, and it
+    # ships off, in which case the response and the upstream payload are exactly what they are
+    # today. A measured run on the probe sets decides whether it ever acts on the verdict.
+    grounding_check_asked_identifier: bool = Field(
+        default=False, alias="GROUNDING_CHECK_ASKED_IDENTIFIER")
     # Number of previous user/assistant exchanges forwarded from the bridge
     # to LightRAG as conversation_history. 0 disables history entirely.
     # LightRAG sends history to the LLM only; it does not affect retrieval.

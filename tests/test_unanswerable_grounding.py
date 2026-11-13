@@ -85,7 +85,12 @@ class TestGatewayPassesAnUngroundedAnswerThrough(unittest.TestCase):
     """REPRODUCTION: today the gateway is a courier between LightRAG and the caller.
 
     It asks for the chunk content (so it COULD check support), never checks it, and sends
-    no gate upstream. This test must be inverted when a grounding gate is added.
+    no gate upstream. This test must be inverted when a grounding gate CHANGES the answer.
+
+    M1 (``GROUNDING_CHECK_ASKED_IDENTIFIER``) has since landed as a flag-only report, so the
+    word "grounding" can now appear in a response - but it ships off, and with it off this
+    reproduction holds end to end. See tests/test_grounding_gate.py for what the flag does
+    and does not do.
     """
 
     def setUp(self) -> None:
@@ -128,6 +133,11 @@ class TestGatewayPassesAnUngroundedAnswerThrough(unittest.TestCase):
         blob = json.dumps({"data": envelope.data, "meta": envelope.meta}, default=str).lower()
         for needle in ("grounding", "unsupported", "unverified", "support_check"):
             self.assertNotIn(needle, blob)
+        # The reproduction is the SHIPPED state, not merely the default. If the flag ever
+        # ships on, this test must be re-read rather than left green by accident.
+        from app.config import Settings
+        self.assertIs(Settings().grounding_check_asked_identifier, False,
+                      "M1 ships dark; with it on this test's 'grounding' needle must move")
 
     def test_the_upstream_payload_sets_no_gate(self) -> None:
         """The gateway sends no similarity threshold, no only_need_context, no prompt."""

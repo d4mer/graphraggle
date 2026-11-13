@@ -51,24 +51,14 @@ repo_root = Path(__file__).resolve().parents[1]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from app import lightrag_text, structure_chunker  # noqa: E402
+from app import grounding, lightrag_text, structure_chunker  # noqa: E402
 
-# ── identifiers ─────────────────────────────────────────────────────────────
-# An identifier in these corpora is an uppercase, hyphen-segmented token with at
-# least one digit in it: NC-3617 (planted fact), NC-NA-01 (unanswerable),
-# CP-2-114 (topic-scoped). Requiring a digit keeps ordinary ALL-CAPS words and
-# section numbers out of the set; requiring a hyphen keeps "PDF" out.
-_IDENT = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+\b")
-
-
-def identifiers(text: str) -> list[str]:
-    """Identifier-shaped tokens in order of first appearance, de-duplicated."""
-    seen: dict[str, None] = {}
-    for match in _IDENT.finditer(text or ""):
-        token = match.group(0)
-        if any(ch.isdigit() for ch in token):
-            seen.setdefault(token, None)
-    return list(seen)
+# ── identifiers ────────────────────────────────────────────────────────────
+# One implementation, in app/grounding.py, because the gateway now applies the same
+# rule the harness measures. A second copy here would let the harness certify a rule
+# the gateway no longer runs.
+identifiers = grounding.identifiers
+verbatim_support = grounding.verbatim_support
 
 
 def near_misses(code: str, pool: Iterable[str], *, company_code: str | None = None) -> dict[str, list[str]]:
@@ -95,61 +85,20 @@ def near_misses(code: str, pool: Iterable[str], *, company_code: str | None = No
     }
 
 
-def verbatim_support(code: str, evidence: str, *, match: str = "token") -> bool:
-    """Is this identifier present in the evidence?
-
-    ``match="token"`` (the safe default) requires a standalone identifier token: with
-    plain ``substring`` matching, an asked code that is a prefix of a longer identifier
-    counts as supported, which is exactly how a support gate starts passing answers it
-    should refuse. Measured in analyse_company as ``shares_a_subtoken``.
-    """
-    if match == "substring":
-        return code in evidence
-    return code in set(identifiers(evidence))
-
-
-# ── candidate mitigation, as a measurable pure function ─────────────────────
+# ── the mitigation the gateway now runs, driven with a list of chunks ───────
 
 def support_gate(question: str, answer: str, evidence: Sequence[str]) -> dict[str, Any]:
-    """Candidate rule M1: the identifiers an answer asserts must appear verbatim in
-    the evidence the retrieval pass returned.
+    """``app.grounding.support_gate`` over a list of evidence chunks instead of one string.
 
-    ``evidence`` must be the evidence the ANSWER was written from -- on the gateway
-    that is the primary pass's ``references`` with ``include_chunk_content: True``,
-    before company scoping and before the citation_top_k truncation, because a chunk
-    that was dropped from the returned list was still in front of the model.
-
-    Returns the classification only. Nothing here raises or refuses; the caller
-    decides.
+    Same rule, same numbers. On the gateway the evidence is the primary pass's
+    ``references`` with ``include_chunk_content: True`` - before company scoping and before
+    the ``CITATION_TOP_K`` truncation, because a chunk dropped from the returned list was
+    still in front of the model.
     """
     joined = "\n".join(evidence)
-    asked = identifiers(question)
-    asserted = identifiers(answer)
-    in_evidence = {c for c in set(asked) | set(asserted) if verbatim_support(c, joined)}
-    asked_unsupported = [c for c in asked if c not in in_evidence]
-    asserted_unsupported = [c for c in asserted if c not in in_evidence]
-    # Precedence matters for diagnosis. Empty evidence is its own failure. Otherwise, when
-    # the QUESTION names an identifier and that identifier is nowhere in the evidence, that
-    # is the unanswerable shape, and it is reported as such even though the same code is
-    # normally also asserted in the answer.
-    if not evidence:
-        # "Nothing was retrieved" is a different failure from "what was retrieved does not
-        # contain the code", and it wants a different response.
-        verdict = "no_evidence"
-    elif asked and asked_unsupported:
-        verdict = "no_support_for_asked_identifier"
-    elif asserted_unsupported:
-        verdict = "unsupported_identifiers_in_answer"
-    else:
-        verdict = "supported"
-    return {
-        "verdict": verdict,
-        "asked": asked,
-        "asserted": asserted,
-        "asked_unsupported": asked_unsupported,
-        "asserted_unsupported": asserted_unsupported,
-        "evidence_identifier_count": len(identifiers(joined)),
-    }
+    result = grounding.support_gate(question, answer, joined)
+    result["evidence_identifier_count"] = len(identifiers(joined))
+    return result
 
 
 # ── invented-corpus text recovery (deliberately crude; see module docstring) ──

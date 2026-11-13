@@ -11,6 +11,7 @@ from typing import Any
 import aiofiles
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 
+from . import grounding
 from .auth import require_bearer
 from .config import settings
 from .generation import generate_document
@@ -1355,6 +1356,7 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
     fallback_used = False
     fallback_reason = None
     fallback_answer_used = False
+    all_citations_fallback: list[dict[str, Any]] = []
 
     # ── First pass: original query ──────────────────────────────────────
     timer.start("first_pass")
@@ -1457,6 +1459,25 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
         if not primary_answer.strip():
             answer = fallback_answer
             fallback_answer_used = True
+
+    # ── M1: asked-identifier grounding (FLAG ONLY, GL-08) ─────────────────
+    # 8 of 12 unanswerable synthetic probes were answered with an outcome for a code that
+    # exists in no document. This records whether the identifier the caller named is present
+    # in the evidence; it changes nothing else - not the answer, not the citations, not the
+    # status code. Off by default, and when off nothing here even touches query_scope, so the
+    # shipped envelope is byte-identical to before.
+    #
+    # The evidence is the reference list of the pass that produced the answer, NOT the
+    # citation list the caller receives: that one is company-scoped and truncated to
+    # CITATION_TOP_K, while the model saw everything the pass returned.
+    grounding_result: dict[str, Any] | None = None
+    if settings.grounding_check_asked_identifier:
+        grounding_evidence = all_citations_fallback if fallback_answer_used else all_citations
+        grounding_result = grounding.asked_identifier_grounding(req.query, answer, grounding_evidence)
+        # Which pass the verdict was computed from, so a later run can tell a retrieval miss
+        # from a grounding miss.
+        grounding_result["evidence_pass"] = "fallback_naive" if fallback_answer_used else "primary"
+        grounding_result["check_enabled"] = True
 
     # ── GraphRAG adaptive expansion (after merge, before scope filter) ───
     graph_enabled = settings.graph_expansion_enabled
@@ -1629,6 +1650,11 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
         "graph_synthesis_applied": graph_synthesis_applied,
         "graph_synthesis_error": graph_synthesis_error,
     })
+
+    if grounding_result is not None:
+        # Added only when the flag is on: with the flag off this key does not exist, which is
+        # what keeps the shipped response byte-for-byte what it was.
+        query_scope["grounding"] = grounding_result
 
     if requested_company is not None:
         query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"

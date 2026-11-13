@@ -264,6 +264,7 @@ def emit_query_log(
 ) -> None:
     """Write one /query log line from the query_scope metadata already built."""
     try:
+        grounding = query_scope.get("grounding") or {}
         line = {
             "request_id": request_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -296,6 +297,15 @@ def emit_query_log(
             "rerank_input_count": query_scope.get("rerank_input_count"),
             "answer_chars": len(answer or ""),
             "canned_failure": is_canned_failure(answer or ""),
+            # M1 asked-identifier grounding (GL-08). Counts and the caller's own identifiers,
+            # never reference text: a later probe run can compute discrimination per shape
+            # (how often a named identifier was unsupported) straight off this line.
+            "grounding_checked": bool(query_scope.get("grounding")),
+            "grounding_verdict": grounding.get("verdict"),
+            "grounding_asked": grounding.get("asked"),
+            "grounding_unsupported": grounding.get("unsupported"),
+            "grounding_evidence_pass": grounding.get("evidence_pass"),
+            "grounding_references_without_content": grounding.get("evidence_references_without_content"),
             "latency_ms_total": timer.total_ms(started),
             "latency_ms_by_stage": timer.elapsed_ms,
         }

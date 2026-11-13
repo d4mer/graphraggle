@@ -635,3 +635,35 @@ change does not widen that window.
 Suite: **1370 passed, 2 skipped, 2 warnings, 279 subtests passed** (immediately before this change,
 on the same branch: 1359 passed, 2 skipped, 2 warnings, 263 subtests). +11 tests, +16 subtests;
 nothing removed.
+
+## 2026-11-13 - M1 asked-identifier grounding: flag only, no behaviour change
+
+- `app/grounding.py` (new): the rule the GL-08 investigation proposed - does the identifier
+  the QUESTION named appear verbatim, by token match, in the references of the pass that
+  produced the answer? `support_gate()` classifies; it never raises or refuses. Three traps
+  are encoded in it rather than left to the caller: token match, never substring (a company
+  code is a substring of every planted code in the store, so `code in evidence` is a rubber
+  stamp); the question sanitised with `sanitize_like_lightrag` before extraction (LightRAG
+  deletes C0 controls from stored text, so raw question text compares false against clean
+  evidence); and evidence read from the pass's references, not from the caller's
+  company-scoped, `CITATION_TOP_K`-truncated citation list.
+- `GROUNDING_CHECK_ASKED_IDENTIFIER` (default **false**): when on, one added key,
+  `query_scope.grounding`, and six flat query-log fields carrying counts and the caller's own
+  identifiers - never reference text. When off, the key does not exist at all, so the shipped
+  envelope is byte-identical and the payload to LightRAG is unchanged.
+- `scripts/unanswerable_grounding.py` now imports `identifiers`/`verbatim_support`/
+  `support_gate` from `app.grounding` instead of carrying its own copy: the harness cannot
+  certify a rule the gateway no longer runs.
+- `tests/test_grounding_gate.py` (new, 17 tests) pins both halves - off is byte-identical,
+  on reports without changing - because an enforcement commit that quietly altered the
+  response would otherwise look like a passing measurement.
+- Deferred by design: acting on the verdict (a 422 or a grounded `no_evidence` answer), which
+  needs a measured run on the real probe sets first. The rule's reach is stated in `docs/05`:
+  on the GL-08 stack2 run it would have fired on 4 of 8 hallucinations and on 0 of the 43
+  answerable probes, so it cannot cost their recall - and says nothing about them either.
+- Gap named, not papered over: those two figures come from the stack2 run export, which was an
+  off-repo artefact and is not versioned, and the in-repo harness scores only a *generated
+  corpus* (`python scripts/unanswerable_grounding.py <corpus>`), not a run export. So the
+  corpus half of the GL-08 finding is reproducible here and the run half is not. A scorer for
+  run exports is the prerequisite for the go/no-go on enforcement, and it should be written
+  against the real export shape rather than a guessed one.

@@ -100,7 +100,10 @@ under-prices the shapes a PDF/DOCX extraction produces. Measured against a cl100
 lower bound (`tests/test_pdf_chunk_token_overflow.py`): prose 0.62x (safe), JSON-ish text 1.04x,
 code 1.55x, PDF pipe tables 1.94x, dotted number runs 3.00x; the two stack2 rejections sat at 1.21x
 and 1.145x. 3.2 is the worst measured ratio plus headroom, and because those ratios are *lower*
-bounds it bounds the cases we measured, not every case there is. **Counting in LightRAG's own
+bounds it bounds the cases we measured, not every case there is. The shapes in that list are
+fixtures in the test file and reproduce here; the two stack2 figures were measured on the GL-07/08
+source PDFs, which are not in this repo - re-measure them with `pdftotext` plus a cl100k
+pre-tokenizer if those files are on hand. **Counting in LightRAG's own
 tokenizer family (install tiktoken, or vendor cl100k) remains the proper fix**; the factor is the
 interim. The factor moves no piece boundary — the submitted bytes are byte-identical with it on or
 off, pinned by sha256 in that test file. On the row, `structure_chunking_chunk_token_safety`,
@@ -267,6 +270,28 @@ Gateway defaults that are **in force without being written in `.env`**:
    source file in place is expected to hit this 409 and stay stuck as
    `submit_terminal_failed` until an operator reindex (inferred from the probe and
    the code, not yet reproduced end to end).
+
+2. `GROUNDING_CHECK_ASKED_IDENTIFIER=false` (default). When on, the gateway records in
+   `query_scope.grounding` whether the identifier the **question** named appears verbatim
+   (token match) in the references of the pass that produced the answer, and mirrors the
+   counts into the query log (`grounding_verdict`, `grounding_asked`,
+   `grounding_unsupported`, `grounding_evidence_pass`,
+   `grounding_references_without_content`). **Flag only**: it never changes the answer, the
+   citation list or the status code, and with the flag off the response and the upstream
+   payload are byte-identical to before it existed. It exists because the GL-08 synthetic
+   baseline answered 8 of 12 unanswerable probes with an outcome for a code that is in no
+   document, while similarity scores of answerable and unanswerable probes overlap and
+   cannot separate them. On the GL-08 stack2 run (2026-11-09; that run's export was an
+   off-repo artefact and is not versioned, so these two figures are quoted from the handback
+   report, not reproducible from this repo): the rule would have fired on 4 of the 8
+   hallucinations and on **0** of the 43 answerable probes, because no answerable probe names
+   an identifier in its question. It cannot therefore cost scoped or cross-company recall -
+   and it also says nothing about those probes. What IS reproducible in-repo is the corpus
+   half of the finding (`python scripts/unanswerable_grounding.py <generated corpus>`): 0 of
+   12 unanswerable codes appear in any document chunk while all 12 appear in `manifest.json`,
+   712 same-company lookalikes per probe, and chunker line-wrapping that makes identifier-
+   level (not sentence-level) matching the only durable evidence test. Off until one measured
+   run on the real probe sets decides whether it ever acts on the verdict.
 
 ## oMLX Behaviour Notes (measured 2026-10-09)
 
