@@ -594,3 +594,44 @@ family as the production S/4 PDF and the `manifest.json` failures.
 Suite: **1337 passed, 2 skipped, 2 warnings, 263 subtests passed in 9.74s** (baseline
 at `a8f04bb`: 1299 passed, 2 skipped, 2 warnings, 248 subtests). Three new files and
 38 new tests; four existing assertions updated to the new status.
+
+## 2026-11-13 — chunk-token overflow, option B: a relative safety factor on `chunk_token_size`
+
+Operator decision on the GL-07/08 fix-3 report: **B now, A later**. Hermes confirmed
+`STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH=/opt/bgem3-tok` is set and the tokenizer files exist on
+production and stack2, so the embedder-window check is **not** running on the weak counter and this
+change does not widen that window.
+
+- Two new settings, both read where the limit is built (`app/structure_chunker.py`, called from
+  `app/worker.py`):
+  - `STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY` (default **3.2**) — the limit is now
+    `ceil(largest_piece_in_our_units x SAFETY) + STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS`. The default
+    is not a round number: it is the largest measured under-count in
+    `tests/test_pdf_chunk_token_overflow.py` (prose 0.62x, JSON 1.04x, code 1.55x, PDF pipe tables
+    1.94x, dotted number runs 3.00x) plus headroom, against the two stack2 rejections at 1.21x and
+    1.145x. A test pins the default to those measurements so lowering it below a measured ratio
+    fails here.
+  - `STRUCTURE_CHUNKING_CHUNK_TOKEN_CEILING` (default **8192**, `0` disables) — never ask LightRAG to
+    enforce a chunk bigger than the served embedder's window. The cap can never pull the number
+    below the pre-factor `largest + FIT_MARGIN`, so a misconfigured ceiling cannot create a rejection
+    that did not already exist. Values below 1.0 for the factor are clamped to 1.0.
+- **No piece boundary moves.** The submitted text is byte-identical with the factor on or off;
+  pinned per document by sha256 (8 invented transcripts + a DOCX-shaped spec body) in
+  `tests/test_pdf_chunk_token_overflow.py::TestTheGapIsClosedByTheSafetyFactor`.
+- `TestTheGapIsStillOpen` is **inverted**, as that report promised. It is now
+  `TestTheGapUnderThePreFactorConfig` (the defect at `SAFETY=1.0`, kept so the remedy cannot be
+  removed silently) plus `TestTheGapIsClosedByTheSafetyFactor` (no submitted segment's cl100k
+  lower-bound count exceeds the limit we ask for, on the same adversarial fixtures).
+- Diagnosability on the row: `structure_chunking_chunk_token_safety` (after clamping),
+  `..._largest_piece`, `..._ceiling`, `..._uncapped`, `..._capped`. Counts only, never text.
+- Consequence stated plainly: a bigger limit makes LightRAG's size check a weaker guard against
+  oversized chunks. The ceiling is what keeps that from becoming "accept anything"; the window check
+  in the worker is the real oversized-chunk gate, and it runs on the embedder's own tokens here.
+- **A remains the proper fix.** Every ratio above is a *lower* bound, so 3.2 bounds the cases we
+  measured, not every case there is. Counting in LightRAG's tokenizer family (tiktoken, or a
+  vendored local cl100k read the way `app/embed_tokenizer.py` reads the embed tokenizer — never
+  fetched) removes the guesswork. Not implemented here, by instruction.
+
+Suite: **1370 passed, 2 skipped, 2 warnings, 279 subtests passed** (immediately before this change,
+on the same branch: 1359 passed, 2 skipped, 2 warnings, 263 subtests). +11 tests, +16 subtests;
+nothing removed.

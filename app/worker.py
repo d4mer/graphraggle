@@ -30,9 +30,9 @@ from .structure_chunker import (
     DEFAULT_MIN_PIECE_TOKENS,
     DEFAULT_HEADER_TOKENS,
     chunk_document,
-    chunk_token_size_for_payload,
+    chunk_token_sizing_for_payload,
     coverage_gaps,
-    lightrag_chunk_token_size,
+    lightrag_chunk_token_sizing,
     render_for_lightrag,
 )
 from .lightrag_text import pieces_survive
@@ -437,14 +437,19 @@ def prepare_structure_payload(
                         f"{coverage['unaccounted_word_tokens']} word tokens of the source")
 
     margin = int(settings.structure_chunking_fit_margin_tokens or 0)
+    safety = float(settings.structure_chunking_chunk_token_safety or 1.0)
+    ceiling = int(settings.structure_chunking_chunk_token_ceiling or 0)
     # There is no chunk-size budget to floor this against: the pieces are whatever the
-    # document's own boundaries produced, so the size we tell LightRAG is exactly the
-    # largest one plus the margin that keeps its own cutting from ever firing. It is
-    # measured in LightRAG's tokenizer family (tiktoken cl100k when installed, the
-    # chunker's conservative over-count otherwise) and NEVER in the embedder's: doc08 in
+    # document's own boundaries produced, so the size we tell LightRAG is the largest one
+    # scaled by the safety factor plus the margin that keeps its own cutting from ever
+    # firing. It is measured in LightRAG's tokenizer family (tiktoken cl100k when installed,
+    # the chunker's conservative over-count otherwise) and NEVER in the embedder's: doc08 in
     # the stack2 run carried cts 2579 against a piece LightRAG counted at 2592, and under
-    # split_by_character_only that is a hard rejection, not a re-cut.
-    size, size_basis = lightrag_chunk_token_size(plan, margin)
+    # split_by_character_only that is a hard rejection, not a re-cut. The factor is there
+    # because that stand-in counter under-prices table/number/punctuation-dense text; the
+    # measured ratios are in STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY in app/config.py.
+    sizing = lightrag_chunk_token_sizing(plan, margin, safety=safety, ceiling=ceiling)
+    size, size_basis = sizing.size, sizing.basis
     updates["structure_chunking_chunk_token_basis"] = size_basis
     try:
         payload, params = render_for_lightrag(plan, chunk_token_size=size)
@@ -467,14 +472,25 @@ def prepare_structure_payload(
     # worth, this is the number that decides whether the request is accepted (doc08: cts 2579
     # against a segment LightRAG counted at 2592). It can only ever raise the size.
     try:
-        payload_size, _ = chunk_token_size_for_payload(payload, delimiter, margin)
+        payload_sizing = chunk_token_sizing_for_payload(payload, delimiter, margin,
+                                                        safety=safety, ceiling=ceiling)
     except Exception as exc:
         return fallback(f"sizing failed: {type(exc).__name__}: {str(exc)[:160]}")
+    payload_size = payload_sizing.size
     if payload_size > params["params"]["chunk_token_size"]:
         updates["structure_chunking_chunk_token_payload_gap"] = (
             payload_size - params["params"]["chunk_token_size"])
         params["params"]["chunk_token_size"] = payload_size
     updates["structure_chunking_chunk_token_size"] = params["params"]["chunk_token_size"]
+    # What a later rejection has to be read against: the factor actually applied (after
+    # clamping), the largest counted segment, the number the ceiling would have allowed, and
+    # whether the ceiling was the thing that bound. Counts only, never text.
+    updates["structure_chunking_chunk_token_safety"] = payload_sizing.safety
+    updates["structure_chunking_chunk_token_largest_piece"] = payload_sizing.largest
+    if ceiling:
+        updates["structure_chunking_chunk_token_ceiling"] = ceiling
+        updates["structure_chunking_chunk_token_uncapped"] = payload_sizing.uncapped
+        updates["structure_chunking_chunk_token_capped"] = payload_sizing.capped
     # The check the API-boundary test could not make: LightRAG sanitises the whole document
     # BEFORE splitting (sanitize_text_for_encoding -> strip_control_characters), which deletes
     # the C0 separators - the \x1e delimiter the first version of this path used. Eight of ten

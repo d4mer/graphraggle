@@ -1747,26 +1747,83 @@ def pick_delimiter(plan: ChunkPlan, explicit: str | None = None) -> str:
         "no candidate delimiter is absent from this document; refusing to guess")
 
 
-def lightrag_chunk_token_size(plan: ChunkPlan, margin: int = 0) -> tuple[int, str]:
+@dataclass(frozen=True)
+class ChunkTokenSizing:
+    """One sizing decision, with the numbers a later diagnosis needs.
+
+    ``size`` is what we ask LightRAG to enforce. ``uncapped`` and ``capped`` say whether the
+    ceiling bound it, and ``safety`` is the factor that was actually applied (after clamping).
+    Every count is in ``basis`` units.
+    """
+
+    size: int
+    basis: str
+    largest: int
+    safety: float
+    ceiling: int
+    uncapped: int
+    capped: bool
+
+
+def size_from_counts(counts: Iterable[int], margin: int = 0, *,
+                     safety: float = 1.0, ceiling: int = 0) -> ChunkTokenSizing:
+    """``ceil(largest * SAFETY) + margin``, capped, never below the pre-factor number.
+
+    The factor exists because the counter that prices a piece is not the counter LightRAG
+    counts with. ``conservative-overcount`` (what runs when tiktoken is absent) over-counts
+    English prose and UNDER-counts the shapes a PDF/DOCX extraction hands us: measured against
+    a cl100k pre-tokenizer lower bound, 0.62x on prose but 1.04x on JSON-ish text, 1.55x on
+    code, 1.94x on pipe tables and 3.00x on dotted number runs. A constant margin cannot fix
+    that, because the shortfall scales with the piece; a relative factor can.
+
+    Guards: ``safety`` is clamped up to 1.0, and the ``ceiling`` can never pull the result
+    below ``largest + margin``. Both rules mean a bad setting value degrades to the pre-factor
+    behaviour rather than to a rejection LightRAG would not otherwise have raised.
+    """
+    values = [int(c) for c in counts]
+    if not values:
+        raise StructureChunkerError("cannot size an empty plan")
+    largest = max(values)
+    applied = max(1.0, float(safety))
+    uncapped = max(64, int(math.ceil(largest * applied)) + max(0, int(margin)))
+    floor = max(64, largest + max(0, int(margin)))
+    size = uncapped
+    if ceiling and size > int(ceiling):
+        size = max(int(ceiling), floor)
+    return ChunkTokenSizing(size=max(size, floor), basis=tokenizer_name(), largest=largest,
+                            safety=applied, ceiling=int(ceiling or 0), uncapped=uncapped,
+                            capped=size < uncapped)
+
+
+def lightrag_chunk_token_sizing(plan: ChunkPlan, margin: int = 0, *,
+                                safety: float = 1.0, ceiling: int = 0) -> ChunkTokenSizing:
+    """The full sizing decision for a plan, with the numbers behind it."""
+    if not plan.pieces:
+        raise StructureChunkerError("cannot size an empty plan")
+    return size_from_counts((token_count(piece.render()) for piece in plan.pieces), margin,
+                            safety=safety, ceiling=ceiling)
+
+
+def lightrag_chunk_token_size(plan: ChunkPlan, margin: int = 0, *,
+                              safety: float = 1.0, ceiling: int = 0) -> tuple[int, str]:
     """``chunk_token_size`` for the request, in the tokens LIGHTRAG counts with.
 
     LightRAG sizes chunks with its own tokenizer (the tiktoken cl100k family), not with the
     embedder's, and under ``split_by_character_only`` a chunk over ``chunk_token_size`` is a
     hard ``ChunkTokenLimitExceededError`` - doc08 in the stack2 run: cts 2579 against a piece
     LightRAG measured at 2592. So this number is the largest RENDERED piece (header included)
-    in ``tokenizer_name()`` units plus a margin, and it is never the embedder-token count: the
-    embedder's count decides whether a piece fits the embedding window, which is a different
-    question with a different answer. When tiktoken is not installed the chunker's conservative
-    over-count stands in; it over-counts English prose and pipe tables, so it errs high, which
-    is the safe direction for this number.
+    in ``tokenizer_name()`` units, scaled by the safety factor and plus a margin, and it is
+    never the embedder-token count: the embedder's count decides whether a piece fits the
+    embedding window, which is a different question with a different answer. When tiktoken is
+    not installed the chunker's conservative over-count stands in; it errs high on prose and
+    low on table/number/punctuation-dense text, which is what the factor pays for.
     """
-    if not plan.pieces:
-        raise StructureChunkerError("cannot size an empty plan")
-    largest = max(token_count(piece.render()) for piece in plan.pieces)
-    return max(64, largest + max(0, int(margin))), tokenizer_name()
+    sizing = lightrag_chunk_token_sizing(plan, margin, safety=safety, ceiling=ceiling)
+    return sizing.size, sizing.basis
 
 
-def chunk_token_size_for_payload(payload: str, delimiter: str, margin: int = 0) -> tuple[int, str]:
+def chunk_token_sizing_for_payload(payload: str, delimiter: str, margin: int = 0, *,
+                                   safety: float = 1.0, ceiling: int = 0) -> ChunkTokenSizing:
     """Size ``chunk_token_size`` from the payload's OWN segments, not from the plan.
 
     The plan says what the pieces are; LightRAG counts what it is handed. Those can differ by
@@ -1779,9 +1836,16 @@ def chunk_token_size_for_payload(payload: str, delimiter: str, margin: int = 0) 
         raise StructureChunkerError("cannot size an empty payload")
     # A single-piece payload carries no delimiter at all: one segment is the whole document,
     # and that is the case LightRAG accepts whole.
-    largest = max(token_count(segment) for segment in payload.split(delimiter)
-                  if segment.strip())
-    return max(64, largest + max(0, int(margin))), tokenizer_name()
+    return size_from_counts((token_count(segment) for segment in payload.split(delimiter)
+                             if segment.strip()), margin, safety=safety, ceiling=ceiling)
+
+
+def chunk_token_size_for_payload(payload: str, delimiter: str, margin: int = 0, *,
+                                 safety: float = 1.0, ceiling: int = 0) -> tuple[int, str]:
+    """The ``(size, basis)`` pair of :func:`chunk_token_sizing_for_payload`."""
+    sizing = chunk_token_sizing_for_payload(payload, delimiter, margin,
+                                            safety=safety, ceiling=ceiling)
+    return sizing.size, sizing.basis
 
 
 def render_for_lightrag(plan: ChunkPlan, delimiter: str | None = None,

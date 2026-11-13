@@ -82,12 +82,30 @@ STRUCTURE_CHUNKING_MIN_PIECE_TOKENS=150    # merge floor: a smaller unit welds t
 STRUCTURE_CHUNKING_MERGE_UNTIL=floor       # floor: one natural unit per piece; window: pack to 7500
 STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS=8192 # BGE-M3's window, used for the fit check
 STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS=64    # headroom added to chunk_token_size
+STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY=3.2  # relative headroom on that same number
+STRUCTURE_CHUNKING_CHUNK_TOKEN_CEILING=8192 # never ask for a limit above the embedder window; 0 = no cap
 STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH=   # BGE-M3 tokenizer.json dir; empty = conservative over-count
 STRUCTURE_CHUNKING_EMBED_URL=              # empty by default = NO topic pass (deterministic fallback)
 STRUCTURE_CHUNKING_EMBED_MODEL=bge-m3-mlx-fp16
 STRUCTURE_CHUNKING_EMBED_API_KEY_ENV=OMLX_API_KEY  # the NAME of the variable, never the key
 STRUCTURE_CHUNKING_TOPIC_THRESHOLD=0.30    # TextTiling depth that counts as a topic change
 ```
+
+`chunk_token_size` is not a budget: it is the limit we ask LightRAG to enforce over pieces it is
+not allowed to re-cut, and it is computed per document as
+`ceil(largest_piece_in_our_units x SAFETY) + FIT_MARGIN`, capped at `CHUNK_TOKEN_CEILING` and never
+below the pre-factor `largest + FIT_MARGIN`. The **safety factor** exists because the counter that
+prices a piece (`conservative-overcount`, since `requirements.txt` carries no tiktoken)
+under-prices the shapes a PDF/DOCX extraction produces. Measured against a cl100k pre-tokenizer
+lower bound (`tests/test_pdf_chunk_token_overflow.py`): prose 0.62x (safe), JSON-ish text 1.04x,
+code 1.55x, PDF pipe tables 1.94x, dotted number runs 3.00x; the two stack2 rejections sat at 1.21x
+and 1.145x. 3.2 is the worst measured ratio plus headroom, and because those ratios are *lower*
+bounds it bounds the cases we measured, not every case there is. **Counting in LightRAG's own
+tokenizer family (install tiktoken, or vendor cl100k) remains the proper fix**; the factor is the
+interim. The factor moves no piece boundary — the submitted bytes are byte-identical with it on or
+off, pinned by sha256 in that test file. On the row, `structure_chunking_chunk_token_safety`,
+`..._largest_piece`, `..._ceiling`, `..._uncapped` and `..._capped` say what was applied, so a later
+`ChunkTokenLimitExceededError` is readable without a re-run.
 
 **To turn it on** — recommended for production, **not** defaults; these go in the production
 `.env` (and only `STRUCTURE_CHUNKING_ENABLED` is the chunker itself):

@@ -30,12 +30,20 @@ What the tests below establish, offline, with invented text only
    different question. Nothing in the path bounds the piece against LightRAG's own
    tokenizer.
 
-The fix is a design decision (change a limit vs. split pieces vs. count in
-LightRAG's tokenizer family) and is reported to the lead rather than chosen here.
-Nothing in ``app/`` changed for fix 3: the byte-exact transcript and DOCX results
-are untouched by construction. ``test_the_gap_is_still_open`` documents the defect
-as a characterisation test - when the lead lands a fix, that test must be inverted
-to assert no submitted segment can exceed the limit.
+STATUS (2026-11-13): the operator chose option B - a relative safety factor on the
+limit we ask LightRAG to enforce (``STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY``, shipped at
+3.2 = the largest measured under-count plus headroom, capped by
+``STRUCTURE_CHUNKING_CHUNK_TOKEN_CEILING`` at the embedder window). Option A - counting in
+LightRAG's own tokenizer family, i.e. installing tiktoken or vendoring cl100k - remains the
+proper fix, because every ratio here is a LOWER bound: a factor of 3.2 bounds the cases we
+measured, not every case there is.
+
+So this file now holds both halves. ``TestTheGapUnderThePreFactorConfig`` keeps the defect
+alive as a characterisation test at SAFETY=1.0 (the configuration stack2 ran with), so the
+remedy cannot be silently removed. ``TestTheGapIsClosedByTheSafetyFactor`` is the inversion:
+with the shipped factor, no submitted segment's lower-bound count exceeds the limit we ask
+for, on the same adversarial fixtures - and the payload BYTES, hence every piece boundary,
+are identical with and without the factor.
 """
 
 from __future__ import annotations
@@ -55,6 +63,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app.structure_chunker as sc
 import app.worker as worker
+from app.config import Settings
 
 REQUIREMENTS = Path(__file__).resolve().parent.parent / "requirements.txt"
 
@@ -111,6 +120,68 @@ PROSE_TEXT = (
     "autumn once the commissioning engineer signs the safety dossier.\n"
 ) * 6
 
+# The two classes the safety factor was sized on, beyond the table and the manifest.
+DOTTED_NUMBERS = "1.2.3.4.5.6.7.8.9.10.11.12.13.14.15 " * 20
+CODE_MIXED = "if (a && b) { x = f(y); } // 42\n" * 30
+
+# Invented transcript bodies, the shape whose byte-exact ingest results the earlier
+# packets pinned. Eight of them, because that is how the GL-07 corpus is shaped, and the
+# invariant must hold per document, not only on one sample.
+_TRANSCRIPT_TOPICS = (
+    ("order-to-cash handling", "the window ran 5 hours 55 minutes with 32 blockers"),
+    ("flat-file interfaces", "the extract failed twice on the 14th and was rerun at 02:10"),
+    ("master data cleansing", "1,240 customer masters were held for review by the plant team"),
+    ("legacy decommissioning", "the parallel run closed with 3 open defects, none blocking"),
+    ("role and authorisation redesign", "18 roles were merged and 4 were retired outright"),
+    ("archive and retention", "the retention rule keeps 7 years of records at 12.5% cost"),
+    ("three-way match exceptions", "90 invoices were released manually under $2,050.00 each"),
+    ("cutover rehearsal", "the go/no-go call took 45 minutes and listed 6 exit criteria"),
+)
+
+
+def transcript_text(index: int) -> str:
+    topic, outcome = _TRANSCRIPT_TOPICS[index]
+    code = f"NC-3617-T{index + 1:02d}-01"
+    return (
+        f"Meeting {index + 1}: {topic}\n"
+        f"A. Speaker: we have the entry in front of us, Entry {code}: {topic} "
+        f"was reviewed on {index + 3:02d}/0{(index % 9) + 1}/2026.\n"
+        f"B. Speaker: the outcome line reads {outcome}.\n"
+        f"A. Speaker: agreed, and the follow-up is scheduled with 3 owners and 2 dates.\n"
+    ) * 3
+
+
+TRANSCRIPT_SET = [transcript_text(i) for i in range(8)]
+TRANSCRIPT_TEXT = TRANSCRIPT_SET[0]
+
+# A DOCX-shaped specification body: dense identifiers and a table, the shape
+# OrderBook.docx stands for in the earlier packets.
+DOCX_LIKE_TEXT = (
+    "Interface specification - order book (invented)\n\n"
+    "1. Scope\nThis document specifies the order book interface between the legacy system and "
+    "the new ERP. Record NC-3617-OB-001 carries 12 fields.\n\n"
+    "2. Field map\n"
+    "FIELD | TYPE | WIDTH | NOTE\n"
+    "ORDER_ID | CHAR | 10 | key NC-3617-OB-###\n"
+    "QUANTITY | DEC | 8 | 3 decimals, 1,240.000 max\n"
+    "UNIT_PRICE | CUR | 11 | $2,050.00 typical\n"
+    "DELIVERY | DATE | 8 | 03/11/2026 format\n" * 4
+)
+
+# sha256 of the submitted (delimiter-joined) text for each fixture in TRANSCRIPT_SET +
+# DOCX_LIKE_TEXT, captured when option B landed. Byte-exactness, not a count.
+SUBMITTED_BYTES_SHA256: list[str] = [
+    "5ed88e7ff66ec3aab3eec6d04887231c4f531fe4411721f77ba8a7a447bab464",  # transcript 1
+    "5d24efb393c7f3e202f4a2edcc7d0476f9ff87427a8e6fed99b325334cc94fee",  # transcript 2
+    "def4c77cfe7afdd86ffc06268932cb1dbc5ca050325b26ca4489c778101b90a1",  # transcript 3
+    "05c785dce406224ef40816a0407d465dcc723e2944404880b380ef61d20d4f16",  # transcript 4
+    "b29aa04541c822b6fea0a83a0e71aee0471c91746cf0ddb33d86588c9e3f949e",  # transcript 5
+    "838921fe85b6c331fdac3faab337ec7e076d13c5e2484fff3f02e2e13fbe2220",  # transcript 6
+    "ce2f78323ccaf85219a0ac7bb2dfe0d7d31a40b510f2788bc1ea65559fe5a5c7",  # transcript 7
+    "4f429416d458293ff2648414cfd95dead6b84344c7632e06f92fa9c97281d32e",  # transcript 8
+    "e0964929e06fcfc8d5b3e55fa32a1ba64fd23c8cc5acf00dff30da5267bdf571",  # docx-shaped spec
+]
+
 MANIFEST_LIKE_TEXT = (
     '{"company":"Northwind Chemicals","facts":[{"id":"nc-f1","doc":"docx",'
     '"sentence":"The batch record NC-3617 was signed on 03/11/2026 by the plant '
@@ -143,6 +214,31 @@ class TestEstimateDirection(unittest.TestCase):
         ours = sc.token_count(text)
         bound = lightrag_token_lower_bound(text)
         self.assertLess(ours, bound)
+
+    def test_code_and_symbol_text_is_under_counted_too(self) -> None:
+        ours = sc.token_count(CODE_MIXED)
+        bound = lightrag_token_lower_bound(CODE_MIXED)
+        self.assertLess(ours, bound,
+                        f"we price this at {ours}; LightRAG counts it at >= {bound}")
+
+    def test_the_shipped_factor_covers_every_measured_ratio_in_this_file(self) -> None:
+        """The default is tied to these measurements, not to a round number.
+
+        If a fixture's ratio rises above the shipped factor, or someone lowers the factor,
+        this fails here instead of in an ingest run.
+        """
+        ratios = {}
+        for name, text in (("prose", PROSE_TEXT), ("pdf_table", TABLE_TEXT),
+                           ("json_manifest", MANIFEST_LIKE_TEXT),
+                           ("dotted_numbers", DOTTED_NUMBERS), ("code_mixed", CODE_MIXED)):
+            ours = sc.token_count(text)
+            ratios[name] = lightrag_token_lower_bound(text) / max(1, ours)
+        shipped = Settings().structure_chunking_chunk_token_safety
+        self.assertGreaterEqual(shipped, max(ratios.values()),
+                                f"measured under-counts {ratios} exceed the factor {shipped}")
+        self.assertLess(shipped, 5.0,
+                        "a factor this large would out-argue its own evidence; see the "
+                        "STRUCTURE_CHUNKING_CHUNK_TOKEN_CEILING for why it is capped")
 
     def test_json_is_not_reliably_over_counted_either(self) -> None:
         """The manifest.json shape: dense punctuation, so neither rule bounds it.
@@ -197,6 +293,11 @@ class _SubmitHarness(unittest.TestCase):
             structure_chunking_embed_window_tokens=8192,
             structure_chunking_embed_tokenizer_path="",
             worker_pdf_extract_enabled=True,
+            # The PRE-FACTOR configuration. Everything in this class characterises the stack2
+            # defect, so it must run with the sizing that produced it; the factor's own
+            # behaviour is asserted in TestTheGapIsClosedByTheSafetyFactor.
+            structure_chunking_chunk_token_safety=1.0,
+            structure_chunking_chunk_token_ceiling=0,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -297,6 +398,30 @@ class TestRouteAndLimitProvenance(_SubmitHarness):
         self.assertEqual(got["meta"].get("structure_chunking_chunk_token_basis"),
                          sc.tokenizer_name(),
                          "the counter that produced that number is recorded on the row")
+        self.assertEqual(got["meta"].get("structure_chunking_chunk_token_safety"), 1.0,
+                         "and so is the factor that was applied to it")
+
+    def test_the_shipped_default_scales_the_limit_by_the_measured_worst_case(self) -> None:
+        """At shipped defaults the limit is ceil(largest * SAFETY) + margin, not +margin."""
+        shipped = Settings().structure_chunking_chunk_token_safety
+        self.assertGreater(shipped, 1.0, "option B must not ship disabled")
+        with patch.multiple(worker.settings,
+                            structure_chunking_chunk_token_safety=shipped,
+                            structure_chunking_chunk_token_ceiling=int(
+                                Settings().structure_chunking_chunk_token_ceiling)):
+            got = self.submit_pdf_file("integration-analysis.pdf", TABLE_TEXT)
+        params = got["body"]["chunking"]["params"]
+        segments = [s for s in got["body"]["text"].split(params["split_by_character"]) if s.strip()]
+        largest_ours = max(sc.token_count(segment) for segment in segments)
+        self.assertEqual(
+            params["chunk_token_size"],
+            math.ceil(largest_ours * shipped) + int(
+                worker.settings.structure_chunking_fit_margin_tokens),
+            "ceil(largest * SAFETY) + FIT_MARGIN: the formula, in words")
+        worst_ratio = max(lightrag_token_lower_bound(s) / max(1, sc.token_count(s))
+                          for s in segments)
+        self.assertLessEqual(worst_ratio, shipped,
+                             "the shipped factor must cover the fixture class it was sized on")
         self.assertEqual(got["meta"].get("structure_extract_backend"), "pdftotext")
 
     def test_max_piece_tokens_is_a_different_budget(self) -> None:
@@ -322,13 +447,11 @@ class TestRouteAndLimitProvenance(_SubmitHarness):
                            "scales with the piece, so a bigger constant is not a bound")
 
 
-class TestTheGapIsStillOpen(_SubmitHarness):
-    """CHARACTERISATION of the unfixed defect - see the module docstring.
+class TestTheGapUnderThePreFactorConfig(_SubmitHarness):
+    """CHARACTERISATION of the defect at SAFETY=1.0 - the config stack2 ran with.
 
-    This test asserts what the code does TODAY, so that a fix cannot land silently
-    and so that the lead's decision is anchored to a measured case. When a fix
-    lands, invert the last assertion to: no segment's true count may exceed the
-    limit the request asks LightRAG to enforce.
+    Kept on purpose: if the factor is ever set back to 1.0, this is the shape that comes
+    back, and it must not come back unnoticed.
     """
 
     def test_adversarial_pdf_like_piece_exceeds_the_limit_we_ask_for(self) -> None:
@@ -344,9 +467,134 @@ class TestTheGapIsStillOpen(_SubmitHarness):
                         "the piece cleared the chunker's own ceiling...")
         self.assertGreater(
             worst, sent,
-            "...and yet LightRAG must count this same segment at >= that number, which "
-            "is the 505 > 481 shape. Left unfixed on purpose: the remedy is a design "
-            "decision reported to the lead.")
+            "...and yet LightRAG must count this same segment at >= that number, which is "
+            "the 505 > 481 shape: a constant margin cannot bound a relative error.")
+
+
+class TestTheGapIsClosedByTheSafetyFactor(_SubmitHarness):
+    """THE INVERSION: with the shipped factor, the limit clears the measured classes.
+
+    ``lightrag_token_lower_bound`` is a LOWER bound on LightRAG's count, so clearing it is
+    evidence, not proof - which is exactly why option A stays on the list.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.shipped = Settings().structure_chunking_chunk_token_safety
+        self.ceiling = Settings().structure_chunking_chunk_token_ceiling
+        patcher = patch.multiple(
+            worker.settings,
+            structure_chunking_chunk_token_safety=self.shipped,
+            structure_chunking_chunk_token_ceiling=self.ceiling)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def submitted(self, text: str) -> tuple[int, list[str], dict]:
+        got = self.submit_pdf_file("integration-analysis.pdf", text)
+        params = got["body"]["chunking"]["params"]
+        segments = [s for s in got["body"]["text"].split(params["split_by_character"]) if s.strip()]
+        return int(params["chunk_token_size"]), segments, got["meta"]
+
+    def test_the_default_factor_covers_every_measured_under_counting_class(self) -> None:
+        for name, text in (("pdf_table", TABLE_TEXT), ("prose", PROSE_TEXT),
+                           ("json_manifest", MANIFEST_LIKE_TEXT), ("dotted_numbers", DOTTED_NUMBERS)):
+            with self.subTest(shape=name):
+                sent, segments, _meta = self.submitted(text)
+                worst = max(lightrag_token_lower_bound(s) for s in segments)
+                self.assertLessEqual(
+                    worst, sent,
+                    f"{name}: LightRAG counts a segment at >= {worst} but we asked it to "
+                    f"enforce {sent}")
+
+    def test_the_factor_is_what_closes_it_and_not_a_bigger_margin(self) -> None:
+        """Same fixture, factor off: the exact failure the factor pays for."""
+        with patch.multiple(worker.settings, structure_chunking_chunk_token_safety=1.0,
+                            structure_chunking_chunk_token_ceiling=0):
+            off_sent, off_segments, _meta = self.submitted(TABLE_TEXT)
+        off_worst = max(lightrag_token_lower_bound(s) for s in off_segments)
+        on_sent, on_segments, _meta = self.submitted(TABLE_TEXT)
+        on_worst = max(lightrag_token_lower_bound(s) for s in on_segments)
+        self.assertGreater(off_worst, off_sent)
+        self.assertLessEqual(on_worst, on_sent)
+        self.assertGreater(on_sent, off_sent)
+
+    def test_eight_transcripts_and_a_docx_body_keep_their_exact_bytes(self) -> None:
+        """The byte-exact ingest results from the earlier packets survive option B.
+
+        Pinned as sha256 of the submitted text per document, so a later change that moves a
+        boundary anywhere in this set fails here rather than in someone's ingest run. The
+        table was produced at the factor's introduction and must only move with a deliberate
+        chunking change.
+        """
+        for index, text in enumerate(TRANSCRIPT_SET + [DOCX_LIKE_TEXT]):
+            with self.subTest(document=index):
+                sent, segments, _meta = self.submitted(text)
+                joined = self.post_json.await_args.args[1]["text"]
+                self.assertEqual(
+                    hashlib.sha256(joined.encode("utf-8")).hexdigest(),
+                    SUBMITTED_BYTES_SHA256[index],
+                    f"document {index} no longer submits the bytes it used to")
+                self.assertTrue(segments)
+                self.assertGreater(sent, 64)
+
+    def test_the_factor_changes_no_byte_of_the_payload_and_no_piece_boundary(self) -> None:
+        """The whole point of option B: only the acceptance threshold moves.
+
+        Asserted on the submitted BYTES (digest), not on counts, for the document classes
+        whose byte-exact ingest results the earlier packets pinned.
+        """
+        for name, text in (("transcript", TRANSCRIPT_TEXT), ("pdf_table", TABLE_TEXT),
+                           ("docx_spec", DOCX_LIKE_TEXT)):
+            with self.subTest(shape=name):
+                with patch.object(worker.settings, "structure_chunking_chunk_token_safety", 1.0):
+                    off_sent, off_segments, _ = self.submitted(text)
+                    off_text = self.post_json.await_args.args[1]["text"]
+                on_sent, on_segments, _ = self.submitted(text)
+                on_text = self.post_json.await_args.args[1]["text"]
+                self.assertEqual(off_text, on_text, f"{name}: the submitted bytes moved")
+                self.assertEqual(len(off_segments), len(on_segments))
+                self.assertEqual([len(s) for s in off_segments], [len(s) for s in on_segments])
+                self.assertGreaterEqual(on_sent, off_sent)
+
+    def test_a_code_shaped_fixture_never_reaches_the_limit_at_all(self) -> None:
+        """Why CODE_MIXED is not in the submitted loop: it gets no chunk plan.
+
+        The chunker returns no pieces for text with no prose units, so the worker falls back
+        to the unchunked route. That class's 1.55x under-count is measured at the counter
+        level (TestEstimateDirection) and is not something this limit governs.
+        """
+        got = self.submit_pdf_file("interface-code.pdf", CODE_MIXED)
+        self.assertNotIn("chunking", got["body"])
+        self.assertIn("no pieces", got["meta"]["structure_chunking_reason"])
+
+    def test_the_ceiling_bounds_the_request_and_says_so_on_the_row(self) -> None:
+        """A piece must not inherit an absurd limit from a 3.2x factor."""
+        with patch.object(worker.settings, "structure_chunking_chunk_token_ceiling", 700):
+            sent, _segments, meta = self.submitted(TABLE_TEXT)
+        self.assertEqual(sent, 700)
+        self.assertTrue(meta["structure_chunking_chunk_token_capped"])
+        self.assertGreater(meta["structure_chunking_chunk_token_uncapped"], 700)
+        self.assertEqual(meta["structure_chunking_chunk_token_safety"], self.shipped)
+
+    def test_the_ceiling_never_pulls_the_limit_below_the_pre_factor_number(self) -> None:
+        """A misconfigured ceiling cannot create a rejection that did not already exist."""
+        with patch.multiple(worker.settings, structure_chunking_chunk_token_safety=3.2,
+                            structure_chunking_chunk_token_ceiling=10):
+            sent, segments, meta = self.submitted(TABLE_TEXT)
+        largest_ours = max(sc.token_count(s) for s in segments)
+        self.assertGreaterEqual(sent, largest_ours + int(
+            worker.settings.structure_chunking_fit_margin_tokens))
+        self.assertTrue(meta["structure_chunking_chunk_token_capped"])
+
+    def test_a_safety_below_one_degrades_to_the_pre_factor_behaviour(self) -> None:
+        with patch.multiple(worker.settings, structure_chunking_chunk_token_safety=0.2,
+                            structure_chunking_chunk_token_ceiling=0):
+            sent, segments, meta = self.submitted(TABLE_TEXT)
+        largest_ours = max(sc.token_count(s) for s in segments)
+        self.assertEqual(sent, largest_ours + int(
+            worker.settings.structure_chunking_fit_margin_tokens))
+        self.assertEqual(meta["structure_chunking_chunk_token_safety"], 1.0,
+                         "the applied factor is recorded after clamping, not the typed one")
 
 
 if __name__ == "__main__":

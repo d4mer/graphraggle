@@ -283,3 +283,39 @@ Common `readiness_reason` values:
 - `skipped` — `status: skipped` with `error_code: skipped_by_name`: the filename is on
   `INGEST_SKIP_BASENAMES` (default `manifest.json`), so it was never a document.
 - `blocked` — blocked by another condition; check other fields
+
+## A document fails with `Chunk token length N exceeds chunk_token_size M`
+
+That `M` is **our own number**, not a LightRAG setting: the worker sizes each document as
+`ceil(largest_piece x STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY) + STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS`,
+capped at `STRUCTURE_CHUNKING_CHUNK_TOKEN_CEILING`. A configured LightRAG limit would be one number
+for every document; these differ per document, which is how you can tell.
+
+Read the row's `warnings_json.worker` block before changing anything:
+
+```bash
+jq '.worker | {structure_chunking_chunk_token_size,
+               structure_chunking_chunk_token_safety,
+               structure_chunking_chunk_token_largest_piece,
+               structure_chunking_chunk_token_basis,
+               structure_chunking_chunk_token_ceiling,
+               structure_chunking_chunk_token_uncapped,
+               structure_chunking_chunk_token_capped,
+               structure_chunking_embedder_tokens_max,
+               structure_chunking_fit_basis}' <state-export.json>
+```
+
+- `structure_chunking_chunk_token_basis: conservative-overcount` means the size was priced by the
+  stand-in counter, not by LightRAG's tokenizer (tiktoken is not in `requirements.txt`). That counter
+  under-prices table, number-run and punctuation-dense text — which is what the safety factor pays
+  for. If one document still overflows, the factor was not enough for *that* text: raise
+  `STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY` for the store, or land the proper fix (count in
+  LightRAG's tokenizer family). Do **not** fix it by raising `..._FIT_MARGIN_TOKENS`: the shortfall is
+  relative to the piece, so a constant cannot bound it.
+- `structure_chunking_chunk_token_capped: true` means the ceiling bound the request. The limit could
+  not go higher without asking LightRAG to accept a chunk larger than the embedder window, so treat
+  that document as oversized rather than as mis-sized: the window check
+  (`structure_chunking_embedder_tokens_max` against `STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS`) is the
+  gate that should have caught it.
+- `structure_chunking_chunk_token_payload_gap` shows the plan and the payload disagreed; the payload
+  number is the one LightRAG sees.

@@ -170,6 +170,27 @@ class Settings(BaseSettings):
     # is a bug signal, and blocking ingest on a heuristic is a worse outcome than the bug.
     structure_chunking_fail_on_lost_text: bool = Field(
         default=False, alias="STRUCTURE_CHUNKING_FAIL_ON_LOST_TEXT")
+    # Relative safety factor on the chunk_token_size we ask LightRAG to enforce:
+    # size = ceil(largest_piece_in_our_units * SAFETY) + FIT_MARGIN. It exists because the
+    # counter that prices a piece (``conservative-overcount``, since tiktoken is not in
+    # requirements.txt) UNDER-counts the classes a PDF extraction produces. Measured against
+    # a cl100k pre-tokenizer LOWER bound (tests/test_pdf_chunk_token_overflow.py): prose 0.62x
+    # (safe), JSON-shaped manifest text 1.04x, code/mixed 1.55x, PDF pipe tables 1.94x, dotted
+    # number runs 3.00x; the two stack2 rejections were at 1.21x and 1.145x. 3.2 is the largest
+    # measured ratio plus headroom - and because those ratios are LOWER bounds, it is a bound of
+    # experience, not a proof. Counting in LightRAG's own tokenizer family is the real fix; this
+    # is the interim. It changes no piece boundary: it only moves the acceptance threshold.
+    # Values below 1.0 are clamped to 1.0, which is the pre-factor behaviour.
+    structure_chunking_chunk_token_safety: float = Field(
+        default=3.2, alias="STRUCTURE_CHUNKING_CHUNK_TOKEN_SAFETY")
+    # Never ask LightRAG to enforce a chunk larger than this, in our counter's units. 0 disables
+    # the cap. Default equals STRUCTURE_CHUNKING_EMBED_WINDOW_TOKENS: a limit above the served
+    # embedder's window would only mean "ingest it and let the embedder truncate it silently".
+    # The cap can never push the number BELOW largest+FIT_MARGIN (the pre-factor value), so a
+    # misconfigured ceiling cannot introduce rejections that did not already exist; when the cap
+    # binds, structure_chunking_chunk_token_capped=true says so on the row.
+    structure_chunking_chunk_token_ceiling: int = Field(
+        default=8192, alias="STRUCTURE_CHUNKING_CHUNK_TOKEN_CEILING")
 
     rerank_enabled: bool = Field(default=False, alias="RERANK_ENABLED")
     rerank_binding_host: Optional[str] = Field(default=None, alias="RERANK_BINDING_HOST")
