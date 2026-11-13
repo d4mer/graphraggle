@@ -195,7 +195,11 @@ class TestWorkerDoor(_Base):
         with self.mocked_client() as up:
             _run(worker.handle_candidate(self.b_path, "upload", self.base))
         row = _row(str(self.b_path))
-        self.assertEqual(row["status"], "accepted")
+        # `skipped`, not `accepted`: the skip happens before any submit, so there
+        # is no track to poll and `accepted` would park the row forever (GL-07/08
+        # counted three such rows on stack2). See tests/test_skipped_duplicate_rows.py
+        # for the full set of terminal-status assertions.
+        self.assertEqual(row["status"], "skipped")
         self.assertEqual(row["error_code"], "duplicate_content")
         self.assertFalse(row["query_ready"])
         self.assertEqual(up.post_json.await_count, 0)

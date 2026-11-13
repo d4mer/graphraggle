@@ -472,3 +472,125 @@ Suite: **1250 passed, 2 warnings, 248 subtests** (baseline at `b462f24`: 1232/24
 no existing test edited). The patch also applies to a `git archive` export of `master` and there
 runs **1242 passed, 8 skipped** - the eight skips are the end-to-end class, which needs both
 comparison commits and skips by design without git history.
+
+## 2026-11-13 — three ingest fixes from the GL-07/08 synthetic-company run (Plane GRAG-62/63)
+
+Hermes ingested Northwind Chemicals and Contoso Pharma on stack2 on 2026-11-12. Three
+defects showed up in every company folder. Fixes 1 and 2 are implemented; fix 3 is a
+diagnosis with the decision left to the lead (see below).
+
+### Fix 1 — `manifest.json` is never ingested
+
+Every synthetic company folder carries a harness `manifest.json`. `.json` is in
+`SUPPORTED`/`TEXT_EXTENSIONS`, so the worker submitted it and LightRAG failed it in
+every folder: `Chunk token length 3431 exceeds chunk_token_size 3060`.
+
+- New setting `INGEST_SKIP_BASENAMES` (default `manifest.json`,
+  `app/config.py:ingest_skip_basenames`). Comma-separated, matched on the **whole
+  basename**, case-insensitive, never on an extension: `orders.json` still ingests,
+  `company_manifest.json` still ingests, `manifest.json.bak` is not matched (it gets
+  the normal `unsupported_extension` row).
+- A refused file gets a **terminal `skipped` row** (`error_code: skipped_by_name`)
+  naming the rule, not a failure row and not silence. Scans after that write nothing.
+- The rule does **not** take down a row that already has content upstream or in
+  flight (`ingested`/`submitted`/`processing`): the skip list is not a deletion
+  mechanism. Removing content from the store stays a separate explicit operation.
+- **Limit, tested for:** `/upload` stages files as `<id>--<name>`, so a basename rule
+  cannot see an API-uploaded `manifest.json`. Only the filesystem scan door is covered.
+- New `tests/test_ingest_skip_rule.py` (12 tests).
+
+### Fix 2 — a skipped duplicate reaches a terminal status
+
+The skip happens before any submit, so there is no track to poll. The row was written
+`accepted`, which every consumer reads as "waiting to be submitted", and it never
+terminated: one stuck row in Northwind, two in Contoso.
+
+- `skipped` is the **tenth lifecycle status** (see the ADR 0001 amendment). Written by
+  `mark_duplicate_candidate` in place of `accepted`, and by the new skip rule.
+- Both stuck shapes are terminated: the scan door's `accepted` row and the **upload
+  door's `pending` row** (`app/api.py` flags `duplicate_content` and never submits).
+- A row the old build left at `accepted` is promoted by the next worker scan, once.
+- `skipped` is not ACTIVE: not in `worker.ACTIVE_DUPLICATE_STATUSES` nor
+  `state_store.ACTIVE_SUPERSEDING_STATUSES`, so it cannot suppress a later copy or
+  supersede a row. It is never polled (no `track_id`) and never retried (the retry
+  block is gated on `status == "failed"`).
+- `derive_readiness` now answers `duplicate_content` / `skipped`; the company join is
+  unchanged (`scope_query_citations` joins by path, no status filter), which is tested.
+- New `tests/test_skipped_duplicate_rows.py` (14 tests); three existing assertions in
+  `test_company_aware_dedupe.py`, `test_worker_dedupe.py` and
+  `test_state_store_lifecycle.py` updated to the new status, plus one new promotion test.
+
+### Migration note — existing `accepted` duplicate rows (NOT run by anything)
+
+Nothing in `app/` or `scripts/` runs this. The next worker scan promotes those rows by
+itself, so this is only for an operator who wants the `by_status` counts to move before
+that scan. Preview first; it touches no row that has a track.
+
+```sql
+-- Read-only preview (state DB, e.g. ~/rag-project/state/ingest.db).
+-- Shape 1: the scan door's parked row, written by the old build.
+SELECT path, status, error_code, updated_at
+  FROM documents
+ WHERE status='accepted'
+   AND error_code='duplicate_content'
+   AND track_id IS NULL
+   AND json_extract(warnings_json,'$.worker.dedupe_action')='skip_duplicate_content';
+
+-- Shape 2: the upload door's row (the door flags it and never submits it).
+SELECT path, status, error_code, updated_at
+  FROM documents
+ WHERE status='pending'
+   AND error_code='duplicate_content'
+   AND track_id IS NULL;
+
+-- Apply each shape with the same predicate, swapping SELECT for
+-- `UPDATE documents SET status='skipped', updated_at=datetime('now')`.
+```
+
+`json_extract` needs SQLite's JSON1 (present in the worker image's Python: verified
+against SQLite 3.54.0 here). A row whose `status` is already `skipped` matches nothing,
+so it is safe to run twice.
+
+### Fix 3 — PDF chunk-token overflow: diagnosed, **not fixed**, decision reported
+
+`Chunk token length 505 exceeds chunk_token_size 481` on the synthetic PDFs is the same
+family as the production S/4 PDF and the `manifest.json` failures.
+
+1. **481 is our number, not LightRAG's setting.** `render_for_lightrag` sends
+   `chunk_token_size` per document, and its value is the largest rendered piece counted
+   **in our counter** plus `STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS` (64). Two different
+   documents produced two different limits (481, 3060); a configured limit would be one
+   number for every document.
+2. **Our counter is the fallback and it is not an upper bound.** `requirements.txt` does
+   not install tiktoken, so `app/structure_chunker.py` uses `conservative-overcount`
+   = `max(ceil(chars/3.6), whitespace_units)`. That over-counts prose (measured 0.62x of
+   a lower bound on LightRAG's own count — the safe direction the module docstring
+   promises) and **under-counts** the classes a `pdftotext -layout` PDF and a JSON
+   manifest produce: 1.94x under on an invented part-code/date/money table, 3.0x under
+   on dotted number runs, 1.04x under on JSON. LightRAG counts with tiktoken cl100k, so
+   the segment it measures can exceed the limit we asked it to enforce. The stack2
+   shortfalls (+21%, +14.5%) sit inside that range.
+3. **`STRUCTURE_CHUNKING_MAX_PIECE_TOKENS` (7500) is orthogonal.** It is the BGE-M3
+   8192-token window less a margin, checked against a different question. It never
+   bounds a piece against LightRAG's tokenizer. Note the same weak counter also carries
+   the window check when `STRUCTURE_CHUNKING_EMBED_TOKENIZER_PATH` is empty — that is
+   the silent-truncation variant of the same instrument error.
+4. The lower bound in (2) is provable offline without a vocabulary: cl100k pre-tokenizes
+   before BPE and each pre-token chunk is at least one token, so counting the published
+   pre-tokenizer's chunks bounds LightRAG's count from below.
+- New `tests/test_pdf_chunk_token_overflow.py` (11 tests), including
+  `TestTheGapIsStillOpen` — a characterisation test that fails loudly if anyone makes
+  the path claim a bound it does not have, and that must be inverted when a fix lands.
+- Options reported to the lead, not chosen: (A) count in LightRAG's tokenizer family
+  (tiktoken, or a vendored local cl100k file read like `app/embed_tokenizer.py` reads the
+  embed tokenizer — "never fetched"); (B) inflate `chunk_token_size` by a relative
+  safety factor (changes no piece boundary, so the 8 transcripts + DOCX stay byte-exact,
+  but it stops LightRAG's check being a guard against oversized chunks); (C) split pieces
+  against a LightRAG-aware budget (changes boundaries only for documents that fail
+  today); (D) raise `STRUCTURE_CHUNKING_FIT_MARGIN_TOKENS` — **proven insufficient**, the
+  shortfall scales with the piece (the manifest case needed +371 tokens).
+- Nothing in `app/` changed for fix 3.
+
+Suite: **1337 passed, 2 skipped, 2 warnings, 263 subtests passed in 9.74s** (baseline
+at `a8f04bb`: 1299 passed, 2 skipped, 2 warnings, 248 subtests). Three new files and
+38 new tests; four existing assertions updated to the new status.

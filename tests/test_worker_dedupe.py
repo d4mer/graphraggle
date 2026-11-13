@@ -322,7 +322,10 @@ class TestHandleCandidateDuplicates(unittest.TestCase):
                 _doc(
                     dup,
                     digest,
-                    "accepted",
+                    # The terminal status for a refused duplicate (GL-07/08 fix 2).
+                    # It used to be "accepted", which never terminated: see
+                    # test_legacy_accepted_duplicate_row_is_promoted_once below.
+                    "skipped",
                     validation_state="warn",
                     error_stage="validation",
                     error_code="duplicate_content",
@@ -337,6 +340,32 @@ class TestHandleCandidateDuplicates(unittest.TestCase):
         submit_file.assert_not_awaited()
         self.assertEqual(store.state_updates, [])
         self.assertEqual(store.docs[str(dup)]["error_code"], "duplicate_content")
+
+    def test_legacy_accepted_duplicate_row_is_promoted_once(self):
+        """A row the old build parked at `accepted` gets one write: the new status."""
+        dup = self._file("dup.txt")
+        original = self._file("orig.txt")
+        digest = worker.sha256_of(dup)
+        store = _FakeStateStore([
+            self._attributed(
+                _doc(
+                    dup,
+                    digest,
+                    "accepted",
+                    validation_state="warn",
+                    error_stage="validation",
+                    error_code="duplicate_content",
+                    warnings_json=_duplicate_meta(str(original)),
+                )
+            ),
+            self._attributed(_doc(original, digest, "ingested", query_ready=True)),
+        ])
+
+        submit_file = self._handle(store, dup)
+
+        submit_file.assert_not_awaited()
+        self.assertEqual(len(store.state_updates), 1, "promoted exactly once")
+        self.assertEqual(store.state_updates[0][1]["status"], "skipped")
 
     def test_mutual_duplicate_original_is_resubmitted_not_remarked(self):
         """Bug 1 end-to-end: retried original must not be marked duplicate of its own copy."""

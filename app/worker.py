@@ -71,7 +71,16 @@ METADATA_FILE_PREFIXES = ("._",)
 # /upload stages the stream inside UPLOADS_DIR as ".<document_id>.part" and only
 # renames it into place once the body is complete.
 INGEST_SKIP_SUFFIXES = {".part"}
+# A `skipped` row is deliberately NOT in here: it carries nothing of its own
+# upstream, so it must never be the row that suppresses a later document. It is
+# still a real row for the company that owns the path, which is what the gateway
+# join uses it for.
 ACTIVE_DUPLICATE_STATUSES = {"accepted", "submitted", "processing", "ingested"}
+# Rows that already have content upstream or in flight. The filename skip rule is
+# not a deletion mechanism, so it never takes one of these down.
+IN_FLIGHT_OR_INDEXED_STATUSES = TERMINAL_SUCCESS | {"submitted", "processing"}
+# error_code written on a row the filename skip rule refused.
+SKIP_RULE_ERROR_CODE = "skipped_by_name"
 NON_RETRYABLE_FAILURE_CODES = {
     "decode_failed",
     "lightrag_processing_failed",
@@ -119,6 +128,27 @@ def is_metadata_file(path: Path) -> bool:
     if name in METADATA_FILE_BASENAMES:
         return True
     return name.startswith(METADATA_FILE_PREFIXES)
+
+
+def configured_skip_basenames() -> frozenset[str]:
+    """The ``INGEST_SKIP_BASENAMES`` list, parsed per call so a test can retune it.
+
+    Comma-separated, whitespace-tolerant, lowercased for matching. An empty value
+    turns the rule off entirely.
+    """
+    raw = str(settings.ingest_skip_basenames or "")
+    return frozenset(name.strip().lower() for name in raw.split(",") if name.strip())
+
+
+def skipped_basename_match(path: Path) -> str | None:
+    """The configured basename this path is skipped for, or None.
+
+    Matched on the whole basename, case-insensitively, and never on an extension:
+    a genuine document named ``orders.json`` is still a document. That is the whole
+    point of the rule - it names files, not types.
+    """
+    rules = configured_skip_basenames()
+    return path.name if path.name.lower() in rules else None
 
 
 def should_skip_path(path: Path, root: Path, source_type: str) -> bool:
@@ -760,6 +790,88 @@ def is_retryable_failure(doc: dict[str, Any]) -> bool:
     return bool(error_code) and error_code not in NON_RETRYABLE_FAILURE_CODES
 
 
+async def mark_skipped_by_name(path: Path, root: Path, source_type: str, matched: str) -> None:
+    """Write a terminal ``skipped`` row for a file the filename rule excludes.
+
+    Deliberately not silent. :func:`should_skip_path` writes nothing at all for a
+    Finder sidecar, because there is nothing to explain. A ``manifest.json`` inside
+    a company folder looks exactly like a document an operator expected to be
+    searchable, and before this rule it was submitted and failed upstream on chunk
+    size, so the folder showed a failing row nobody could explain. The row now says
+    which rule refused it.
+
+    It does not touch a row that already has content upstream or in flight: the
+    skip list is not a deletion mechanism, and taking an ``ingested`` row down
+    would make a citable document read as if it had never been ingested while its
+    chunks are still in the store. Removing content from the store is a separate,
+    explicit operation.
+    """
+    existing = await get_document_by_path(str(path))
+    if existing is not None:
+        status = existing.get("status")
+        worker_meta = parse_warning_metadata(existing.get("warnings_json")).get("worker")
+        settled = (isinstance(worker_meta, dict)
+                   and worker_meta.get("skip_rule_basename") == matched)
+        if status == "skipped" and settled:
+            return
+        if status in IN_FLIGHT_OR_INDEXED_STATUSES:
+            return
+
+    digest = sha256_of(path)
+    company, company_source, company_source_detail = infer_company_from_path(path, root, source_type)
+    warnings_json = merge_warning_metadata(
+        existing.get("warnings_json") if existing else None,
+        duplicate_of=None,
+        worker_updates=cleared_reindex_updates({
+            "dedupe_action": None,
+            "skip_rule_basename": matched,
+            "submission_blocked": "ingest_skip_basenames",
+        }),
+    )
+    if existing is None:
+        await upsert_document(
+            document_id=str(uuid.uuid4()),
+            path=str(path),
+            source_type=source_type,
+            company=company,
+            company_source=company_source,
+            company_source_detail=company_source_detail,
+            filename=path.name,
+            original_filename=path.name,
+            sha256=digest,
+            status="skipped",
+            track_id=None,
+            validation_state="warn",
+            error_stage="validation",
+            error_code=SKIP_RULE_ERROR_CODE,
+            error_message="Filename matches INGEST_SKIP_BASENAMES; not ingested",
+            error_detail=f"skipped by basename rule: {matched}",
+            query_ready=False,
+            content_hash=digest,
+            byte_size=path.stat().st_size,
+            warnings_json=warnings_json,
+        )
+    else:
+        await update_document_state(
+            str(path),
+            sha256=digest,
+            status="skipped",
+            validation_state="warn",
+            error_stage="validation",
+            error_code=SKIP_RULE_ERROR_CODE,
+            error_message="Filename matches INGEST_SKIP_BASENAMES; not ingested",
+            error_detail=f"skipped by basename rule: {matched}",
+            last_error=None,
+            track_id=None,
+            query_ready=False,
+            content_hash=digest,
+            byte_size=path.stat().st_size,
+            ingested_at=None,
+            warnings_json=warnings_json,
+        )
+    warn(f"Skipping {path}: basename matches INGEST_SKIP_BASENAMES ({matched})")
+
+
 async def mark_duplicate_candidate(path: Path, digest: str, duplicate_of: dict[str, Any], existing: dict[str, Any] | None) -> None:
     warnings_json = merge_warning_metadata(
         existing.get("warnings_json") if existing else None,
@@ -781,10 +893,15 @@ async def mark_duplicate_candidate(path: Path, digest: str, duplicate_of: dict[s
             "track_poll_payload": None,
         }),
     )
+    # ``skipped``, not ``accepted``. The skip happens before any submit, so there
+    # is no track to poll: as ``accepted`` the row never terminated, and the GL-07/08
+    # run found one parked in Northwind and two in Contoso. This is also the
+    # self-healing backfill for rows written by the old build - the next scan moves
+    # them, one write each, with no operator step.
     await update_document_state(
         str(path),
         sha256=digest,
-        status="accepted",
+        status="skipped",
         validation_state="warn",
         error_stage="validation",
         error_code="duplicate_content",
@@ -1541,8 +1658,14 @@ async def handle_candidate(path: Path, source_type: str, root: Path) -> None:
                 "company": blind_match.get("company"),
             }
     if duplicate_of is not None:
-        if duplicate_row:
+        if duplicate_row and status == "skipped":
+            # Already settled at the terminal status: no write, no re-pointing,
+            # no submit. This is the idempotence the dedupe tests guard.
             return
+        # Either this is a new duplicate, or it is a row the OLD build parked at
+        # ``accepted`` (scan door) or left at ``pending`` (upload door, which
+        # flags the duplicate but never submits it). Both get the terminal status
+        # here, once.
         await mark_duplicate_candidate(path, digest, duplicate_of, existing)
         return
 
@@ -1666,6 +1789,14 @@ async def scan_once() -> None:
             # Before the unsupported-extension branch: a staged upload temp file
             # must produce no row at all, not a `rejected` one.
             if should_skip_path(path, base, source_type):
+                continue
+            # After it, on purpose: a skipped basename is a decision about a real
+            # file, and it gets a row that says so. Before the SUPPORTED check so
+            # a skipped name can never collect an `unsupported_extension` row
+            # either, and before handle_candidate so it is never submitted.
+            matched = skipped_basename_match(path)
+            if matched is not None:
+                await mark_skipped_by_name(path, base, source_type, matched)
                 continue
             company, company_source, company_source_detail = infer_company_from_path(path, base, source_type)
             if path.suffix.lower() not in SUPPORTED:

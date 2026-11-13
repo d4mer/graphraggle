@@ -98,8 +98,8 @@ Or make it do work and watch the effect: `POST /reindex`, then watch
 `GET /ingest/status` → `summary.by_status` and the rows' `updated_at` move.
 
 Two kinds of silence that are also normal: a row whose bytes match the recorded
-`sha256` and whose status is already terminal (`ingested`, `rejected`, or flagged
-`auto_split`) is returned before any retry bookkeeping, and so is a row that hit a
+`sha256` and whose status is already terminal (`ingested`, `rejected`, `skipped`, or
+flagged `auto_split`) is returned before any retry bookkeeping, and so is a row that hit a
 non-retryable submit failure (`submit_terminal_failed`) at the `INGEST_MAX_RETRIES`
 limit — its `retry_count` stays where it was and nothing further happens until the next
 `/reindex`. If you see `refused status transition` in the logs, the worker **is**
@@ -275,4 +275,11 @@ curl -s http://localhost:8000/ingest/status \
 Common `readiness_reason` values:
 - `upstream_failed` — LightRAG ingestion failed; reindex may resolve
 - `superseded` — document was replaced by a newer version; check `supersedes_document_id`
+- `duplicate_content` — `status: skipped`. The worker refused to submit these bytes
+  because an ACTIVE row already carries them. `warnings_json.duplicate_of.path` names
+  the copy that was indexed, and `worker.duplicate_match_paths` lists them all. This is
+  terminal: the row is not stuck and no reindex is needed unless the original is
+  removed, in which case the next scan resubmits this one.
+- `skipped` — `status: skipped` with `error_code: skipped_by_name`: the filename is on
+  `INGEST_SKIP_BASENAMES` (default `manifest.json`), so it was never a document.
 - `blocked` — blocked by another condition; check other fields

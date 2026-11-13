@@ -8,6 +8,10 @@ from .config import settings
 
 logger = logging.getLogger("gateway.state_store")
 
+# A `skipped` row carries no indexed content of its own (a duplicate the worker
+# refused to submit, or a basename on INGEST_SKIP_BASENAMES), so it can never be
+# the ACTIVE row that supersedes another one. Same reason it is not in
+# worker.ACTIVE_DUPLICATE_STATUSES: it must not suppress a later document.
 ACTIVE_SUPERSEDING_STATUSES = {"accepted", "submitted", "processing", "ingested"}
 COMPANY_SOURCE_EXPLICIT = "explicit"
 COMPANY_SOURCE_PATH_INFERRED = "path_inferred"
@@ -74,7 +78,8 @@ UNSET = object()
 
 
 # ── Lifecycle transitions ───────────────────────────────────────────────────
-# The nine statuses of ADR 0001 (docs/decisions/0001-lifecycle-model.md). This
+# The ten statuses of ADR 0001 (docs/decisions/0001-lifecycle-model.md, plus its
+# 2026-11-13 amendment adding `skipped`). This
 # table is the single definition of which status edges a row may travel; the
 # writer functions below enforce it, so a slow poll, a retry or a re-scan can no
 # longer downgrade a row silently. Illegal writes are dropped with a log line -
@@ -90,6 +95,15 @@ STATUSES = frozenset({
     "failed",
     "rejected",
     "superseded",
+    # The tenth status, added for GL-07/08 (see the ADR 0001 amendment). Terminal
+    # and deliberate: the worker decided NOT to submit this file - a duplicate of an
+    # active row, or a basename on INGEST_SKIP_BASENAMES - and wrote that decision
+    # instead of leaving the row at `accepted`, where the GL-07/08 run found rows
+    # parked forever (the skip happens before any submit, and the worker only polls
+    # submitted tracks). It is not a failure, it is not query-ready, and the scan
+    # loop does not retry it. A `skipped` row still resolves its company by path,
+    # which is what the gateway join uses it for.
+    "skipped",
 })
 
 # `superseded` is never written as a stored status anywhere in app/: supersession
@@ -120,15 +134,26 @@ READ_DERIVED_STATUSES = frozenset({"superseded"})
 #   ingested is only reachable from a status that has an upstream track: a row
 #              that never went upstream cannot become query-ready.
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
-    "pending": frozenset({"validating", "accepted", "submitted", "processing", "failed", "rejected", "superseded"}),
-    "validating": frozenset({"pending", "accepted", "submitted", "processing", "failed", "rejected", "superseded"}),
-    "accepted": frozenset({"pending", "validating", "submitted", "processing", "failed", "rejected", "superseded"}),
-    "submitted": frozenset({"pending", "validating", "accepted", "processing", "ingested", "failed", "rejected", "superseded"}),
-    "processing": frozenset({"pending", "validating", "accepted", "submitted", "ingested", "failed", "rejected", "superseded"}),
-    "ingested": frozenset({"pending", "validating", "accepted", "submitted", "rejected", "superseded"}),
-    "failed": frozenset({"pending", "validating", "accepted", "submitted", "processing", "ingested", "rejected", "superseded"}),
-    "rejected": frozenset({"pending", "validating", "accepted", "submitted", "superseded"}),
-    "superseded": frozenset({"pending", "validating", "accepted", "submitted"}),
+    "pending": frozenset({"validating", "accepted", "submitted", "processing", "failed", "rejected", "superseded", "skipped"}),
+    "validating": frozenset({"pending", "accepted", "submitted", "processing", "failed", "rejected", "superseded", "skipped"}),
+    "accepted": frozenset({"pending", "validating", "submitted", "processing", "failed", "rejected", "superseded", "skipped"}),
+    "submitted": frozenset({"pending", "validating", "accepted", "processing", "ingested", "failed", "rejected", "superseded", "skipped"}),
+    "processing": frozenset({"pending", "validating", "accepted", "submitted", "ingested", "failed", "rejected", "superseded", "skipped"}),
+    # `ingested -> skipped` is the honest version of what already happens today: a
+    # force-reindexed row that turns out to duplicate another company's active row
+    # was written back to `accepted`, which also took away its readiness. The
+    # worker's own skip rule refuses to take an already-indexed row down
+    # (app.worker.mark_skipped_by_name), so this edge only runs for the duplicate
+    # mark.
+    "ingested": frozenset({"pending", "validating", "accepted", "submitted", "rejected", "superseded", "skipped"}),
+    "failed": frozenset({"pending", "validating", "accepted", "submitted", "processing", "ingested", "rejected", "superseded", "skipped"}),
+    "rejected": frozenset({"pending", "validating", "accepted", "submitted", "superseded", "skipped"}),
+    "superseded": frozenset({"pending", "validating", "accepted", "submitted", "skipped"}),
+    # `skipped` mirrors the statuses that must be re-validated before they can do
+    # work again: it may return to pending (an operator reindex) or back to work
+    # when the row it duplicated disappears, but it cannot become processing or
+    # ingested directly - nothing was ever upstream for it.
+    "skipped": frozenset({"pending", "validating", "accepted", "submitted"}),
 }
 
 
@@ -230,6 +255,13 @@ def derive_readiness(doc: dict, superseded_ids: set[str] | None = None) -> tuple
         return False, "validation_rejected"
     if validation_state == "auto_split":
         return False, "split_required"
+    if status == "skipped":
+        # Terminal by decision, not by failure. Named after the decision, so an
+        # operator counting reasons can tell "we refused this file" apart from
+        # "we have not got to this file yet".
+        if str(doc.get("error_code") or "") == "duplicate_content":
+            return False, "duplicate_content"
+        return False, "skipped"
     if status == "ingested":
         return True, "ingested"
     if status in {"submitted", "processing"}:

@@ -94,7 +94,10 @@ class TestTransitionTable(unittest.TestCase):
             self.assertTrue(state_store.is_legal_transition(status, "pending"), status)
 
     def test_a_row_that_never_went_upstream_cannot_become_ingested(self) -> None:
-        for status in ("pending", "validating", "accepted", "rejected", "superseded"):
+        # `skipped` joins this group: a refused duplicate or a filename the skip
+        # rule excluded has nothing upstream, so it cannot become query-ready
+        # without going back through work.
+        for status in ("pending", "validating", "accepted", "rejected", "superseded", "skipped"):
             self.assertFalse(state_store.is_legal_transition(status, "ingested"), status)
         for status in ("submitted", "processing", "failed"):
             self.assertTrue(state_store.is_legal_transition(status, "ingested"), status)
@@ -105,11 +108,15 @@ class TestTransitionTable(unittest.TestCase):
         self.assertTrue(state_store.is_legal_transition("ingested", "rejected"))
         for status in ("failed", "processing"):
             self.assertFalse(state_store.is_legal_transition("ingested", status), status)
-        for status in ("pending", "validating", "accepted", "submitted", "superseded"):
+        # `skipped` is in this group because the duplicate mark is the only writer
+        # that reaches it from `ingested` (a force-reindexed row that turns out to
+        # duplicate another company's active row). It already left query-ready
+        # today by being written back to `accepted`; `skipped` just says so.
+        for status in ("pending", "validating", "accepted", "submitted", "superseded", "skipped"):
             self.assertTrue(state_store.is_legal_transition("ingested", status), status)
 
-    def test_rejected_and_superseded_must_be_revalidated(self) -> None:
-        for source in ("rejected", "superseded"):
+    def test_rejected_superseded_and_skipped_must_be_revalidated(self) -> None:
+        for source in ("rejected", "superseded", "skipped"):
             for status in ("processing", "ingested", "failed"):
                 self.assertFalse(state_store.is_legal_transition(source, status), f"{source}->{status}")
 

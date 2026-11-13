@@ -19,6 +19,17 @@ class Settings(BaseSettings):
 
     ingest_scan_interval_seconds: int = Field(default=30, alias="INGEST_SCAN_INTERVAL_SECONDS")
     ingest_max_retries: int = Field(default=3, alias="INGEST_MAX_RETRIES")
+    # Basenames the scanner never ingests, comma-separated, matched on the whole
+    # basename case-insensitively. The default exists because of a measured
+    # failure: every synthetic company folder carries a manifest.json written by
+    # the test harness, `.json` is in SUPPORTED/TEXT_EXTENSIONS, so the worker
+    # submitted it and LightRAG failed it on chunk size in every company folder
+    # (GL-07/08 on stack2, 2026-11-12). A refused file gets a terminal `skipped`
+    # row naming the rule; it is never silently invisible, and it is never a
+    # failure row. This names FILES, not extensions - a real orders.json, or any
+    # file whose name merely contains "manifest", still ingests. Empty disables.
+    ingest_skip_basenames: str = Field(default="manifest.json",
+                                       alias="INGEST_SKIP_BASENAMES")
     request_timeout_seconds: int = Field(default=300, alias="REQUEST_TIMEOUT_SECONDS")
 
     # Company-aware duplicate selection. Default false = shipped behaviour is

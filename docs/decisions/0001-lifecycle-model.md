@@ -27,6 +27,7 @@ Recommended lifecycle states:
 7. `failed`
 8. `rejected`
 9. `superseded`
+10. `skipped` — added 2026-11-13, see *Amendment* below
 
 Optional later:
 
@@ -117,6 +118,40 @@ upsert of /data/source_docs/companyA/a.txt as rejected ignored:
 
 If a document is stuck, or shows the wrong `query_ready`, those lines are the
 first place to look.
+
+## Amendment (2026-11-13): the tenth status, `skipped`
+
+GL-07/08 (two synthetic companies ingested on stack2, 2026-11-12) surfaced a state
+the nine-status model could not say. A duplicate refused before any submit was
+written `accepted`, and every consumer reads `accepted` as "waiting to be
+submitted". The worker only polls submitted tracks, so those rows never terminated:
+one parked row in Northwind Chemicals, two in Contoso Pharma, and they will keep
+multiplying in every company folder.
+
+Decision, as implemented in `app/state_store.py`:
+
+1. `skipped` is **terminal and deliberate**, not a failure. It means the worker
+   decided not to submit this file: either its bytes duplicate an ACTIVE row
+   (`error_code: duplicate_content`) or its basename is on `INGEST_SKIP_BASENAMES`
+   (`error_code: skipped_by_name`).
+2. It is written where `accepted` used to be written, and by the same two call
+   sites — so the set of sources that may reach `skipped` mirrors the set that
+   could reach `accepted`. Rows the old build left at `accepted` are promoted by
+   the next scan: one write each, no operator step.
+3. From `skipped` a row may go to `pending`, `validating`, `accepted` or
+   `submitted` — an operator reindex, or the copy it duplicated stopping being an
+   original. It cannot go straight to `processing` or `ingested`: nothing of its
+   own ever went upstream. Same rule as `rejected` and `superseded`.
+4. `skipped` is **not** an ACTIVE status. It is in neither
+   `worker.ACTIVE_DUPLICATE_STATUSES` nor `state_store.ACTIVE_SUPERSEDING_STATUSES`:
+   it holds no indexed content, so it may not suppress a later document or
+   supersede another row.
+5. It is still a real row for the company that owns the path. The gateway joins
+   citations by path with no status filter, so "which company has this file" keeps
+   answering even for a skipped duplicate — which is why the fix did not need a new
+   place to store `duplicate_of`.
+6. Readiness is derived, never stored: `derive_readiness` returns
+   `duplicate_content` or `skipped` as the reason, and `query_ready` false.
 
 ## Affected Packets
 

@@ -272,6 +272,15 @@ Gateway defaults that are **in force without being written in `.env`**:
 2. `source_docs/__enqueued__` is ignored
 3. text-like files ingest through `/documents/text`
 4. binary docs ingest through `/documents/upload`
+5. `INGEST_SKIP_BASENAMES` (default `manifest.json`) is never submitted. The rule
+   matches the whole basename, case-insensitively, and never an extension, so a real
+   `orders.json` still ingests. A refused file gets a terminal `skipped` row naming
+   the rule - visible to an operator, not a failure row and not silence. Added for
+   GL-07/08: every synthetic company folder carries a harness `manifest.json`, and in
+   every folder it was submitted and failed on chunk size.
+   **Limit:** `/upload` stages files as `<id>--<name>`, so an API-uploaded
+   `manifest.json` is not matched by a basename rule and is ingested like any other
+   document. Only the filesystem scan door is covered.
 
 ## Text Extensions Sent Through `/documents/text`
 
