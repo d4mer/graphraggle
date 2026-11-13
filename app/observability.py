@@ -306,6 +306,11 @@ def emit_query_log(
             "grounding_unsupported": grounding.get("unsupported"),
             "grounding_evidence_pass": grounding.get("evidence_pass"),
             "grounding_references_without_content": grounding.get("evidence_references_without_content"),
+            # The exact guard metric for enforcement. `grounding_unsupported` above is
+            # asked-OR-asserted, so on its own it cannot answer "would enforcement have refused
+            # this row?" without counting rows where only the answer added an extra code.
+            "grounding_supported": grounding.get("supported"),
+            "grounding_asked_unsupported": grounding.get("asked_unsupported"),
             "latency_ms_total": timer.total_ms(started),
             "latency_ms_by_stage": timer.elapsed_ms,
         }

@@ -667,3 +667,32 @@ nothing removed.
   corpus half of the GL-08 finding is reproducible here and the run half is not. A scorer for
   run exports is the prerequisite for the go/no-go on enforcement, and it should be written
   against the real export shape rather than a guessed one.
+
+## 2026-11-13 - run-export scorer for the M1 gate (`scripts/score_grounding_run.py`)
+
+- New script turns a labelled probe run + the gateway query log into the go/no-go numbers for
+  ENFORCING M1, counts only: `would_newly_refuse_answerable` (the guard, printed even at 0),
+  `hallucinations_caught` / `_missed`, `references_without_content`, per-shape row counts, the
+  labels as the export already labelled them, gate cross-tabs, and rows vs distinct-question
+  denominators. No question text, answers, identifiers or reference content in the report - it is
+  meant to be pasted into a ticket.
+- It fails loudly instead of guessing: an export row with no log line, an unknown label value, an
+  unknown manifest shape key, a repeated question with no `request_id` to disambiguate, or a run
+  with no query log all exit 2 with **no headline numbers printed**, so a half-joined run can
+  never produce a decision number.
+- Join key is chosen and reported: `request_id` (the gateway puts the same id in the response
+  `meta.request_id` and in the query log, so a runner that records it joins unambiguously even
+  with repeats), falling back to question+company only when that is unambiguous.
+- The runner's export field names are ASSUMED and declared in one place (`FIELD_ALIASES`), because
+  the runner lives outside this repo and no real export was on disk when this was written. Unknown
+  names are a `--map theirs=ours` one-liner, and a failure message lists the keys a row did carry
+  (key names only) so the mapping is fixable without reading the corpus.
+- Found while building it, and fixed: the generated manifests repeat question text within a
+  company (scoped probes are per FACT and several facts share a topic label). That is why the 55
+  row GL-08 run is 41 distinct questions. A first draft rejected the repeats, which would have
+  made the real run unscorable; it now counts them and reports entries vs distinct keys. A text
+  that appears in two different shapes is still a hard failure.
+- `app/observability.emit_query_log` gains `grounding_supported` and `grounding_asked_unsupported`.
+  The M1 projection logged `grounding_unsupported`, which is asked-OR-asserted, so the guard
+  metric could not be computed from it exactly - an older log is still scorable but only
+  conservatively, and the script labels that and warns.

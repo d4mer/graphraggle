@@ -292,6 +292,16 @@ Gateway defaults that are **in force without being written in `.env`**:
    712 same-company lookalikes per probe, and chunker line-wrapping that makes identifier-
    level (not sentence-level) matching the only durable evidence test. Off until one measured
    run on the real probe sets decides whether it ever acts on the verdict.
+   **Measuring it:** set `GROUNDING_CHECK_ASKED_IDENTIFIER=true` plus `QUERY_LOG_PATH` for the
+   run, then `python scripts/score_grounding_run.py --manifest <company manifest.json>...
+   --results <the runner's *.results.jsonl> --log <that query-log capture>`. It prints counts
+   only — no question text, no answers, no reference content — and its headline guard is
+   `would_newly_refuse_answerable`, which must be 0. It refuses to score rather than guess: an
+   export row it cannot join, a label it does not recognise, a repeated question with no
+   `request_id` to disambiguate, or a run with no query log all stop it. Note that the GL-08
+   55-row run is only 41 distinct questions because generated scoped probes repeat a question
+   text within a company (several facts share one topic label); the scorer reports rows and
+   distinct questions separately so no rate hides that.
 
 ## oMLX Behaviour Notes (measured 2026-10-09)
 

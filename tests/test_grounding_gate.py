@@ -255,18 +255,27 @@ class TestQueryLogCarriesTheCounts(unittest.TestCase):
     def test_the_fields_are_present_when_the_check_ran(self) -> None:
         line = self._emit({"grounding": {
             "verdict": "no_support_for_asked_identifier", "asked": [ABSENT_CODE],
-            "unsupported": [ABSENT_CODE], "evidence_pass": "primary",
+            "unsupported": [ABSENT_CODE], "asked_unsupported": [ABSENT_CODE],
+            "supported": False, "evidence_pass": "primary",
             "evidence_references_without_content": 0}})
         self.assertTrue(line["grounding_checked"])
         self.assertEqual(line["grounding_verdict"], "no_support_for_asked_identifier")
         self.assertEqual(line["grounding_asked"], [ABSENT_CODE])
         self.assertEqual(line["grounding_unsupported"], [ABSENT_CODE])
         self.assertEqual(line["grounding_evidence_pass"], "primary")
+        # The guard metric, and the exact asked-only subset. `grounding_unsupported` alone is
+        # asked-OR-asserted, so scripts/score_grounding_run.py cannot compute
+        # would_newly_refuse_answerable from it without over-counting.
+        self.assertIs(line["grounding_supported"], False)
+        self.assertEqual(line["grounding_asked_unsupported"], [ABSENT_CODE])
 
     def test_the_fields_are_quiet_when_it_did_not(self) -> None:
         line = self._emit({})
         self.assertFalse(line["grounding_checked"])
         self.assertIsNone(line["grounding_verdict"])
+        # None here means "not checked", and it is distinguishable from supported=False.
+        self.assertIsNone(line["grounding_supported"])
+        self.assertIsNone(line["grounding_asked_unsupported"])
 
     def test_no_reference_text_ever_reaches_the_line(self) -> None:
         """The log projects named fields, so evidence text cannot leak by accident."""
