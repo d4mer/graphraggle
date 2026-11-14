@@ -696,3 +696,33 @@ nothing removed.
   The M1 projection logged `grounding_unsupported`, which is asked-OR-asserted, so the guard
   metric could not be computed from it exactly - an older log is still scorable but only
   conservatively, and the script labels that and warns.
+
+## 2026-11-14 - identifier-bearing answerable probes for the M1 guard (`scripts/make_identifier_probes.py`)
+
+- The GL-08 `would_newly_refuse_answerable = 0` was structural, not a result: all 43 answerable
+  questions named no identifier, so the gate reported `no_identifier` and could not have refused
+  anything. This generates the probes that make the guard measurable: one per planted fact code
+  (39 per company), phrased over 7 deterministic templates (code at start / middle / end, quoted,
+  with a company mention), plus edge variants on ~20%, a few two-code questions, and the existing
+  unanswerable rows carried over unchanged as controls.
+- Output goes outside the repo: `/home/maverick/work/synthetic-co-probes/<Company>/manifest.json`
+  (the shape `scripts/score_grounding_run.py` and the Hermes runner consume) plus
+  `edge-variants.json` and `RUN-NOTES.md`. Buckets are the existing `scoped` / `cross_company` /
+  `unanswerable`, because the scorer rejects unknown probe keys.
+- Every row carries `expected_gate` (`fire` / `not_fire` / `no_identifier`), DERIVED by running the
+  gate's own rule (`app.grounding.identifiers` + `verbatim_support`) against the pieces
+  `app.structure_chunker` cuts from the document holding the code - so the expectation is a
+  prediction the run can be scored against, not a hand-written label.
+- Validation stops the run: a code that is not planted, not verbatim in its document, or not a
+  standalone token in a text-route chunk piece; a question containing a planted answer sentence; a
+  duplicate or non-namespaced id; an "unanswerable" control whose code is actually in the corpus;
+  and output the repo's own scorer refuses to load.
+- What the set deliberately surfaces about the gate, all measured rather than asserted: a question
+  whose code has one hyphen opened to a space fires on an answerable probe (3 per company) - that is
+  what a line-wrapped transcript, an ASR transcript or a human typing from memory produces; a
+  two-code question fires if ANY asked code is missing from the returned evidence union, so
+  retrieval coverage becomes a refusal cause; a lowercase code is invisible to the identifier rule,
+  which is unprotected rather than unsafe. Expected-fire ids are listed per company in
+  `edge-variants.json`, and the acceptance rule is stated in `RUN-NOTES.md`: a row that fires
+  outside that list is a genuine false refusal.
+- Nothing in `app/grounding.py`, `app/api.py` or the flag changed. Gate behaviour untouched.
