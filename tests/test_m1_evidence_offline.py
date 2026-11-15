@@ -21,7 +21,12 @@ What is pinned:
   content is counted as non-empty by app/generation.py's reader and as unreadable by the shipped
   gate's reader;
 - membership counts evidence strings and answer strings separately, so "the model repeated the code"
-  is never reported as "the evidence reached us".
+  is never reported as "the evidence reached us";
+- the probe's COMMAND SURFACE, from the two defects the 2026-11-15 stack2 run hit: the gateway
+  question is unscoped unless --company is asked for (a scoped query returned 0 references and the
+  probe measured nothing), the probe id resolves the manifest when no company is given, a duplicate
+  id across company manifests demands --company, and the raw LightRAG auth header is selectable
+  (stock v1.5.7 answers 401 to Bearer) with the default unchanged.
 """
 
 from __future__ import annotations
@@ -32,9 +37,11 @@ import json
 import contextlib
 import sys
 import tempfile
+import os
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
@@ -361,8 +368,8 @@ class ReferenceShapeProbe(unittest.TestCase):
     def test_cli_end_to_end_against_a_fake_stack(self):
         calls = []
 
-        def fake_post(url, payload, api_key, timeout):
-            calls.append((url, payload, api_key))
+        def fake_post(url, payload, api_key, timeout, auth_style="bearer"):
+            calls.append((url, payload, api_key, auth_style))
             if "gateway" in url:
                 return 200, {"ok": True, "data": {"answer": f"Entry {CODE_A} ran four hours.",
                                                   "citations": [{"file_path": "one.txt"}]}}
@@ -380,6 +387,10 @@ class ReferenceShapeProbe(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1][1]["include_chunk_content"], True)
+        # This run asked with --company, so the scoped body is what goes to the gateway, and the
+        # raw leg keeps the bearer default when no --lightrag-auth-header is given.
+        self.assertEqual(calls[0][1].get("company"), COMPANY)
+        self.assertEqual(calls[1][3], "bearer")
         self.assertIn("readable_by_the_shipped_gate", printed)
         self.assertIn("expected_document=transcripts/one.txt", printed)
         self.assertNotIn(SENTENCE_A, printed)
@@ -389,6 +400,172 @@ class ReferenceShapeProbe(unittest.TestCase):
                          (REAL_PROBES / company / "manifest.json").exists()
                          for company in REAL_COMPANIES),
                      "generated GL-07 corpora and probe set are not on disk")
+class ProbeCommandSurface(unittest.TestCase):
+    """The two defects the 2026-11-15 stack2 run of the probe hit.
+
+    1. The gateway body always carried ``company``, which SCOPES the query. The scoped question came
+       back with ``data.citations n=0``, so the probe reported the shape of nothing and the run
+       answered no question at all. Unscoped is now the default, the way the probe runner asks.
+    2. The raw LightRAG leg sent ``Authorization: Bearer`` and stock lightrag v1.5.7 answered 401.
+       ``X-API-Key`` is the header that image accepts, so the auth style is selectable; the default
+       stays ``bearer`` so the first run's command line still works verbatim.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        build_probes(self.root)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _second_company_with_the_same_id(self) -> None:
+        other = self.root / "Beta Widgets"
+        other.mkdir(parents=True, exist_ok=True)
+        (other / "manifest.json").write_text(json.dumps(
+            {"company": "Beta Widgets", "company_code": "BETA-002",
+             "probes": {"scoped": [{"id": "idn-a1", "question": "duplicate id question"}]}},
+            indent=2), encoding="utf-8")
+
+    # ---- manifest lookup: the probe id is what identifies a row -------------------
+
+    def test_a_probe_id_finds_its_manifest_without_a_company(self) -> None:
+        path, row = probe.find_probe(self.root, "idn-u1")
+        self.assertEqual(path.parent.name, COMPANY)
+        self.assertEqual(row["expected_gate"], "fire")
+
+    def test_company_still_selects_that_manifest(self) -> None:
+        path, row = probe.find_probe(self.root, "idn-a2", COMPANY)
+        self.assertEqual(path.parent.name, COMPANY)
+        self.assertEqual(row["expected_gate_asked"], [CODE_B])
+
+    def test_a_company_that_does_not_hold_the_id_is_an_error(self) -> None:
+        with self.assertRaises(probe.ProbeLookupError) as caught:
+            probe.find_probe(self.root, "idn-a1", "Widgets That Do Not Exist")
+        self.assertIn("not found", str(caught.exception))
+
+    def test_an_id_under_two_companies_demands_a_choice(self) -> None:
+        """Silently picking one would change which question the run measures."""
+        self._second_company_with_the_same_id()
+        with self.assertRaises(probe.ProbeLookupError) as caught:
+            probe.find_probe(self.root, "idn-a1")
+        self.assertIn("--company", str(caught.exception))
+        self.assertIn("Beta Widgets", str(caught.exception))
+
+    def test_an_unknown_id_exits_2_and_names_no_probe_text(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = probe.main(["--gateway-url", "http://gateway.invalid",
+                               "--probe-root", str(self.root), "--probe-id", "idn-nope"])
+        self.assertEqual(code, 2)
+        self.assertIn("idn-nope", err.getvalue())
+        # The manifest holds invented questions, but the same discipline applies to a real probe set:
+        # an error line names ids and paths, not question text.
+        self.assertNotIn("What outcome was recorded", err.getvalue() + out.getvalue())
+
+    # ---- auth header style --------------------------------------------------------
+
+    def test_the_default_auth_header_is_bearer_and_no_key_means_no_header(self) -> None:
+        self.assertEqual(probe.auth_headers("secret"), {"Authorization": "Bearer secret"})
+        self.assertEqual(probe.auth_headers("secret", "bearer"), {"Authorization": "Bearer secret"})
+        self.assertEqual(probe.auth_headers("secret", "x-api-key"), {"X-API-Key": "secret"})
+        self.assertEqual(probe.auth_headers(None, "x-api-key"), {})
+
+    def test_post_sends_the_header_the_receiving_service_wants(self) -> None:
+        sent: list[object] = []
+
+        class _Response:
+            status = 200
+
+            def read(self) -> bytes:
+                return b'{"response": "ok"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            sent.append(request)
+            return _Response()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            status, body = probe.post("http://stack.invalid:9621", {"query": "q"}, "secret",
+                                      5, auth_style="x-api-key")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"response": "ok"})
+        headers = {key.lower(): value for key, value in sent[0].headers.items()}
+        self.assertEqual(headers.get("x-api-key"), "secret")
+        self.assertNotIn("authorization", headers)
+        self.assertTrue(sent[0].full_url.endswith("/query"))
+
+    # ---- the gateway body: scoped only on purpose ---------------------------------
+
+    def _run_main(self, argv: list[str]) -> tuple[int, list[tuple[str, dict, str | None, str]], str]:
+        calls: list[tuple[str, dict, str | None, str]] = []
+
+        def fake_post(url, payload, api_key, timeout, auth_style="bearer"):
+            calls.append((url, payload, api_key, auth_style))
+            return 200, {"response": "nothing", "references": []}
+
+        out = io.StringIO()
+        with mock.patch.object(probe, "post", fake_post), contextlib.redirect_stdout(out):
+            code = probe.main(argv)
+        return code, calls, out.getvalue()
+
+    def _base_argv(self) -> list[str]:
+        return ["--gateway-url", "http://gateway.invalid", "--probe-root", str(self.root),
+                "--probe-id", "idn-a1"]
+
+    def test_the_gateway_question_is_unscoped_by_default(self) -> None:
+        """Scoping is what returned n=0 references; the probe must see the same shape the probe
+        runner sees."""
+        code, calls, printed = self._run_main(self._base_argv())
+        self.assertEqual(code, 0)
+        url, payload, _, _ = calls[0]
+        self.assertEqual(payload, {"query": f"What outcome was recorded under {CODE_A}?"})
+        self.assertNotIn("company", payload)
+        self.assertIn("company=UNSCOPED", printed)
+        self.assertIn(str(self.root / COMPANY / "manifest.json"), printed)
+
+    def test_company_scopes_when_it_is_asked_for(self) -> None:
+        code, calls, printed = self._run_main(self._base_argv() + ["--company", COMPANY])
+        self.assertEqual(code, 0)
+        _, payload, _, _ = calls[0]
+        self.assertEqual(payload.get("company"), COMPANY)
+        self.assertIn(f"company={COMPANY}", printed)
+
+    def test_the_raw_lightrag_leg_gets_the_selected_auth_header_and_says_so_on_401(self) -> None:
+        calls: list[tuple[str, dict, str | None, str]] = []
+
+        def fake_post(url, payload, api_key, timeout, auth_style="bearer"):
+            calls.append((url, payload, api_key, auth_style))
+            if "9621" in url:
+                return 401, {"detail": "Unauthorized"}
+            return 200, {"response": "nothing", "references": []}
+
+        out = io.StringIO()
+        argv = (self._base_argv() + ["--raw-lightrag-url", "http://stack.invalid:9621",
+                                     "--lightrag-auth-header", "x-api-key"])
+        with mock.patch.object(probe, "post", fake_post), \
+                mock.patch.dict(os.environ, {"LIGHTRAG_API_KEY": "secret"}), \
+                contextlib.redirect_stdout(out):
+            code = probe.main(argv)
+        self.assertEqual(code, 0)
+        _, _, api_key, auth_style = calls[-1]
+        self.assertEqual(auth_style, "x-api-key")
+        self.assertEqual(api_key, "secret")
+        printed = out.getvalue()
+        self.assertIn("auth header: x-api-key", printed)
+        self.assertIn("--lightrag-auth-header bearer", printed)   # the hint names the other style
+
+    def test_the_auth_style_defaults_to_bearer(self) -> None:
+        code, calls, printed = self._run_main(
+            self._base_argv() + ["--raw-lightrag-url", "http://stack.invalid:9621"])
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[-1][3], "bearer")
+        self.assertIn("auth header: bearer", printed)
+
+
 class RealGl07Measurements(unittest.TestCase):
     """The numbers the report quotes, pinned where they come from."""
 

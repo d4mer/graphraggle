@@ -14,10 +14,13 @@ question (invented corpus).
 Two things it answers in one run:
 
   Q1  Do `references` entries carry a content-bearing field at all, and under what key/shape?
-      The gateway reads `content` as a plain string (app/grounding.py:88-93) while
-      app/generation.py:29 reads `content` as a LIST of strings and app/rerank.py:33-41 accepts
-      content/text/chunk_text/body as string or list. If the upstream shape is the list form, the
-      gate is blind because of our reader, not because LightRAG withheld anything.
+      Three readers disagreed about this until 51e3c39: app/generation.py:29 read `content` as a LIST
+      of strings and app/rerank.py:33-41 accepted content/text/chunk_text/body as string or list,
+      while the M1 gate looked only at a string-valued `content`. If the upstream shape is the list
+      form, the gate was blind because of our reader, not because LightRAG withheld anything.
+      `readable_by_the_shipped_gate` deliberately still measures the OLD string-only reader, so this
+      run is comparable with the 2026-11-15 one that reported n=0; read it next to
+      `content_key_counts` / `content_key_list_valued` to see what the widened reader gains.
 
   Q2  Did the asked identifier reach the gateway in the first place? `asked_code_token_hits` counts
       the strings in the whole response in which the code appears as a standalone token (the same
@@ -27,15 +30,31 @@ Two things it answers in one run:
 
 Examples (stack2):
 
+  # UNSCOPED (the default, and what the probe runner does): the probe id picks the manifest.
   python scripts/m1_reference_shape_probe.py \
     --gateway-url http://localhost:8000 --api-key-env GATEWAY_API_KEY \
-    --company "Northwind Chemicals" --probe-id idn-nc3617-s001
+    --probe-id idn-nc3617-s001
 
-  # also ask LightRAG directly with the gateway's own retrieval flags:
+  # also ask LightRAG directly with the gateway's own retrieval flags. Stock lightrag v1.5.7 wants
+  # `X-API-Key`, not `Authorization: Bearer`; --company stays available for a deliberate scoped run:
   python scripts/m1_reference_shape_probe.py \
     --gateway-url http://localhost:8000 --api-key-env GATEWAY_API_KEY \
     --raw-lightrag-url http://localhost:9621 --api-key-env LIGHTRAG_API_KEY \
+    --lightrag-auth-header x-api-key \
     --company "Northwind Chemicals" --probe-id idn-nc3617-s001 --mode mix
+
+Why --company is optional
+-------------------------
+The first stack run sent ``{"query": ..., "company": ...}`` to the gateway, and company scoping
+returned ``data.citations n=0``: the probe asked a scoped question, got no references back, and so
+learned nothing about the reference shape. The probe runner asks unscoped, so the default is now
+unscoped too, and a scoped run is an explicit choice rather than an accident.
+
+Why the auth header is selectable
+---------------------------------
+The raw LightRAG leg authenticates with ``Authorization: Bearer`` and stock lightrag v1.5.7 answered
+HTTP 401; ``X-API-Key`` is the header that image accepts. The default stays ``bearer`` so the first
+run's command keeps working verbatim; ``--lightrag-auth-header x-api-key`` is the one-flag fix.
 """
 
 from __future__ import annotations
@@ -116,12 +135,25 @@ def describe(payload: Any) -> str:
                      for path, shapes in sorted(cells.items()))
 
 
-def post(url: str, payload: dict[str, Any], api_key: str | None, timeout: int) -> tuple[int, Any]:
+def auth_headers(api_key: str | None, style: str = "bearer") -> dict[str, str]:
+    """The credential header, in the style the receiving service expects.
+
+    The gateway takes ``Authorization: Bearer``. Stock lightrag v1.5.7 answered 401 to that and
+    accepts ``X-API-Key``. No default changes: ``bearer`` stays the default everywhere.
+    """
+    if not api_key:
+        return {}
+    if style == "x-api-key":
+        return {"X-API-Key": api_key}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def post(url: str, payload: dict[str, Any], api_key: str | None, timeout: int,
+         auth_style: str = "bearer") -> tuple[int, Any]:
     request = urllib.request.Request(
         url.rstrip("/") + "/query",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 **({"Authorization": f"Bearer {api_key}"} if api_key else {})},
+        headers={"Content-Type": "application/json", **auth_headers(api_key, auth_style)},
         method="POST",
     )
     try:
@@ -170,7 +202,9 @@ def reference_report(response: Any) -> dict[str, Any]:
         "content_key_counts": counts,
         "content_key_list_valued": list_valued,
         "references_with_nonempty_content": non_empty,
-        # The reader app/grounding.py actually uses.
+        # The reader the gate used before 51e3c39, kept as-is so the second stack run is comparable
+        # with the first. The widened reader is app/citation_text.citation_content; its gain on this
+        # response is visible as (content_key_counts - readable_by_the_shipped_gate).
         "readable_by_the_shipped_gate": sum(
             1 for reference in references if isinstance(reference, dict)
             and isinstance(reference.get("content"), str) and reference["content"].strip()),
@@ -212,6 +246,47 @@ def membership_report(response: Any, asked_codes: list[str]) -> dict[str, Any]:
             "evidence_reached_the_gateway": any(facts.get("evidence", 0) > 0 for facts in hits.values())}
 
 
+class ProbeLookupError(Exception):
+    """Manifest lookup failure. Messages carry paths and ids only, never probe text."""
+
+
+def find_probe(probe_root: Path, probe_id: str,
+               company: str | None = None) -> tuple[Path, dict[str, Any]]:
+    """The probe row and the manifest it came from.
+
+    With ``company`` this is the single company manifest, as before. Without it - the default now -
+    every ``<probe-root>/*/manifest.json`` is searched, because the probe id is what identifies the
+    row and the query itself stays unscoped. An id present under two companies is an error rather
+    than a coin flip: which question gets asked changes what the run measures.
+    """
+    candidates = ([probe_root / company / "manifest.json"] if company
+                  else sorted(probe_root.glob("*/manifest.json")))
+    if not candidates:
+        raise ProbeLookupError(f"no manifests under {probe_root} (check --probe-root / --company)")
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ProbeLookupError(f"{path}: unreadable manifest ({type(exc).__name__})")
+        for bucket in (document.get("probes") or {}).values():
+            for probe in bucket:
+                if isinstance(probe, dict) and probe.get("id") == probe_id:
+                    matches.append((path, probe))
+    if not matches:
+        raise ProbeLookupError(
+            f"probe id {probe_id!r} not found in {len(candidates)} manifest(s) under {probe_root}")
+    if len(matches) > 1:
+        owners = sorted({path.parent.name for path, _ in matches})
+        if len(owners) > 1:
+            raise ProbeLookupError(
+                f"probe id {probe_id!r} appears in {len(matches)} company manifests "
+                f"({', '.join(owners)}); pass --company to pick one")
+    return matches[0]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="M1 reference-shape probe (run on the stack)")
     parser.add_argument("--gateway-url", required=True, help="e.g. http://localhost:8000")
@@ -220,33 +295,38 @@ def main(argv: list[str] | None = None) -> int:
                         help="also POST /query straight to LightRAG with the gateway's flags")
     parser.add_argument("--lightrag-api-key-env", default="LIGHTRAG_API_KEY")
     parser.add_argument("--probe-root", type=Path, default=DEFAULT_PROBE_ROOT)
-    parser.add_argument("--company", required=True)
+    parser.add_argument("--company", default=None,
+                        help="scope the gateway query to one company and read that company's "
+                             "manifest. Omit it to ask unscoped, the way the probe runner does - "
+                             "scoping is what returned data.citations n=0 on the first stack run")
     parser.add_argument("--probe-id", required=True, help="row id from the generated probe manifest")
+    parser.add_argument("--lightrag-auth-header", choices=("bearer", "x-api-key"), default="bearer",
+                        help="credential header for the raw LightRAG leg. Stock lightrag v1.5.7 "
+                             "answers 401 to 'Authorization: Bearer' and accepts X-API-Key; the "
+                             "default stays bearer so earlier commands still run")
     parser.add_argument("--mode", default=None, help="retrieval mode for the raw LightRAG call")
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--chunk-top-k", type=int, default=16)
     parser.add_argument("--timeout", type=int, default=180)
     args = parser.parse_args(argv)
 
-    manifest_path = args.probe_root / args.company / "manifest.json"
-    if not manifest_path.exists():
-        print(f"ERROR: {manifest_path} not found", file=sys.stderr)
-        return 2
-    document = json.loads(manifest_path.read_text(encoding="utf-8"))
-    row = next((probe for bucket in document["probes"].values()
-                for probe in bucket if probe["id"] == args.probe_id), None)
-    if row is None:
-        print(f"ERROR: probe id {args.probe_id!r} not in {manifest_path}", file=sys.stderr)
+    try:
+        manifest_path, row = find_probe(args.probe_root, args.probe_id, args.company)
+    except ProbeLookupError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     question = row["question"]
     asked = row.get("expected_gate_asked") or grounding.identifiers(question)
 
-    print(f"probe {args.probe_id}  company={args.company}  asked={asked}  "
+    print(f"probe {args.probe_id}  company={args.company or 'UNSCOPED'}  asked={asked}  "
           f"expected_gate={row.get('expected_gate')}  expected_document={row.get('expected_document')}")
+    print(f"manifest: {manifest_path}")
 
     gateway_key = os.environ.get(args.api_key_env)
-    status, response = post(args.gateway_url,
-                            {"query": question, "company": args.company},
+    gateway_body: dict[str, Any] = {"query": question}
+    if args.company:
+        gateway_body["company"] = args.company
+    status, response = post(args.gateway_url, gateway_body,
                             gateway_key, args.timeout)
     print(f"\n== gateway POST {args.gateway_url}/query == HTTP {status}")
     print("  response shape:")
@@ -262,8 +342,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode:
             payload["mode"] = args.mode
         status, raw = post(args.raw_lightrag_url, payload,
-                           os.environ.get(args.lightrag_api_key_env), args.timeout)
-        print(f"\n== LightRAG POST {args.raw_lightrag_url}/query == HTTP {status}")
+                           os.environ.get(args.lightrag_api_key_env), args.timeout,
+                           auth_style=args.lightrag_auth_header)
+        print(f"\n== LightRAG POST {args.raw_lightrag_url}/query == HTTP {status} "
+              f"(auth header: {args.lightrag_auth_header})")
+        if status == 401:
+            other = "x-api-key" if args.lightrag_auth_header == "bearer" else "bearer"
+            print(f"  HTTP 401: stock lightrag v1.5.7 takes X-API-Key, not Bearer. "
+                  f"Re-run with --lightrag-auth-header {other}.")
         print("  payload sent (keys only): " + ", ".join(sorted(payload)))
         print("  response shape:")
         print(describe(raw))

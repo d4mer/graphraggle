@@ -808,3 +808,30 @@ reader in the repo was deciding whether the store supports an answer.
   test tying the gate's key list to the reranker's and the graph scanner's by function identity so
   the readers cannot re-fork. The query-log tests carry the shape census. Suite:
   `1470 passed, 2 skipped, 290 subtests passed`.
+
+## 2026-11-15 - the M1 reference-shape probe could not see what it was sent (two command fixes)
+
+Hermes ran `scripts/m1_reference_shape_probe.py` on stack2 on 2026-11-15 and both legs failed for
+command-surface reasons, not measurement reasons:
+
+1. The gateway request body always carried `{"company": ...}`, which **scopes** the query. The scoped
+   question came back with `data.citations n=0`, so the probe printed the shape of nothing and the
+   reference-shape question stayed open. `--company` is now optional and the default asks **unscoped**,
+   the way the probe runner asks; the probe row is located by `--probe-id` across
+   `--probe-root/*/manifest.json`, and an id that appears under two companies is an error asking for
+   `--company` rather than a silent pick. Passing `--company` still scopes, for a deliberate run.
+2. The raw LightRAG leg authenticated with `Authorization: Bearer` and stock `lightrag:v1.5.7`
+   answered **HTTP 401**; `X-API-Key` is the header that image accepts. New
+   `--lightrag-auth-header bearer|x-api-key`, **default unchanged** (`bearer`, so the first run's
+   command line still runs verbatim), and a 401 now prints the flag to retry with.
+
+**Read the 2026-11-15 second probe output with this in mind:** that run used a local copy of the
+script carrying these two changes, so its output is not reproducible from `51e3c39` alone - it needs
+this commit. Any earlier "n=0 references" reading is the scoping defect, not a fact about LightRAG.
+
+Tests: +11 in `tests/test_m1_evidence_offline.py` (`ProbeCommandSurface`: unscoped by default, scoped
+on request, id-resolves-manifest without a company, duplicate id across company manifests demands
+`--company`, unknown id exits 2 without naming question text, `auth_headers` styles, `post()` sends the
+selected header, raw-leg auth style is passed and hinted on 401, default stays `bearer`), and the
+existing end-to-end CLI test now pins the scoped body plus the bearer default. Suite:
+`1481 passed, 2 skipped, 290 subtests passed` (base `0d83376`: 1470).
