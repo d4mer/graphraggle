@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .citation_text import citation_content
+
 try:
     import httpx
 except ImportError:  # pragma: no cover - test environments may patch this module directly
@@ -31,15 +33,15 @@ def build_rerank_url(rerank_host: str) -> str:
 
 
 def citation_to_text(citation: dict[str, Any]) -> str:
-    """Extract a human-readable text snippet from a citation dict for reranking."""
-    for key in ("content", "text", "chunk_text", "body"):
-        value = citation.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:4000]
-        if isinstance(value, list):
-            parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
-            if parts:
-                return "\n\n".join(parts)[:4000]
+    """Extract a human-readable text snippet from a citation dict for reranking.
+
+    The key set and the list-valued shape live in ``app/citation_text.py`` so this reader and the
+    grounding gate cannot drift apart; the length cap and the JSON fallback stay here, because they
+    belong to what a rerank document is.
+    """
+    text = citation_content(citation)
+    if text is not None:
+        return text[:4000]
     return json.dumps(citation, sort_keys=True, default=str)
 
 

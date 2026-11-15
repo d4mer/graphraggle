@@ -29,6 +29,12 @@ The three traps this module encodes
    ``CITATION_TOP_K`` truncation.** The caller's citation list is a view; the model saw
    everything the retrieval pass returned.
 
+4. **Evidence means the fields the rest of the gateway reads.** This module once looked only at a
+   string-valued ``content``, while ``app/rerank.py``, ``app/graphrag.py`` and
+   ``app/generation.py`` all accept ``content``/``text``/``chunk_text``/``body`` and accept a list of
+   chunk strings. A guard narrower than the readers around it refuses questions the system
+   demonstrably had the text to answer.
+
 Scope, stated honestly: a question that names no identifier produces ``asked == []`` and
 carries no information either way. Scoped and cross-company probes are shaped like that,
 which is why this rule cannot cost them recall - but it also means it says nothing about
@@ -40,6 +46,8 @@ from __future__ import annotations
 
 import re
 from typing import Any, Iterable, Sequence
+
+from .citation_text import CITATION_TEXT_KEYS, citation_content, content_shape_counts
 
 # An identifier is an uppercase, hyphen-segmented token that contains a digit:
 # NC-3617-014 (planted fact), NC-3617-NA-01 (the unanswerable shape), CP-2507-OB-001.
@@ -70,9 +78,16 @@ def verbatim_support(code: str, evidence: str, *, match: str = "token") -> bool:
 
 
 def evidence_texts(citations: Iterable[dict[str, Any]] | None,
-                   keys: Sequence[str] = ("content",)) -> tuple[str, int]:
+                   keys: Sequence[str] = CITATION_TEXT_KEYS) -> tuple[str, int]:
     """Join the evidence text the answer was written from, and count references that
     carried none.
+
+    The key set and the list-valued shape are the ones ``app/rerank.py`` and
+    ``app/graphrag.py`` have always accepted, shared through ``app/citation_text.py``. Before
+    that, this reader looked only at a string-valued ``content``: the same response that let the
+    reranker score a chunk and the prompt cite it could leave the gate with an empty evidence
+    string and a ``no_evidence`` verdict. Reading fewer fields than the callers is how a guard
+    becomes a coin flip.
 
     The second number matters: the gateway asks LightRAG for chunk content
     (``include_chunk_content: True``), and if a real response ever omits it, a support
@@ -82,15 +97,7 @@ def evidence_texts(citations: Iterable[dict[str, Any]] | None,
     parts: list[str] = []
     missing = 0
     for citation in citations or []:
-        if not isinstance(citation, dict):
-            missing += 1
-            continue
-        text = ""
-        for key in keys:
-            value = citation.get(key)
-            if isinstance(value, str) and value.strip():
-                text = value
-                break
+        text = citation_content(citation, keys)
         if text:
             parts.append(text)
         else:
@@ -150,8 +157,16 @@ def asked_identifier_grounding(question: str, answer: str,
     Carries identifiers (which came from the caller's own question) and counts, never
     reference text, so the query log stays publishable and small.
     """
-    evidence, missing_content = evidence_texts(citations)
+    reference_list = list(citations or [])
+    evidence, missing_content = evidence_texts(reference_list)
     gate = support_gate(question, answer, evidence)
-    gate["evidence_reference_count"] = len(list(citations or []))
+    gate["evidence_reference_count"] = len(reference_list)
     gate["evidence_references_without_content"] = missing_content
+    # Shape census, counts only. A run can be read without a second probe run: if every row
+    # says `absent`, the evidence was never in the response and no rule change can help; if it
+    # says `list`, the old string-only reader was the whole story. Shapes are "string", "list",
+    # "empty" and "absent" (see app/citation_text.py).
+    gate["references_with_content"] = sum(
+        1 for citation in reference_list if citation_content(citation))
+    gate["references_content_shapes"] = content_shape_counts(reference_list)
     return gate

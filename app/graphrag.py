@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any
 
+from .citation_text import citation_content
+
 # Default number of top citations to use for entity extraction seeds
 DEFAULT_SEED_CITATION_COUNT = 3
 # Maximum total neighbors across all hops
@@ -45,21 +47,14 @@ def citation_to_text_for_entity_extraction(citation: dict[str, Any]) -> str:
     Returns a short fallback JSON repr if no text fields are present.
     """
     parts: list[str] = []
-    content_found = False
-    for key in ("content", "text", "chunk_text", "body"):
-        value = citation.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value.strip()[:2000])
-            content_found = True
-            break
-        if isinstance(value, list):
-            joined = "\n\n".join(
-                item.strip() for item in value if isinstance(item, str) and item.strip()
-            )
-            if joined:
-                parts.append(joined[:2000])
-                content_found = True
-                break
+    # Same key set and list handling as the reranker and the grounding gate, from
+    # app/citation_text.py; the 2000-char cap and the path hint stay here.
+    text = citation_content(citation)
+    if text is not None:
+        parts.append(text[:2000])
+        content_found = True
+    else:
+        content_found = False
     # Append path as context hint only when content was found
     if content_found:
         for path_key in ("file_source", "path", "source", "file_path"):

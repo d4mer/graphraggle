@@ -276,7 +276,11 @@ Gateway defaults that are **in force without being written in `.env`**:
    (token match) in the references of the pass that produced the answer, and mirrors the
    counts into the query log (`grounding_verdict`, `grounding_asked`,
    `grounding_unsupported`, `grounding_evidence_pass`,
-   `grounding_references_without_content`). **Flag only**: it never changes the answer, the
+   `grounding_references_without_content`, `grounding_references_with_content`,
+   `grounding_references_content_shapes` - the last two count references by the shape their content
+   arrived in: `string`, `list`, `empty`, `absent`). Evidence is read the way the reranker and the
+   graph scanner read it (`app/citation_text.py`: `content`/`text`/`chunk_text`/`body`, string or
+   list), so the guard cannot be narrower than the readers around it. **Flag only**: it never changes the answer, the
    citation list or the status code, and with the flag off the response and the upstream
    payload are byte-identical to before it existed. It exists because the GL-08 synthetic
    baseline answered 8 of 12 unanswerable probes with an outcome for a code that is in no

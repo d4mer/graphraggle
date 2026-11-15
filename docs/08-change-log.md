@@ -776,3 +776,35 @@ gate-rule simulation under three evidence models; counts only), `scripts/m1_refe
 (run on the stack; key paths/types/lengths/hashes and membership booleans, never chunk text),
 `tests/test_m1_evidence_offline.py` (35 tests; the real-corpus class skips when the generated GL-07
 corpora are absent). Suite: `1452 passed, 2 skipped, 279 subtests passed`.
+
+## 2026-11-15 - M1 evidence reader: shape-tolerant and self-reporting (flag still OFF)
+
+The M1 evidence investigation found four readers of the same LightRAG reference dicts, and the
+grounding gate was the narrowest: `app/grounding.py` read only a **string-valued `content`**, while
+`app/rerank.py:33-41`, `app/graphrag.py:46-63` and `app/generation.py:29-32` all accept
+`content`/`text`/`chunk_text`/`body` and accept a **list** of chunk strings. A response that let the
+reranker score a chunk and the prompt cite it could leave the gate with an empty evidence string and
+a `no_evidence` verdict for a question the system demonstrably had the text to answer. The narrowest
+reader in the repo was deciding whether the store supports an answer.
+
+- New `app/citation_text.py`: `CITATION_TEXT_KEYS` plus `citation_content()` (string or list, joined
+  the way the generation prompt joins it), `citation_content_shape()` and `content_shape_counts()`.
+  `grounding.evidence_texts`, `rerank.citation_to_text` and
+  `graphrag.citation_to_text_for_entity_extraction` now share it; each caller keeps its own length
+  cap and JSON fallback. `app/generation.py` is deliberately untouched - widening the prompt is an
+  answer-path change and is not in this brief.
+- `query_scope["grounding"]` gains `references_with_content` and `references_content_shapes`
+  (`string` / `list` / `empty` / `absent` reference counts), mirrored into the query log as
+  `grounding_references_with_content` and `grounding_references_content_shapes`. Counts only: a run
+  can now tell "the store held the text and the answer invented the code" apart from "the response
+  carried no chunk text at all", without storing a single reference.
+- Not changed: no flag default, no answer/citation/status behaviour, no upstream payload. With
+  `GROUNDING_CHECK_ASKED_IDENTIFIER=false` (the shipped state) the envelope stays byte-identical and
+  the existing byte-identity test still pins that. `reconstruct_if_known`, case-folding and
+  company-code handling are **not** implemented here; they wait for the reference-shape facts from
+  the stack and the lead's go.
+- Tests: 6 new in `tests/test_grounding_gate.py` - list-valued `content`, text under each alternative
+  key, `empty` and `absent` counted apart, a whitespace-only chunk is not evidence, and a contract
+  test tying the gate's key list to the reranker's and the graph scanner's by function identity so
+  the readers cannot re-fork. The query-log tests carry the shape census. Suite:
+  `1470 passed, 2 skipped, 290 subtests passed`.

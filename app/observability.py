@@ -306,6 +306,13 @@ def emit_query_log(
             "grounding_unsupported": grounding.get("unsupported"),
             "grounding_evidence_pass": grounding.get("evidence_pass"),
             "grounding_references_without_content": grounding.get("evidence_references_without_content"),
+            # What the evidence LOOKED like, counts only. Without these two a run cannot say which
+            # of the two failure stories it is: the store held the text and the answer invented an
+            # identifier, or the response carried no chunk text at all and the verdict was decided
+            # by an empty string. `..._content_shapes` counts string / list / empty / absent
+            # references, so a shape change upstream shows up here before anyone scores a run.
+            "grounding_references_with_content": grounding.get("references_with_content"),
+            "grounding_references_content_shapes": grounding.get("references_content_shapes"),
             # The exact guard metric for enforcement. `grounding_unsupported` above is
             # asked-OR-asserted, so on its own it cannot answer "would enforcement have refused
             # this row?" without counting rows where only the answer added an extra code.

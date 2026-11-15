@@ -15,6 +15,13 @@ What this file holds to account
    references that carry no content counted rather than silently treated as unsupported.
 4. **One implementation.** The investigation harness and the gateway call the same
    functions, so the harness cannot certify a rule the gateway no longer runs.
+5. **One evidence reader.** The gate accepts the fields the reranker, the graph scanner and the
+   generation prompt already accept (string or list), and a contract test keeps them from
+   re-forking. A gate narrower than the readers around it reports "no evidence" for text the
+   system plainly had.
+6. **The evidence shape is reported.** Counts of string / list / empty / absent references ride in
+   the log line, so a run can tell "the store had the text and the answer invented the code"
+   apart from "the response carried no chunk text at all".
 5. **The log line carries the discrimination counts** (asked / unsupported / which pass the
    evidence came from) without any reference text.
 
@@ -36,7 +43,8 @@ from unittest.mock import AsyncMock, Mock, patch
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
-from app import api, grounding, observability, state_store          # noqa: E402
+from app import (api, citation_text, graphrag, grounding, observability,  # noqa: E402
+                 rerank, state_store)
 from app.config import Settings                                     # noqa: E402
 from app.models import QueryRequest                                 # noqa: E402
 
@@ -240,6 +248,78 @@ class TestTheRuleAndItsTraps(unittest.TestCase):
             self.assertEqual(harness_report[key], app_report[key])
 
 
+class TestEvidenceReadingIsShapeTolerant(unittest.TestCase):
+    """The gate reads what the other readers read.
+
+    Every case below is a response shape LightRAG or a caller has been seen to produce, taken from
+    what `app/rerank.py` and `app/graphrag.py` already accepted. Under the old string-only reader
+    each of the first three produced an empty evidence string and a `no_evidence` verdict for a
+    question the model had the text to answer.
+    """
+
+    def test_a_list_valued_content_is_evidence(self) -> None:
+        """`app/generation.py:29` has always treated `content` as a list of chunk strings."""
+        citations = [{"reference_id": "1", "file_path": "a.txt",
+                      "content": [f"entry {REAL_CODE} closed with 3 blockers", "second chunk"]}]
+        report = grounding.asked_identifier_grounding(
+            f"What happened under {REAL_CODE}?", f"{REAL_CODE} closed.", citations)
+        self.assertEqual(report["verdict"], "supported")
+        self.assertEqual(report["evidence_references_without_content"], 0)
+        self.assertEqual(report["references_with_content"], 1)
+        self.assertEqual(report["references_content_shapes"],
+                         {"string": 0, "list": 1, "empty": 0, "absent": 0})
+
+    def test_text_under_an_alternative_key_is_evidence(self) -> None:
+        for key in ("text", "chunk_text", "body"):
+            with self.subTest(key=key):
+                citations = [{"reference_id": "1", key: f"entry {REAL_CODE} closed"}]
+                report = grounding.asked_identifier_grounding(
+                    f"What happened under {REAL_CODE}?", f"{REAL_CODE} closed.", citations)
+                self.assertEqual(report["verdict"], "supported")
+                self.assertEqual(report["references_with_content"], 1)
+
+    def test_empty_and_absent_references_are_counted_apart(self) -> None:
+        """Both end the run with no evidence, and they need different fixes."""
+        citations = [{"reference_id": "1", "content": f"entry {REAL_CODE} closed"},
+                     {"reference_id": "2", "content": []},
+                     {"reference_id": "3", "content": "   "},
+                     {"reference_id": "4", "file_path": "a.txt"}]
+        report = grounding.asked_identifier_grounding(
+            f"What happened under {REAL_CODE}?", f"{REAL_CODE} closed.", citations)
+        self.assertEqual(report["evidence_reference_count"], 4)
+        self.assertEqual(report["references_with_content"], 1)
+        self.assertEqual(report["evidence_references_without_content"], 3)
+        self.assertEqual(report["references_content_shapes"],
+                         {"string": 1, "list": 0, "empty": 2, "absent": 1})
+
+    def test_a_whitespace_only_chunk_is_not_evidence(self) -> None:
+        self.assertIsNone(citation_text.citation_content({"content": " \n "}))
+        self.assertIsNone(citation_text.citation_content({"content": ["", "  "]}))
+        self.assertEqual(citation_text.citation_content_shape({"content": [""]}), "empty")
+
+    def test_the_gate_and_the_other_readers_agree_on_the_keys(self) -> None:
+        """Contract test: one key list, three readers, no private copies.
+
+        Drift here is silent: a reader that gains a key scores or prompts on a chunk the gate calls
+        unevidenced, and the disagreement only shows up as a refusal nobody can explain."""
+        self.assertEqual(citation_text.CITATION_TEXT_KEYS,
+                         ("content", "text", "chunk_text", "body"))
+        self.assertEqual(grounding.evidence_texts.__defaults__[0],
+                         citation_text.CITATION_TEXT_KEYS)
+        # Identity of the function, not a copy of the tuple: the readers call the same accessor.
+        self.assertIs(rerank.citation_content, citation_text.citation_content)
+        self.assertIs(graphrag.citation_content, citation_text.citation_content)
+        for key in citation_text.CITATION_TEXT_KEYS:
+            for value in (f"entry {REAL_CODE} closed", [f"entry {REAL_CODE} closed", "more"]):
+                with self.subTest(key=key, value_type=type(value).__name__):
+                    citation = {"reference_id": "1", "file_path": "a.txt", key: value}
+                    text = citation_text.citation_content(citation)
+                    self.assertIn(REAL_CODE, grounding.evidence_texts([citation])[0])
+                    self.assertIn(text, rerank.citation_to_text(citation))
+                    self.assertIn(text, graphrag.citation_to_text_for_entity_extraction(citation))
+                    self.assertEqual(grounding.evidence_texts([citation])[1], 0)
+
+
 class TestQueryLogCarriesTheCounts(unittest.TestCase):
     def _emit(self, query_scope: dict) -> dict:
         timer = observability.StageTimer()
@@ -269,6 +349,18 @@ class TestQueryLogCarriesTheCounts(unittest.TestCase):
         self.assertIs(line["grounding_supported"], False)
         self.assertEqual(line["grounding_asked_unsupported"], [ABSENT_CODE])
 
+    def test_the_evidence_shape_census_is_reported(self) -> None:
+        """A run must be readable without another probe run: was the text there at all?"""
+        line = self._emit({"grounding": {
+            "verdict": "no_evidence", "asked": [ABSENT_CODE], "unsupported": [ABSENT_CODE],
+            "supported": False, "evidence_pass": "primary",
+            "evidence_references_without_content": 2,
+            "references_with_content": 0,
+            "references_content_shapes": {"string": 0, "list": 0, "empty": 2, "absent": 0}}})
+        self.assertEqual(line["grounding_references_with_content"], 0)
+        self.assertEqual(line["grounding_references_content_shapes"],
+                         {"string": 0, "list": 0, "empty": 2, "absent": 0})
+
     def test_the_fields_are_quiet_when_it_did_not(self) -> None:
         line = self._emit({})
         self.assertFalse(line["grounding_checked"])
@@ -276,6 +368,8 @@ class TestQueryLogCarriesTheCounts(unittest.TestCase):
         # None here means "not checked", and it is distinguishable from supported=False.
         self.assertIsNone(line["grounding_supported"])
         self.assertIsNone(line["grounding_asked_unsupported"])
+        self.assertIsNone(line["grounding_references_with_content"])
+        self.assertIsNone(line["grounding_references_content_shapes"])
 
     def test_no_reference_text_ever_reaches_the_line(self) -> None:
         """The log projects named fields, so evidence text cannot leak by accident."""
@@ -284,10 +378,14 @@ class TestQueryLogCarriesTheCounts(unittest.TestCase):
             "evidence_pass": "primary", "evidence_references_without_content": 0,
             # A hypothetical future field. If emit_query_log ever dumps the whole dict,
             # this line starts carrying corpus text and the test fails.
-            "evidence": "Reviewer: entry NC-3617-014 closed with 3 blockers outstanding."}})
+            "evidence": "Reviewer: entry NC-3617-014 closed with 3 blockers outstanding.",
+            "references_content_shapes": {"string": 1, "list": 0, "empty": 0, "absent": 0}}})
         blob = json.dumps(line)
         self.assertNotIn("Reviewer", blob)
         self.assertNotIn("blockers", blob)
+        # The shape census is allowed; it is counts of reference fields, never their text.
+        self.assertEqual(line["grounding_references_content_shapes"],
+                         {"string": 1, "list": 0, "empty": 0, "absent": 0})
 
 
 if __name__ == "__main__":
