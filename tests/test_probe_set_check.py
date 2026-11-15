@@ -262,3 +262,141 @@ def test_evidence_is_verbatim_after_whitespace(tmp_path, capsys):
         [_key(evidence="The plant went live in March after\n     three months of hypercare.")])
     code, report = _run(qpath, kpath, source_dir, capsys)
     assert code == 0, report
+
+
+# ── GL-13b: office sources arrive as pre-extracted text, never as bytes ──────
+
+OFFICE_NAME = "Beta deck.pptx"
+OFFICE_TEXT = ("Slide 1\n\nTitle: Cutover readiness\n\n"
+               "Q3 interface backlog reached 1,240 items before the cutover.\n\n"
+               "[Table]\n| Region | Volume |\n| APAC | 310 |\n")
+
+
+def _office_question(ident="pp01", source=OFFICE_NAME,
+                     question="How many interface backlog items were recorded before the cutover?",
+                     *, shape="pptx", q_type="single-fact", absent_terms=None):
+    return {"id": ident, "question": question, "source_doc": source, "type": q_type,
+            "shape": shape, "history": [], "evidence": "", "expected_answer": "",
+            "absent_terms": absent_terms or []}
+
+
+def _office_key(ident="pp01", source=OFFICE_NAME,
+                evidence="Q3 interface backlog reached 1,240 items before the cutover.",
+                phrases=("1,240 items",), shape="pptx", location=None):
+    start = OFFICE_TEXT.index("Q3 interface backlog")
+    return {"id": ident, "source_doc": source, "type": "single-fact", "shape": shape,
+            "evidence": evidence, "expected_answer": "1,240 items.",
+            "key_phrases": list(phrases),
+            "location": location or {"char_start": start, "char_end": start + len(evidence),
+                                     "slide": 1},
+            "difficulty": "medium", "history": [], "absent_terms": []}
+
+
+def _office_args(extracted_dir: Path) -> list[str]:
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    text_path = extracted_dir / "Beta-deck.txt"
+    text_path.write_text(OFFICE_TEXT, encoding="utf-8")
+    return ["--extracted-text", f"{OFFICE_NAME}={text_path}"]
+
+
+def _office_fixtures(tmp_path: Path, questions=None, key=None):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / SOURCE_NAME).write_text(SOURCE_TEXT, encoding="utf-8")
+    (source_dir / OFFICE_NAME).write_bytes(b"PK\x03\x04 not really a deck, and never read as text")
+    qpath = _write(tmp_path / "questions.jsonl", questions or [_office_question()])
+    kpath = _write(tmp_path / "answer-key.jsonl", key or [_office_key()])
+    return qpath, kpath, source_dir
+
+
+def test_office_source_without_extracted_text_fails_with_the_hint(tmp_path, capsys):
+    qpath, kpath, source_dir = _office_fixtures(tmp_path)
+    code, report = _run(qpath, kpath, source_dir, capsys)
+    assert code == 1
+    assert any(f"--extracted-text {OFFICE_NAME}=" in p for p in report["problems"]), report
+
+
+def test_extracted_text_makes_an_office_source_checkable(tmp_path, capsys):
+    qpath, kpath, source_dir = _office_fixtures(tmp_path)
+    code, report = _run(qpath, kpath, source_dir, capsys, *_office_args(tmp_path / "extracted"))
+    assert code == 0, report
+    assert report["extracted_text_sources"] == [OFFICE_NAME]
+    assert report["by_shape"] == {"pptx": 1}
+
+
+def test_binary_sources_are_skipped_not_read_as_text(tmp_path, capsys):
+    """Reading a .pptx as text gives junk in which every quote fails and every absent term
+    passes by accident. It must be reported as skipped, and the extracted text used instead."""
+    qpath, kpath, source_dir = _office_fixtures(tmp_path)
+    code, report = _run(qpath, kpath, source_dir, capsys, *_office_args(tmp_path / "extracted"))
+    assert code == 0, report
+    assert report["binary_sources_skipped"] == [OFFICE_NAME]
+    assert report["source_files_on_disk"] == 2
+
+
+def test_evidence_only_in_the_binary_is_not_verbatim(tmp_path, capsys):
+    """The junk inside the bytes must not rescue a quote that the extractor never produced."""
+    qpath, kpath, source_dir = _office_fixtures(
+        tmp_path, key=[_office_key(evidence="interface backlog reached 9,999 items")])
+    code, report = _run(qpath, kpath, source_dir, capsys, *_office_args(tmp_path / "extracted"))
+    assert code == 1
+    assert any("not a verbatim substring" in p for p in report["problems"])
+
+
+def test_unanswerable_phrase_present_in_office_text_fails(tmp_path, capsys):
+    row = _office_question(ident="un01", question="What did the interface backlog cost per item?",
+                           shape="unanswerable", q_type="unanswerable", absent_terms=["cost per item", "unit price", "licence fee"])
+    key_row = {"id": "un01", "source_doc": OFFICE_NAME, "type": "unanswerable",
+               "shape": "unanswerable", "evidence": "", "key_phrases": [],
+               "distinctive_phrase": "interface backlog reached",
+               "expected_answer": "not in the documents", "location": {"char_start": 0,
+                                                                       "char_end": 0},
+               "difficulty": "medium", "history": [], "absent_terms": ["cost per item",
+                                                                       "unit price", "licence fee"]}
+    qpath, kpath, source_dir = _office_fixtures(tmp_path, [row], [key_row])
+    code, report = _run(qpath, kpath, source_dir, capsys, *_office_args(tmp_path / "extracted"))
+    assert code == 1
+    assert any("distinctive_phrase occurs in a source document" in p for p in report["problems"])
+
+
+def test_absent_terms_are_checked_against_office_text_too(tmp_path, capsys):
+    row = _office_question(ident="un02", question="Which vendor quoted the licence fee?",
+                           shape="unanswerable", q_type="unanswerable", absent_terms=["cutover", "licence fee", "vendor quote"])
+    key_row = {"id": "un02", "source_doc": OFFICE_NAME, "type": "unanswerable",
+               "shape": "unanswerable", "evidence": "", "key_phrases": [],
+               "distinctive_phrase": "licence fee per seat",
+               "expected_answer": "not in the documents", "location": {"char_start": 0,
+                                                                       "char_end": 0},
+               "difficulty": "medium", "history": [], "absent_terms": ["cutover", "licence fee",
+                                                                       "vendor quote"]}
+    qpath, kpath, source_dir = _office_fixtures(tmp_path, [row], [key_row])
+    code, report = _run(qpath, kpath, source_dir, capsys, *_office_args(tmp_path / "extracted"))
+    assert code == 1
+    assert any("absent_term #1 (sha256" in p for p in report["problems"]), report
+    # the report is the one artefact allowed into a ticket: it names the slot, never the wording
+    assert not any("cutover" in p for p in report["problems"]), report
+
+
+def test_location_offsets_are_against_the_extracted_text(tmp_path, capsys):
+    qpath, kpath, source_dir = _office_fixtures(
+        tmp_path, key=[_office_key(location={"char_start": 5, "char_end": 40, "slide": 1})])
+    code, report = _run(qpath, kpath, source_dir, capsys, *_office_args(tmp_path / "extracted"))
+    assert code == 1
+    assert any("does not match the located span" in p for p in report["problems"])
+
+
+def test_extracted_text_argument_failures(tmp_path):
+    for bad in ("no equals sign", "Ghost.txt=", "=no-name"):
+        try:
+            psc.parse_extracted_text([bad])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should not parse")
+    missing = tmp_path / "absent.txt"
+    try:
+        psc.parse_extracted_text([f"Ghost.pdf={missing}"])
+    except SystemExit as exc:
+        assert "file not found" in str(exc)
+    else:
+        raise AssertionError("a missing extracted-text file must fail loudly")

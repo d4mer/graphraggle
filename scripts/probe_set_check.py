@@ -24,6 +24,20 @@ Usage
         [--forbid-overlap-with <other.jsonl> ...] [--overlap-limit 40] \
         [--max-evidence-chars 300] [--run-set <merged.jsonl>]
 
+    GL-13b adds office documents, whose bytes are not text:
+
+        --source-dir /home/maverick/work/solvay-src \
+        --extracted-text OrderBook.docx=/home/maverick/work/solvay-probes/gl13b/extracted/OrderBook.txt
+
+    A probe that cites `source_doc: OrderBook.docx` is checked against the text registered
+    under that name. Binary sources (.pdf/.docx/.pptx/.xlsx) are never read as text: reading
+    them that way yields junk in which every quote is "not verbatim" and every absent term is
+    "absent" by accident, so the check would be decoration. The extracted text must come from
+    the extractors the ingest worker runs in production (app/pdf_extract.py,
+    app/docx_extract.py, app/pptx_extract.py), because that is the only text the system can
+    ever retrieve: a sentence a PDF viewer shows but `pdftotext -layout` drops is unreachable,
+    and a probe grounded in it is a trap.
+
 Row shapes
 ----------
 question row: id, question, source_doc, type, shape, history, absent_terms, and
@@ -48,6 +62,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# Reading these as text yields junk, so they must arrive through --extracted-text.
+BINARY_SOURCE_SUFFIXES = (".pdf", ".docx", ".pptx", ".xlsx")
 TYPES = ("single-fact", "multi-fact", "follow-up", "combine", "unanswerable")
 SHAPES = ("fact", "synthesis", "table", "pdf", "docx", "pptx", "deep-turn",
           "unanswerable", "near-miss")
@@ -91,18 +107,47 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
                             for row in rows), encoding="utf-8")
 
 
-def load_sources(source_dir: Path) -> dict[str, str]:
-    """Source documents keyed by filename and by basename."""
+def load_sources(source_dir: Path, extracted: dict[str, str] | None = None,
+                 ) -> tuple[dict[str, str], list[str]]:
+    """Source documents keyed by filename and by stem, plus pre-extracted office text.
+
+    Returns (sources, binary_files_skipped). `extracted` maps the name a probe cites
+    (`OrderBook.docx`) to text extracted from it by the production extractor; those entries win
+    over anything found on disk, and are registered under the name and its stem so either form
+    of `source_doc` resolves.
+    """
     sources: dict[str, str] = {}
+    skipped: list[str] = []
     for path in sorted(source_dir.rglob("*")):
         if not path.is_file():
+            continue
+        if path.suffix.lower() in BINARY_SOURCE_SUFFIXES:
+            skipped.append(str(path.relative_to(source_dir)))
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         if path.name in sources and sources[path.name] != text:
             raise SystemExit(f"duplicate source basename with different content: {path.name}")
         sources[path.name] = text
         sources.setdefault(path.stem, text)
-    return sources
+    for name, text in (extracted or {}).items():
+        sources[name] = text
+        sources.setdefault(Path(name).stem, text)
+    return sources, skipped
+
+
+def parse_extracted_text(values: list[str]) -> dict[str, str]:
+    """`NAME=PATH` repeated into {name: text}. Fails loudly on a typo or a missing file:
+    a silently absent office source would turn every quote against it into a pass."""
+    out: dict[str, str] = {}
+    for value in values:
+        name, separator, raw_path = value.partition("=")
+        if not separator or not name.strip() or not raw_path.strip():
+            raise SystemExit(f"--extracted-text wants NAME=PATH, got {value!r}")
+        path = Path(raw_path)
+        if not path.is_file():
+            raise SystemExit(f"--extracted-text {name.strip()}: file not found: {path}")
+        out[name.strip()] = path.read_text(encoding="utf-8")
+    return out
 
 
 def source_for(row: dict, sources: dict[str, str]) -> str | None:
@@ -176,7 +221,11 @@ def check_questions(rows: list[dict], sources: dict[str, str], problems: list[st
             if isinstance(value, str) and value.strip():
                 problems.append(f"{where}: {answer_field} must be empty in the question file")
         if source_for(row, sources) is None:
-            problems.append(f"{where}: source_doc {row.get('source_doc')!r} not found in source dir")
+            named = row.get("source_doc")
+            hint = ""
+            if isinstance(named, str) and named.lower().endswith(BINARY_SOURCE_SUFFIXES):
+                hint = f" - pass --extracted-text {named}=<extracted text file>"
+            problems.append(f"{where}: source_doc {row.get('source_doc')!r} not found in source dir{hint}")
 
 
 def check_answer_key(rows: list[dict], questions: list[dict], sources: dict[str, str],
@@ -218,6 +267,18 @@ def check_answer_key(rows: list[dict], questions: list[dict], sources: dict[str,
             expected = row.get("expected_answer")
             if not isinstance(expected, str) or "not in the documents" not in expected:
                 problems.append(f"{where}: {shape} expected_answer must contain 'not in the documents'")
+            # An absent_term that is not absent makes the probe answerable, and the run scores a
+            # correct refusal as a miss. The term is reported as a hash, not as text: this report is
+            # the one thing allowed into a ticket, and an absent term is corpus wording.
+            terms = row.get("absent_terms")
+            if isinstance(terms, list):
+                for position, term in enumerate(terms, start=1):
+                    if not isinstance(term, str) or not term.strip():
+                        problems.append(f"{where}: absent_term {position} is not a phrase")
+                    elif any(normalise(term) in text for text in normalised_sources):
+                        digest = hashlib.sha256(normalise(term).encode("utf-8")).hexdigest()[:8]
+                        problems.append(f"{where}: absent_term #{position} (sha256 {digest}, "
+                                        f"{len(term)} chars) occurs in a source document")
             continue
         if not isinstance(evidence, str) or not evidence.strip():
             problems.append(f"{where}: evidence missing")
@@ -317,13 +378,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="quote budget per probe (env GRAGGLE_PROBE_MAX_EVIDENCE_CHARS)")
     parser.add_argument("--run-set", type=Path, default=None,
                         help="write the question+key merged file here (for the scoring runner)")
+    parser.add_argument("--extracted-text", action="append", default=[], metavar="NAME=PATH",
+                        help="pre-extracted text for an office source, named as source_doc cites it "
+                             "(repeatable). Required for any .pdf/.docx/.pptx source.")
     args = parser.parse_args(argv)
 
     if not args.source_dir.is_dir():
         raise SystemExit(f"source dir not found: {args.source_dir}")
     questions = read_jsonl(args.questions)
     key_rows = read_jsonl(args.answer_key)
-    sources = load_sources(args.source_dir)
+    extracted = parse_extracted_text(args.extracted_text)
+    sources, skipped_binaries = load_sources(args.source_dir, extracted)
     source_texts = sorted({text for name, text in sources.items()})
 
     problems: list[str] = []
@@ -348,8 +413,11 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         "questions": len(questions),
         "answer_key_rows": len(key_rows),
-        "source_documents": len(list(args.source_dir.rglob("*"))) - sum(
+        "source_documents": len(source_texts),
+        "source_files_on_disk": len(list(args.source_dir.rglob("*"))) - sum(
             1 for p in args.source_dir.rglob("*") if p.is_dir()),
+        "extracted_text_sources": sorted(extracted),
+        "binary_sources_skipped": sorted(skipped_binaries),
         "by_shape": dict(sorted(shape_counts.items())),
         "by_type": dict(sorted(type_counts.items())),
         "per_source": dict(sorted(per_source.items())),
