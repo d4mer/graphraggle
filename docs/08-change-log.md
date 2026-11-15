@@ -726,3 +726,53 @@ nothing removed.
   `edge-variants.json`, and the acceptance rule is stated in `RUN-NOTES.md`: a row that fires
   outside that list is a genuine false refusal.
 - Nothing in `app/grounding.py`, `app/api.py` or the flag changed. Gate behaviour untouched.
+
+## 2026-11-15 - why the M1 gate is blind online (investigation, tooling only)
+
+Task `qitem-20261115182714-dd468158e0f17600`. **No `app/` change, no flag change.** The 2026-11-14
+stack2 run fired the M1 gate on 96 of 102 identifier probes, 86 of them unexpected, with
+`grounding_references_without_content` = 10-11 on every row. Report:
+`docs/ops/runs/2026-11-15-m1-evidence-blindness.md` (`docs/ops/runs/*.md` is gitignored,
+so the same text is handed over at
+`/home/maverick/work/patches/m1-evidence-blindness-report.md`).
+
+What the measurements say:
+
+- **The run reconciles to empty evidence, exactly.** Recomputed from the probe set alone with
+  evidence = `""` and the shipped rule: 102 answerable rows, 96 identifier-asking, 96 would fire,
+  10 by design, **86 unexpected** - Hermes' numbers to the unit. The 6 that did not fire are the
+  lowercase rows, which the shipped regex (`app/grounding.py` `IDENTIFIER_RE`, uppercase initial)
+  never extracts. No rule defect is needed to explain the run.
+- **Nothing on the gateway path strips chunk text**: `app/api.py:1306` keeps `references` verbatim,
+  `enrich_citation` (`app/api.py:822-833`) copies dicts, `truncate_citations` slices. What is real is
+  that this repo has **three readers of different width**: the gate accepts only `content` as a
+  string (`app/grounding.py:88-93`), the document generator expects `content` as a **list**
+  (`app/generation.py:29-32`), and the reranker accepts `content`/`text`/`chunk_text`/`body` as
+  string or list (`app/rerank.py:33-41`). If upstream sends the list form, the blindness is ours.
+  No raw upstream response is recorded anywhere in the repo, and the LightRAG image is not on the dev
+  host, so that half needs one dump - `scripts/m1_reference_shape_probe.py` prints the two
+  discriminating counts and no corpus text.
+- **Separate finding: a gate on the gateway path does not cover the production path.** Open WebUI goes
+  through the bridge, which never asks for chunk content (`app/api.py:234-235`) and reduces every
+  reference to `{"file_path"}` (`app/api.py:629`).
+- **The co-location fear does not exist in this corpus.** All 78 planted fact sentences name their
+  code inline and pass the gate's token test on their own; 78/78 codes are token-supported in their
+  own document's pieces; 0 of 78 facts have code and sentence in different pieces, at the configured
+  7500-token window or at 1200/400. So "the fact text was in context but the code was not" cannot be
+  true of the same chunk - they are the same bytes.
+- **The decision that matters is the evidence set.** With the shipped rule and corpus-side evidence the
+  simulation lands on the by-design floor (10 refusals, all expected, 12/12 controls caught); with
+  one-document evidence it adds 4 two-code refusals (their codes live in different documents). Of the
+  normalisation variants only `reconstruct_if_known` (join adjacent tokens **only** when the joined
+  form occurs in the evidence) fixes the hyphen-opened rows without breaking two-code rows: 4
+  refusals, all expected. Case-folding is safe (6 more rows ask, 0 more refuse). Stricter
+  "fire only if every code is unsupported" **loses** the 4 one-absent catches.
+- **Two unmeasurable decisions surfaced:** no probe asks the bare company code (0 of 207 pieces carry
+  it as a standalone token, so such a question can never be supported), and no probe carries a
+  lowercase invented code. Both need rows before either rule is enforced.
+
+Added: `scripts/m1_evidence_offline.py` (co-location, piece-window sensitivity, run reconciliation,
+gate-rule simulation under three evidence models; counts only), `scripts/m1_reference_shape_probe.py`
+(run on the stack; key paths/types/lengths/hashes and membership booleans, never chunk text),
+`tests/test_m1_evidence_offline.py` (35 tests; the real-corpus class skips when the generated GL-07
+corpora are absent). Suite: `1452 passed, 2 skipped, 279 subtests passed`.
