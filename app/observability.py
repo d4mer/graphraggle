@@ -340,6 +340,9 @@ def emit_query_log(
             "scoped_pass_model_calls": scoped.get("model_calls"),
             "scoped_pass_retrieval_route": scoped.get("retrieval_route"),
             "scoped_pass_retrieval_fallback_reason": scoped.get("retrieval_fallback_reason"),
+            # Status code and validation message from a rejected retrieval body (never chunk text): the
+            # difference between "scoping found nothing" and "scoping never reached LightRAG".
+            "scoped_pass_retrieval_errors": scoped.get("retrieval_errors"),
             "scoped_pass_keyword_hint_applied": scoped.get("keyword_hint_applied"),
             # Counts of what the retrieval-only endpoint returned (references, chunks, how many carried
             # text, how many had no path). Counts only - never chunk text.

@@ -583,6 +583,10 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
             scoped = await company_scoped_pass(
                 retrieval_query, list(company_meta["companies"]),
                 payload_base=scoped_base, client=client)
+            if not scoped.used and scoped.meta:
+                # Both retrieval routes were rejected: this request continues on the stream (the
+                # citations-only behaviour) and the log records that strict scoping did not run.
+                log_fields["scoped_pass"] = scoped.meta
             if scoped.used:
                 citations, _bridge_scope = await scope_query_citations(
                     scoped.citations, requested_company=None,
@@ -1804,8 +1808,12 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
         # what keeps the shipped response byte-for-byte what it was.
         query_scope["grounding"] = grounding_result
 
-    if scoped_used and scoped is not None:
+    if scoped is not None and scoped.meta:
+        # Logged even when the pass did not run (used=False): a scoped pass whose retrieval routes were
+        # both rejected degrades to citation filtering, and the request must still say why in the log
+        # rather than look like an ordinary unscoped answer.
         query_scope["scoped_pass"] = scoped.meta
+    if scoped_used and scoped is not None:
         query_scope["stages_skipped_for_scope"] = [
             "multi_query", "naive_fallback", "graph_expansion"]
     if company_scope_meta is not None:

@@ -47,6 +47,24 @@ from .state_store import get_documents_by_paths, get_documents_by_sha256
 PATH_KEYS: tuple[str, ...] = ("file_source", "path", "source", "file_path")
 
 
+def error_detail(exc: BaseException) -> dict[str, Any]:
+    """What a LightRAG rejection said, in a form that belongs in a log line.
+
+    A rejected request body is a validation problem, so the response body is the diagnosis: status
+    code plus the server's message. Chunk text never appears in a 4xx body, and the message is
+    truncated anyway so an oversized or unexpected body cannot push document content into the log.
+    """
+    detail: dict[str, Any] = {"type": type(exc).__name__}
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        detail["status"] = status
+    body = getattr(response, "text", None)
+    if isinstance(body, str) and body.strip():
+        detail["message"] = " ".join(body.split())[:300]
+    return detail
+
+
 def path_of(item: Any) -> str:
     if not isinstance(item, dict):
         return ""
@@ -166,15 +184,24 @@ async def retrieve_context(question: str, payload_base: dict[str, Any], client: 
     # Counted separately from the answer the pass later writes, so a run that declines before
     # generating does not report a generation it never made.
     meta: dict[str, Any] = {"retrieval_route": "query/data", "retrieval_fallback_reason": None,
-                            "keyword_hint_applied": False, "retrieval_model_calls": 0}
-    payload = {**payload_base, "include_references": True, "include_chunk_content": True}
+                            "keyword_hint_applied": False, "retrieval_model_calls": 0,
+                            "retrieval_errors": {}}
+    # `query` is set here rather than trusted from payload_base: the gateway door passes
+    # mode/top_k/chunk_top_k and the bridge door strips `query` deliberately, so a retrieval built
+    # from either base without the question is rejected by LightRAG (400 on /query/data, 422 on
+    # /query). The question is what is being retrieved; it belongs to the pass, not to the caller.
+    payload = {**payload_base, "query": question, "include_references": True,
+               "include_chunk_content": True}
     if settings.company_keyword_hint:
         meta["keyword_hint_applied"] = apply_keyword_hint(payload, companies)
     try:
         body = await client.post_json("/query/data", payload)
     except Exception as exc:
         meta["retrieval_route"] = "query"
-        meta["retrieval_fallback_reason"] = f"query_data_error:{type(exc).__name__}"
+        meta["retrieval_errors"]["/query/data"] = error_detail(exc)
+        status = meta["retrieval_errors"]["/query/data"].get("status")
+        meta["retrieval_fallback_reason"] = (f"query_data_http_{status}" if status
+                                             else f"query_data_error:{type(exc).__name__}")
         return await _retrieve_via_query(question, payload_base, client, meta, companies)
 
     items, census = normalize_data_payload(body)
@@ -191,10 +218,22 @@ async def _retrieve_via_query(question: str, payload_base: dict[str, Any], clien
                               meta: dict[str, Any],
                               companies: Sequence[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """The route this code used before: retrieve through the answered endpoint, and pay for it."""
-    payload = {**payload_base, "include_references": True, "include_chunk_content": True}
+    payload = {**payload_base, "query": question, "include_references": True,
+               "include_chunk_content": True}
     if settings.company_keyword_hint:
         meta["keyword_hint_applied"] = apply_keyword_hint(payload, companies)
-    body = await client.post_json("/query", payload)
+    try:
+        body = await client.post_json("/query", payload)
+    except Exception as exc:
+        # Both retrieval routes failed. Raising here turns a LightRAG rejection into an HTTP 500 for
+        # the user, which is what the first stack2 R2 run saw. The caller degrades to the
+        # citations-only behaviour it already ships, with the status codes in the log.
+        meta["retrieval_errors"]["/query"] = error_detail(exc)
+        status = meta["retrieval_errors"]["/query"].get("status")
+        meta["retrieval_failed"] = True
+        meta["retrieval_fallback_reason"] = (f"query_http_{status}" if status
+                                             else f"query_error:{type(exc).__name__}")
+        return [], meta
     references = body.get("references") if isinstance(body, dict) else None
     items = [item for item in (references or []) if isinstance(item, dict)]
     meta["retrieval_shape"] = {"references_found": len(items),
@@ -335,6 +374,25 @@ async def company_scoped_pass(
     references, retrieval_meta = await retrieve_context(question, payload_base, client,
                                                          allowed_companies)
 
+    if retrieval_meta.get("retrieval_failed"):
+        # Neither retrieval route worked. Answer as `citations` enforcement does - the caller's
+        # unscoped pass plus the company filter on the citations - instead of failing the request.
+        # used=False is what tells the caller that; the meta says why.
+        statuses = ";".join(
+            f"{path}={detail.get('status') or detail['type']}"
+            for path, detail in sorted(retrieval_meta["retrieval_errors"].items()))
+        return ScopedPass(answer="", citations=[], used=False, meta={
+            "companies": list(allowed_companies),
+            "retrieval_route": retrieval_meta["retrieval_route"],
+            "retrieval_fallback_reason": retrieval_meta["retrieval_fallback_reason"],
+            "retrieval_errors": retrieval_meta["retrieval_errors"],
+            "model_calls": retrieval_meta.get("retrieval_model_calls", 0),
+            "keyword_hint_applied": retrieval_meta["keyword_hint_applied"],
+            "second_model_call": False,
+            "declined_reason": f"retrieval_routes_failed:{statuses}" if statuses
+                               else "retrieval_routes_failed",
+        })
+
     paths = sorted({path_of(reference) for reference in references} - {""})
     owners_by_path = await companies_for_paths(paths)
     kept, counts = classify_references(references, owners_by_path, allowed_companies)
@@ -359,6 +417,9 @@ async def company_scoped_pass(
         "retrieval_fallback_reason": retrieval_meta["retrieval_fallback_reason"],
         "keyword_hint_applied": retrieval_meta["keyword_hint_applied"],
         "retrieval_shape": retrieval_meta.get("retrieval_shape", {}),
+        # A rejected body is diagnosable only if the status and the server's message survive; this is
+        # the case where /query/data failed and the /query fallback carried the run.
+        "retrieval_errors": retrieval_meta.get("retrieval_errors", {}),
         "declined_reason": None,
     }
 

@@ -65,28 +65,88 @@ def _ref(index: str, path: str, chunks: list[str] | None) -> dict:
     return reference
 
 
+# The top-level fields LightRAG 1.5.7 accepts on /query and /query/data, as read from its source by
+# Hermes on the stack2 run. A fake that accepts any body hides request-shape bugs: the first R2 run
+# died because the scoped retrieval body carried no `query` at all, and a permissive fake could not
+# notice. Anything outside this set is rejected the way the real server rejects it.
+LIGHTRAG_REQUEST_FIELDS = frozenset({
+    "query", "mode", "only_need_context", "only_need_prompt", "response_type", "top_k",
+    "chunk_top_k", "max_entity_tokens", "max_relation_tokens", "max_total_tokens", "hl_keywords",
+    "ll_keywords", "conversation_history", "user_prompt", "disable_user_prompt_prefix",
+    "enable_rerank", "include_references", "include_chunk_content", "include_progress", "stream",
+})
+
+
+class LightRAGRejected(RuntimeError):
+    """Stand-in for httpx.HTTPStatusError: carries .response.status_code and .response.text."""
+
+    class _Response:
+        def __init__(self, status_code: int, text: str) -> None:
+            self.status_code = status_code
+            self.text = text
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(f"HTTP {status_code}: {message}")
+        self.response = self._Response(status_code, message)
+
+
 class FakeLightRAG:
     """Records payloads; answers a retrieval with fixed references and a bypass with fixed text.
 
     `/query/data` is answered with the envelope the brief describes (`status`, `message`,
     `data{entities, relationships, chunks, references}`) unless a test supplies its own body or makes
     the endpoint fail, which is how the fallback routes are exercised.
+
+    Every body is checked the way the server checks it: a missing or blank `query`, or a top-level key
+    outside LIGHTRAG_REQUEST_FIELDS, is a 400/422 rather than a silent answer. That strictness is the
+    point - it is what makes the "payload never carried the question" class of bug fail a test instead
+    of a stack run.
     """
 
     DEFAULT = object()
 
     def __init__(self, references: list[dict], generation_text: str = "the scoped answer",
                  response_text: str = "the unscoped draft answer", *,
-                 data_payload: object = DEFAULT, data_raises: Exception | None = None) -> None:
+                 data_payload: object = DEFAULT, data_raises: Exception | None = None,
+                 strict: bool = True, reject_first_retrievals: int = 0) -> None:
         self.references = references
         self.generation_text = generation_text
         self.response_text = response_text
         self.data_payload = data_payload
         self.data_raises = data_raises
+        self.strict = strict
+        self.reject_first_retrievals = reject_first_retrievals
+        self.retrievals_seen = 0
+        self.rejections: list[tuple[str, list[str]]] = []
         self.calls: list[tuple[str, dict]] = []
+
+    def _reject_reasons(self, payload: dict) -> list[str]:
+        reasons: list[str] = []
+        query = payload.get("query")
+        if not isinstance(query, str) or not query.strip():
+            reasons.append("query")
+        unknown = sorted(set(payload) - LIGHTRAG_REQUEST_FIELDS)
+        if unknown:
+            reasons.append("unknown_keys=" + ",".join(unknown))
+        return reasons
 
     async def post_json(self, path: str, payload: dict) -> dict:
         self.calls.append((path, payload))
+        # Reject the first N retrieval calls (a scoped pass runs /query/data then /query, and runs
+        # first in both doors). Shape-based rejection would also catch the ordinary pass, which asks
+        # for chunk content too, and that would test the wrong thing.
+        if payload.get("mode") != "bypass":
+            self.retrievals_seen += 1
+            if self.retrievals_seen <= self.reject_first_retrievals:
+                raise LightRAGRejected(400 if path == "/query/data" else 422,
+                                       '{"detail":"Invalid request parameters: query"}')
+        if self.strict:
+            reasons = self._reject_reasons(payload)
+            if reasons:
+                self.rejections.append((path, reasons))
+                raise LightRAGRejected(400 if path == "/query/data" else 422,
+                                       '{"detail":"Invalid request parameters: '
+                                       + "; ".join(reasons) + '"}')
         if payload.get("mode") == "bypass":
             return {"response": self.generation_text}
         if path == "/query/data":
@@ -385,6 +445,27 @@ class TestQueryDoor(_TempStore, _PipelineSettings):
                          ["multi_query", "naive_fallback", "graph_expansion"])
         self.assertIn("regenerated", scope["warning"])
 
+    def test_a_failed_scoping_degrades_to_citation_filtering_instead_of_a_500(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])],
+                              reject_first_retrievals=2)
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api.settings, "company_scope_enforcement", "retrieval"),                 patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                request_id="req-4", timer=api.StageTimer(), t_start=0.0))
+        data = envelope.data if envelope.data is not dict else envelope.data
+        data = data if isinstance(data, dict) else data.model_dump()
+        self.assertEqual(client.rejections, [])          # the bodies were valid; the server refused
+        self.assertEqual(data["answer"], "the unscoped draft answer",
+                         "the request is served, not failed")
+        self.assertEqual([c["file_path"] for c in data["citations"]], [NW_PATH],
+                         "and it is served with the company filter still applied")
+        scoped = data["query_scope"]["scoped_pass"]
+        self.assertEqual(scoped["declined_reason"],
+                         "retrieval_routes_failed:/query=422;/query/data=400")
+        self.assertEqual(scoped["retrieval_errors"]["/query/data"]["status"], 400)
+        self.assertNotIn("stages_skipped_for_scope", data["query_scope"],
+                         "the unscoped pipeline ran, so the skipped-stage note would lie")
+
     def test_the_flag_off_pipeline_never_runs_a_scoped_pass(self):
         client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
         with patch.object(api.settings, "company_from_question", False), \
@@ -503,6 +584,16 @@ class TestBridgeDoor(_TempStore, _PipelineSettings):
         self.assertNotIn("streamed answer", answer)
         self.assertEqual(self.proxy_calls, 0, "the streaming call is not made when scoped")
 
+    def test_a_failed_scoping_falls_back_to_the_stream_and_filters_the_sources(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])],
+                              reject_first_retrievals=2)
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api.settings, "company_scope_enforcement", "retrieval"):
+            answer = self._bridge("what did Northwind Chemicals report for Q3?", client)
+        self.assertIn("streamed answer", answer, "the request is served on the stream, not failed")
+        self.assertIn("northwind-q3.pdf", answer)
+        self.assertNotIn("contoso-q3.pdf", answer, "the company filter still applies")
+        self.assertEqual(self.proxy_calls, 1)
+
     def test_default_enforcement_keeps_the_stream_and_filters_only_the_sources(self):
         client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
         with patch.object(api.settings, "company_from_question", True), \
@@ -511,6 +602,74 @@ class TestBridgeDoor(_TempStore, _PipelineSettings):
         self.assertIn("streamed answer", answer)
         self.assertEqual(client.calls, [], "no scoped pass runs at the default enforcement")
         self.assertEqual(self.proxy_calls, 1)
+
+
+class TestRetrievalRequestBody(_TempStore):
+    """The body is part of the contract: a retrieval without the question is not a retrieval."""
+
+    def _pass(self, client, question="what did Northwind Chemicals report for Q3?"):
+        return _run(scoped_pass.company_scoped_pass(question, [NW],
+                                                    payload_base={"mode": "mix", "top_k": 9,
+                                                                  "chunk_top_k": 16},
+                                                    client=client))
+
+    def test_both_retrieval_routes_send_the_question(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._pass(client)
+        self.assertEqual(client.rejections, [])
+        self.assertEqual(client.retrieval_payloads[0]["query"],
+                         "what did Northwind Chemicals report for Q3?")
+
+    def test_the_fallback_route_sends_it_too(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], data_raises=RuntimeError("404"))
+        self._pass(client)
+        self.assertEqual(client.paths.count("/query"), 2)   # the fallback retrieval + the generation
+        self.assertEqual(client.retrieval_payloads[-1]["query"],
+                         "what did Northwind Chemicals report for Q3?")
+
+    def test_the_generation_body_passes_the_same_strict_check(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        self._pass(client)
+        self.assertEqual(client.rejections, [], "the bypass body uses only known fields and carries "
+                                               "its prompt under `query`")
+        bypass = [payload for _, payload in client.calls if payload.get("mode") == "bypass"]
+        self.assertIn(NW_CHUNK, bypass[0]["query"])
+
+    def test_the_door_payloads_use_only_known_fields(self):
+        """The gateway builds mode/top_k/chunk_top_k and the bridge strips `query`; neither may add a
+        key LightRAG does not know, or the strict fake turns the run into a 4xx."""
+        gateway_base = {"mode": "mix", "top_k": 9, "chunk_top_k": 16, "conversation_history": []}
+        bridge_base = {"mode": "mix", "top_k": 9, "only_need_context": False, "enable_rerank": True,
+                       "max_entity_tokens": 1000, "hl_keywords": ["lead times"]}
+        for base in (gateway_base, bridge_base):
+            with self.subTest(keys=sorted(base)):
+                client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+                result = self._pass(client)
+                self.assertEqual(client.rejections, [])
+                self.assertEqual(result.meta["retrieval_route"], "query/data")
+
+    def test_an_unknown_key_degrades_instead_of_answering_from_a_rejected_body(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("what did Northwind Chemicals report?", [NW],
+                                                      payload_base={"mode": "mix",
+                                                                    "knn_search": True},
+                                                      client=client))
+        self.assertFalse(result.used, "no answer may be claimed from a body the server rejected")
+        self.assertIn("400", result.meta["declined_reason"])
+        self.assertIn("422", result.meta["declined_reason"])
+        self.assertEqual(result.meta["retrieval_errors"]["/query/data"]["status"], 400)
+        self.assertEqual(client.bypass_prompts, [])
+
+    def test_a_degraded_pass_reports_the_status_codes_without_document_text(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], reject_first_retrievals=2)
+        result = self._pass(client)
+        self.assertFalse(result.used)
+        self.assertEqual(result.meta["declined_reason"],
+                         "retrieval_routes_failed:/query=422;/query/data=400")
+        dumped = json.dumps(result.meta)
+        self.assertNotIn(NW_CHUNK, dumped)
+        self.assertNotIn("Invalid request parameters", result.meta["declined_reason"],
+                         "the declined_reason names codes, not the server body")
 
 
 class TestQueryDataRoute(_TempStore):
