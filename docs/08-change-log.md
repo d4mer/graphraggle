@@ -835,3 +835,39 @@ on request, id-resolves-manifest without a company, duplicate id across company 
 selected header, raw-leg auth style is passed and hinted on 401, default stays `bearer`), and the
 existing end-to-end CLI test now pins the scoped body plus the bearer default. Suite:
 `1481 passed, 2 skipped, 290 subtests passed` (base `0d83376`: 1470).
+
+## 2026-11-17 — GL-10 part 1+2: the company named in the question scopes the query
+
+The operator's rule is that a bare mention is enough: name a company and the answer comes from that
+company, name several and it comes from those, name none and nothing changes. Nothing in the query
+path read a company out of the question text; scope came only from the `company` request field
+(`app/api.py:1273`), and the caller that matters — Open WebUI through the bridge — never sends one
+(`build_ollama_bridge_query_payload`, `app/api.py:216`). Part 1 is the map
+(`docs/decisions/gl10-company-from-question-map.md`, every claim a file:line at this base); part 2
+is the reading of the question, behind `COMPANY_FROM_QUESTION` (default **off**).
+
+- New `app/company_scope.py`. Matching is against the store's own company names, never guessed
+  organisations: a wrong scope hides every other company's answer and reads like the system lost its
+  memory, while a missed scope only leaves today's behaviour. Case- and punctuation-insensitive
+  whole-phrase matching, longest name first, a shorter name cannot match inside a longer one's span
+  ("Acme Chemicals and Acme Corp" names two companies, "Acmeist" names none). A one-word company
+  whose name is also ordinary English needs a capital in the question, so "what did the target say"
+  does not scope to a company called Target. `COMPANY_ALIASES` bridges what a person types to the
+  directory name and is validated against the known list, so an alias typo cannot scope a query to a
+  company with no documents. A question naming an unknown organisation stays unscoped and records it
+  as `company_candidates`.
+- `app/state_store.py:648` `list_distinct_companies()` — the known list is real rows; `skipped`
+  duplicates count, because a skipped duplicate still proves that company owns that path.
+- `scope_query_citations(..., allowed_companies=[...])` takes a company **set** for the several-
+  companies case; the single `requested_company` comparison and the unscoped path are unchanged.
+- Wired on both doors: `/query` (explicit field still wins over detection) and the direct bridge,
+  the path production uses. With the flag on the bridge filters the references the Sources block is
+  built from and logs `company_scope`; with it off that block never runs.
+- **Honest limit of this commit:** it restricts the citations returned and shown, not what LightRAG
+  retrieved or what the model was shown. Making retrieval itself company-scoped is part 3 and depends
+  on facts only the stack can give (does v1.5.7 `/query` accept a document/path filter; what
+  `only_need_context` returns per chunk) — recorded as open questions in the map.
+- Tests: 28 new in `tests/test_company_from_question.py` — detection rules, alias validation,
+  `list_distinct_companies`, the company-set filter including the missing-row exclusion, and the
+  bridge on/off/cross-company/unknown-name cases. Suite:
+  `1509 passed, 2 skipped, 297 subtests passed` (base `317c077`: 1481).

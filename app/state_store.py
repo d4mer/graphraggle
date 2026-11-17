@@ -645,6 +645,21 @@ async def get_documents_by_paths(paths: list[str]) -> list[dict]:
     return annotate_documents(documents)
 
 
+async def list_distinct_companies() -> list[str]:
+    """Every company the store has rows for, in a stable order.
+
+    GL-10 asks which companies a question names, and the only honest answer set is the one the
+    store actually holds: a name with no rows cannot scope anything. `skipped` rows count — a
+    duplicate that was skipped still proves that company exists and owns that path — while
+    `superseded` rows count too, because a superseded document's company is still a company.
+    """
+    rows = await _fetch_documents(
+        "SELECT DISTINCT company FROM documents WHERE company IS NOT NULL AND TRIM(company) <> ''"
+        " ORDER BY company"
+    )
+    return [str(row["company"]) for row in rows]
+
+
 async def list_documents() -> list[dict]:
     return annotate_documents(await _fetch_documents("SELECT * FROM documents ORDER BY updated_at DESC"))
 

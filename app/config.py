@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     # poll_track file_path guard only ever runs for rows this flag marked.
     company_aware_dedupe: bool = Field(default=False, alias="COMPANY_AWARE_DEDUPE")
 
+    # GL-10: the company named in the QUESTION scopes the search and the answer. Default OFF, and
+    # with it off no part of the query path looks at the question text for a company, so the shipped
+    # envelope and the query log line are what they were. The operator turns it on when the stack2
+    # probe plan in docs/ops/probes has been run.
+    company_from_question: bool = Field(default=False, alias="COMPANY_FROM_QUESTION")
+
+    # What the operator types -> the company name the store holds, because a folder name is rarely
+    # what a person asks with: `Northwind Chemicals=nwind,north wind;Contoso Pharma=contoso`.
+    # Aliases naming a company with no rows are ignored, so a typo here cannot scope a query to a
+    # company that has no documents (app/company_scope.validate_aliases).
+    company_aliases: str = Field(default="", alias="COMPANY_ALIASES")
+
     # packet-27: the worker extracts .pptx itself (python-pptx) into structured
     # text and submits it through /documents/text, because LightRAG's built-in
     # pptx extractor drops tables, grouped shapes, speaker notes and slide

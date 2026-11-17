@@ -306,6 +306,23 @@ Gateway defaults that are **in force without being written in `.env`**:
    55-row run is only 41 distinct questions because generated scoped probes repeat a question
    text within a company (several facts share one topic label); the scorer reports rows and
    distinct questions separately so no rate hides that.
+3. `COMPANY_FROM_QUESTION=false` and `COMPANY_ALIASES=""` (defaults). With the flag on, a company
+   named in the question text scopes the query the same way the explicit `company` request field
+   does, and an explicit field still wins. The known-company list is `SELECT DISTINCT company`
+   over the gateway's own `documents` rows, so only a company the store actually has documents for
+   can scope anything; `COMPANY_ALIASES` maps what a person types to that directory name
+   (`Northwind Chemicals=nwind,north wind;Contoso Pharma=contoso`) and aliases naming a company
+   with no rows are ignored rather than trusted. Matching is case- and punctuation-insensitive and
+   whole-phrase, longest name first; a one-word company whose name is also an ordinary English
+   word only matches when the question capitalises it, because "what did the target say" must not
+   scope to a company called Target. A question naming an organisation the store does not know
+   stays unscoped (today's behaviour) and records what it saw as `company_candidates` in the log
+   line, which is how the operator finds out what to alias.
+   **What part 2 does not do:** with the flag on it restricts the citations the gateway returns and
+   the Sources block the user sees, not what LightRAG retrieved or what the model was shown. The
+   query log line carries `company_scope` (companies matched, where from, candidates) so a run can
+   be scored for scoping before anything about retrieval changes. Retrieval-side scoping is the
+   next packet and needs the stack2 probe answers in `docs/decisions/gl10-company-from-question-map.md`.
 
 ## oMLX Behaviour Notes (measured 2026-10-09)
 
