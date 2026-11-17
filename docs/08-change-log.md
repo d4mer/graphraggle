@@ -965,11 +965,13 @@ retrieval plus one generation, the same cost as an unscoped question.
 
 The response shape has not been observed on this stack, so the code does not guess. `data.references`
 and `data.chunks` are both read; chunk items are grouped by document path, because the scoping decision
-is per document and not per chunk; the accepted path keys are `file_path`, `file_source`, `path`,
-`source`, `filename` — every name this repo already tolerates elsewhere — and the text is read through
-the shared `app/citation_text.py` accessor, which already handles string- and list-valued content. Each
-run logs a census (`scoped_pass_retrieval_shape`: references found, chunks found, items carrying text,
-text-carrying items with no path, chunk-only paths, content-key counts). A chunk is never invented a
+is per document and not per chunk; the accepted path keys are exactly the four
+`app/api.py:extract_citation_path` already tolerates (`file_source`, `path`, `source`, `file_path`) — no
+fifth name is invented, because a wrong guess there is silent — and the text is read through the shared
+`app/citation_text.py` accessor, which already handles string- and list-valued content. Each run logs a
+census (`scoped_pass_retrieval_shape`: references found, chunks found, items carrying text,
+text-carrying items with no path, chunk-only paths, which content keys appeared, which path keys
+appeared). A chunk is never invented a
 path: text with no path stays `unattributable` and is counted as such. If `/query/data` errors or
 yields nothing usable the pass falls back to the `/query` retrieval it used before and records
 `scoped_pass_retrieval_route`, `..._retrieval_fallback_reason` and `..._model_calls` (2 on that route,

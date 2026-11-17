@@ -39,11 +39,12 @@ from .citation_text import CITATION_TEXT_KEYS, citation_content
 from .config import settings
 from .state_store import get_documents_by_paths, get_documents_by_sha256
 
-# Which keys carry a document's path. `file_path` is what /query references use; `file_source` is
-# what the worker submits upstream; the others are the names the gateway already tolerates in
-# app/api.py. The chunk items of /query/data have not been seen on this stack, so the reader accepts
-# every name the repo has evidence for and counts what it found rather than betting on one.
-PATH_KEYS: tuple[str, ...] = ("file_path", "file_source", "path", "source", "filename")
+# Which keys carry a document's path: exactly the four app/api.py:extract_citation_path already
+# tolerates (`file_source`, `path`, `source`, `file_path`). No fifth name is invented, because the
+# chunk items of /query/data have not been observed on this stack - instead the census below counts
+# which of these keys actually appeared, so an unseen key name shows up immediately as
+# `items_without_path` plus an empty path-key count rather than as a silent attribution failure.
+PATH_KEYS: tuple[str, ...] = ("file_source", "path", "source", "file_path")
 
 
 def path_of(item: Any) -> str:
@@ -70,13 +71,20 @@ def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
     census: dict[str, Any] = {"top_level_keys": sorted(payload) if isinstance(payload, dict) else [],
                               "data_keys": [], "references_found": 0, "chunks_found": 0,
                               "items_with_text": 0, "items_without_path": 0,
-                              "chunk_only_paths": 0, "content_keys_seen": {}}
+                              "chunk_only_paths": 0, "content_keys_seen": {},
+                              "path_keys_seen": {}}
     if not isinstance(payload, dict):
         return [], census
     data = payload.get("data")
     if not isinstance(data, dict):
         data = payload                                    # tolerate a body with no envelope
     census["data_keys"] = sorted(data)
+
+    def note_path(item: dict[str, Any]) -> None:
+        for key in PATH_KEYS:
+            if isinstance(item.get(key), str) and item[key].strip():
+                census["path_keys_seen"][key] = census["path_keys_seen"].get(key, 0) + 1
+                break
 
     items: list[dict[str, Any]] = []
     paths_with_text: set[str] = set()
@@ -86,6 +94,7 @@ def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
             if not isinstance(reference, dict):
                 continue
             census["references_found"] += 1
+            note_path(reference)
             text = citation_content(reference)
             if text:
                 census["items_with_text"] += 1
@@ -101,6 +110,7 @@ def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
         order: list[str] = []
         for chunk in chunks:
             census["chunks_found"] += 1
+            note_path(chunk)
             text = citation_content(chunk)
             if not text:
                 continue

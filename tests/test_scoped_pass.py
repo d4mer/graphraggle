@@ -548,6 +548,17 @@ class TestQueryDataRoute(_TempStore):
             {"file_source": CP_PATH, "text": CP_CHUNK}]}})
         self.assertEqual(scoped_pass.path_of(items[0]), CP_PATH)
         self.assertEqual(census["items_with_text"], 1)
+        self.assertEqual(census["path_keys_seen"], {"file_source": 1})
+
+    def test_the_path_key_census_names_the_four_the_gateway_tolerates(self):
+        """No invented fifth key: an unseen name shows up as items_without_path, not as a wrong owner."""
+        self.assertEqual(scoped_pass.PATH_KEYS,
+                         tuple(key for key in ("file_source", "path", "source", "file_path")))
+        items, census = scoped_pass.normalize_data_payload({"data": {"chunks": [
+            {"document_name": CP_PATH, "content": CP_CHUNK}]}})
+        self.assertEqual(scoped_pass.path_of(items[0]), "")
+        self.assertEqual(census["items_without_path"], 1)
+        self.assertEqual(census["path_keys_seen"], {})
 
     def test_references_win_when_they_already_carry_the_document(self):
         client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
@@ -607,6 +618,7 @@ class TestQueryDataRoute(_TempStore):
         self.assertEqual(census["references_found"], 1)
         self.assertEqual(census["items_with_text"], 1)
         self.assertEqual(census["content_key_counts"], {"content": 1})
+        self.assertEqual(census["path_keys_seen"], {"file_path": 1})
         self.assertNotIn(NW_CHUNK, json.dumps(census))
 
 

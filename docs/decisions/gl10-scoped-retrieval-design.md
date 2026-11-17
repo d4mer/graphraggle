@@ -99,9 +99,10 @@ scoped. A scoped question is now one retrieval plus one generation - the same co
 The parsing is deliberately not a bet on an unobserved shape. Which list carries the chunk text
 (`references`, or `chunks`) and under which key has not been seen on this stack, so both are read;
 chunk items are grouped by document path, because the scoping decision is per document rather than per
-chunk; the accepted path keys are the ones this repo already has evidence for (`file_path`,
-`file_source`, `path`, `source`, `filename`) and the text is read through the shared citation accessor
-`app/citation_text.py`. Every run logs a census: references found, chunks found, items carrying text,
+chunk; the accepted path keys are exactly the four `app/api.py:extract_citation_path`
+already tolerates (`file_source`, `path`, `source`, `file_path`) — no fifth name is invented, because a
+wrong guess there would surface as a wrong owner rather than an unknown shape — and the text is read
+through the shared citation accessor `app/citation_text.py`. Every run logs a census: references found, chunks found, items carrying text,
 text-carrying items with no path, chunk-only paths, which content keys appeared. A chunk is never
 invented a path - an item with text and no path stays unattributable and is counted as such. If
 `/query/data` fails or returns nothing usable the pass falls back to the `/query` retrieval it used
