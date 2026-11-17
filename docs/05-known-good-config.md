@@ -332,7 +332,11 @@ Gateway defaults that are **in force without being written in `.env`**:
    `/query/data` is unavailable or returns no usable chunk text the pass falls back to retrieving
    through `/query` (which does force a discarded generation) and logs
    `scoped_pass_retrieval_route` / `..._retrieval_fallback_reason` / `..._model_calls` so the route is
-   visible rather than inferred. Which of `data.references` or `data.chunks` carries the chunk text,
+   visible rather inferred. If **both** retrieval routes are rejected by LightRAG the request is not
+   failed: the pass reports `scoped_pass_declined_reason=retrieval_routes_failed:<codes>` and logs
+   `scoped_pass_retrieval_errors` (status code plus the server's validation message, never document
+   text), and the answer is served the way `citations` enforcement serves it — the ordinary answer with
+   the company filter still applied to the citations. Which of `data.references` or `data.chunks` carries the chunk text,
    and under which key, has not been observed on this stack: both are read, chunk items are grouped by
    document path, and the counts of each are logged (`scoped_pass_retrieval_shape`).
    `COMPANY_KEYWORD_HINT` (default false) is a separate opt-in that names the company in the

@@ -988,3 +988,49 @@ and none of the other company's — and now asserts the same on the fallback rou
 unchanged. `scripts/score_gl10_run.py` reports the new cost keys (`model_calls`, per-route counts,
 fallback reasons, hint applied) so a run shows which route actually ran. Suite:
 `1581 passed, 2 skipped, 304 subtests passed` (base `ebae97b`: 1569).
+
+## 2026-11-17 — URGENT fix: the scoped retrieval never sent the question (stack2 R2 HTTP 500)
+
+**Area:** `app/scoped_pass.py`, `app/api.py`, `app/observability.py` · **Tests:**
+`tests/test_scoped_pass.py` (+8, and the shared fake is now strict)
+**Flag:** inside `COMPANY_FROM_QUESTION` only; no new settings
+
+Hermes' stack2 R2 run stopped on its first scoped probe with HTTP 500: `POST /query/data` returned
+400 Bad Request and the fallback `POST /query` returned 422, and the 422 escaped as an unhandled
+`httpx.HTTPStatusError`. Root cause: **the retrieval body never carried the question.**
+`retrieve_context()` and `_retrieve_via_query()` both send `{**payload_base, include_references,
+include_chunk_content}`, but `payload_base` has no `query` — the gateway door builds it from
+mode/top_k/chunk_top_k (+ history) and the bridge door strips `query` deliberately. The `question`
+parameter was used only for the later generation call. LightRAG requires `query`, so both routes were
+rejected: strict scoping could not run at all on the stack.
+
+- `query` is now set inside the pass, on both routes, from the question the pass was given, rather
+  than trusted from the caller's base.
+- Both routes failing no longer raises. The pass returns `used=False` with
+  `declined_reason = retrieval_routes_failed:/query=422;/query/data=400`, and the request is served
+  the way `COMPANY_SCOPE_ENFORCEMENT=citations` serves it — the ordinary unscoped answer with the
+  company filter still applied to the citations. The gateway logs the scoped-pass metadata even when
+  the pass did not run, so the failure is visible instead of looking like a normal unscoped answer;
+  the bridge records the same in its log fields and continues on the stream. `stages_skipped_for_scope`
+  is no longer claimed in that case, because the unscoped pipeline really did run.
+- Rejections are diagnosable from the gateway log: `scoped_pass_retrieval_errors` carries the status
+  code and the server's validation message (whitespace-collapsed, capped at 300 chars — a 4xx body is
+  a validation problem, not document text) for each failed route.
+- The test double is the real fix for the class of bug. `FakeLightRAG` now validates every body the way
+  the server does — a missing or blank `query`, or any top-level key outside the 1.5.7 request field
+  list Hermes read from source (`query, mode, only_need_context, only_need_prompt, response_type,
+  top_k, chunk_top_k, max_entity_tokens, max_relation_tokens, max_total_tokens, hl_keywords,
+  ll_keywords, conversation_history, user_prompt, disable_user_prompt_prefix, enable_rerank,
+  include_references, include_chunk_content, include_progress, stream`) — and raises a stand-in
+  `HTTPStatusError`. The generation (`mode: bypass`) body is checked the same way. Deleting just the
+  `"query": question` line turns 32 of the 63 scoped-pass tests red; with it, 57 pass. A permissive
+  fake is how this reached a stack run.
+- New door-level tests: at the query door a rejected scoping returns the unscoped answer with the
+  company filter applied and the declined reason in `query_scope`; at the Open WebUI bridge it falls
+  back to the stream with the Sources block still filtered.
+
+Flag-off behaviour is unchanged. Suite: `1597 passed, 2 skipped, 306 subtests passed` (base `41a830e`:
+1589). **Not fixed, deliberately out of this brief:** a 4xx on the scoped pass's *generation* call
+still propagates as a 500. Its body is now covered by the strict fake, so a shape error there cannot
+appear silently, but a server-side refusal of the prompt itself (e.g. too long) is still an unhandled
+path and is worth its own row.
