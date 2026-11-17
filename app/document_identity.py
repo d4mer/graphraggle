@@ -46,6 +46,36 @@ def citation_path(citation: Any) -> str:
     return ""
 
 
+def company_slug(company: str) -> str:
+    """A filesystem-safe, joinable form of a company name.
+
+    Names arrive with spaces, ampersands and accents; LightRAG keeps whatever name it is given and the
+    join has to reproduce it exactly, so the qualified name is built from one rule, in one place.
+    """
+    slug = "".join(character.lower() if character.isalnum() else "-" for character in company)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-")
+
+
+def qualified_submitted_source(path_name: str, company: str | None) -> str:
+    """The name to submit upstream so two companies cannot share one stored basename.
+
+    LightRAG strips directories, so the name it keeps for a filesystem document is the file's own
+    basename - and `Contoso Pharma/q3.pdf` and `Northwind Chemicals/q3.pdf` arrive at the query side as
+    the same indistinguishable `q3.pdf`. Prefixing the submitted name with the company makes the name
+    LightRAG keeps unique, which is the only way the join stops being a guess for NEW ingests. Existing
+    documents are unaffected (they keep resolving through the basename rule) and nothing about the
+    bytes, the chunking or the state row's path changes - only the label upstream stores.
+    """
+    if not company:
+        return path_name
+    slug = company_slug(company)
+    if not slug:
+        return path_name
+    return f"{slug}--{path_name}"
+
+
 def basename_of(path: str) -> str:
     """Last path segment, for both POSIX and Windows-style separators.
 

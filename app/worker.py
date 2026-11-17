@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import document_identity
 from .config import settings
 from .lightrag_client import client
 from .docx_extract import DocxExtractError, extract_docx_payload
@@ -1158,11 +1159,26 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
         # what did the plan look like?" Counts and names only, never text.
         warnings_json = merge_warning_metadata(warnings_json, worker_updates=structure_updates)
 
+    # The name we send is the name the join will later have to recognise, so it is computed once, sent
+    # once, and written to the row. For the upload door LightRAG keeps the uploads-directory basename
+    # (already unique: "<uuid>--<name>"), which is recorded rather than invented.
+    if text_payload is not None:
+        # Only a document the gateway can attribute gets a company prefix: an unattributed file keeps
+        # today's name rather than gaining a label no row claims.
+        submitted_source = (document_identity.qualified_submitted_source(path.name, company)
+                            if (settings.company_qualified_file_source and company) else str(path))
+    else:
+        submitted_source = path.name
+
     try:
         if text_payload is not None:
             body: dict[str, Any] = {
                 "text": text_payload,
-                "file_source": str(path),
+                # What upstream stores as the document's name. LightRAG strips directories, so an
+                # absolute path here is stored as a bare basename and two companies end up sharing it;
+                # with COMPANY_QUALIFIED_FILE_SOURCE on, the submitted name carries the company and the
+                # join can stop guessing. Flag off: byte-identical to today.
+                "file_source": submitted_source,
             }
             if structure_params is not None:
                 # With the flag off this key is absent, so the request body is
@@ -1283,6 +1299,7 @@ async def submit_file(path: Path, source_type: str, digest: str, *, retry_reason
         company_source_detail=existing.get("company_source_detail") if existing else None,
         filename=filename or path.name,
         original_filename=original_filename or path.name,
+        submitted_source=submitted_source,
         sha256=digest,
         status="submitted",
         track_id=track_id,

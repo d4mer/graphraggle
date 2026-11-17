@@ -75,6 +75,14 @@ class Settings(BaseSettings):
     # default so a run can measure whether the bias is worth its effect on recall.
     company_keyword_hint: bool = Field(default=False, alias="COMPANY_KEYWORD_HINT")
 
+    # GL-10: submit a company-qualified `file_source` ("<company-slug>--<basename>") for new ingests so
+    # the name LightRAG keeps is unique per company, and record that exact name in `documents.
+    # submitted_source` (the join prefers it). Off by default: turning it on is a decision about future
+    # ingests, not a switch that changes existing documents - re-submitting an existing document under a
+    # new name creates a second LightRAG document, so this is applied to new files, not flipped over an
+    # already-indexed corpus.
+    company_qualified_file_source: bool = Field(default=False, alias="COMPANY_QUALIFIED_FILE_SOURCE")
+
     # packet-27: the worker extracts .pptx itself (python-pptx) into structured
     # text and submits it through /documents/text, because LightRAG's built-in
     # pptx extractor drops tables, grouped shapes, speaker notes and slide
