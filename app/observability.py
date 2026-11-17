@@ -265,6 +265,8 @@ def emit_query_log(
     """Write one /query log line from the query_scope metadata already built."""
     try:
         grounding = query_scope.get("grounding") or {}
+        scoped = query_scope.get("scoped_pass") or {}
+        company_scope = query_scope.get("company_scope") or {}
         line = {
             "request_id": request_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -318,6 +320,21 @@ def emit_query_log(
             # this row?" without counting rows where only the answer added an extra code.
             "grounding_supported": grounding.get("supported"),
             "grounding_asked_unsupported": grounding.get("asked_unsupported"),
+            # GL-10: what the question named and what the scoped pass did with it. Counts and
+            # company names only - never reference text. `..._unattributable` is the number that
+            # tells the operator how much of the corpus the scoped answer cannot see at all
+            # (upload-door citations), so a scoped run can be read without guessing.
+            "companies_detected": company_scope.get("companies"),
+            "company_detected_from": company_scope.get("company_detected_from"),
+            "company_candidates": company_scope.get("company_candidates"),
+            "scoped_pass": bool(scoped),
+            "scoped_pass_references_kept": scoped.get("references_kept"),
+            "scoped_pass_references_dropped_other_company": scoped.get(
+                "references_dropped_other_company"),
+            "scoped_pass_references_unattributable": scoped.get("references_unattributable"),
+            "scoped_pass_dropped_by_context_cap": scoped.get("references_dropped_by_context_cap"),
+            "scoped_pass_second_model_call": scoped.get("second_model_call"),
+            "scoped_pass_declined_reason": scoped.get("declined_reason"),
             "latency_ms_total": timer.total_ms(started),
             "latency_ms_by_stage": timer.elapsed_ms,
         }

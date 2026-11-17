@@ -318,11 +318,29 @@ Gateway defaults that are **in force without being written in `.env`**:
    scope to a company called Target. A question naming an organisation the store does not know
    stays unscoped (today's behaviour) and records what it saw as `company_candidates` in the log
    line, which is how the operator finds out what to alias.
-   **What part 2 does not do:** with the flag on it restricts the citations the gateway returns and
-   the Sources block the user sees, not what LightRAG retrieved or what the model was shown. The
-   query log line carries `company_scope` (companies matched, where from, candidates) so a run can
-   be scored for scoping before anything about retrieval changes. Retrieval-side scoping is the
-   next packet and needs the stack2 probe answers in `docs/decisions/gl10-company-from-question-map.md`.
+   `COMPANY_SCOPE_ENFORCEMENT` decides how far the scope reaches:
+   - `citations` (default) restricts the citations the gateway returns and the Sources block the
+     user sees. The answer is still whatever LightRAG produced from everything it retrieved.
+   - `retrieval` answers from the named companies' material only: retrieve with chunk content, drop
+     every reference whose `documents` row is not one of the named companies, and generate again
+     from what is left (`app/scoped_pass.py`, `mode: bypass` - the retrieve-then-generate pattern
+     `app/generation.py` already ships). The evidence-adding stages (multi-query, naive fallback,
+     graph expansion) are skipped while that pass runs, because they would put the other companies'
+     material back in.
+   **The trade-off is real and it is the operator's call.** `retrieval` costs a second model call,
+   and on the Open WebUI bridge it also loses the token stream (the answer arrives at the end, not
+   progressively). It is also only as good as attribution: a reference is kept only when its
+   `file_path` joins a `documents` row, and upload-door citations carry a basename that can never
+   equal the stored path, so on an upload-ingested corpus they are dropped as `unattributable` and a
+   scoped answer can come back "I could not find it". That count is in the log line
+   (`scoped_pass_references_unattributable`) precisely so a run can be read without guessing.
+   `COMPANY_SCOPED_CONTEXT_MAX_CHARS` (default 12000) caps the second call's prompt by dropping
+   whole references, never part of one.
+   The query log line carries `company_scope` (companies matched, where from, candidates) and the
+   scoped-pass counts, so a stack2 run can be scored for scoping before anything else changes. The
+   open questions that could make this cheaper - does v1.5.7 `/query` accept a document/path filter,
+   or support per-company workspaces - are listed in
+   `docs/decisions/gl10-company-from-question-map.md`; nothing in this packet assumes an answer.
 
 ## oMLX Behaviour Notes (measured 2026-10-09)
 

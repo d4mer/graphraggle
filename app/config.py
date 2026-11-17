@@ -54,6 +54,21 @@ class Settings(BaseSettings):
     # company that has no documents (app/company_scope.validate_aliases).
     company_aliases: str = Field(default="", alias="COMPANY_ALIASES")
 
+    # GL-10 part 3: how far the question-named company reaches. `citations` (the default) is part
+    # 2: the returned Sources are filtered and the answer is whatever LightRAG produced. `retrieval`
+    # answers from the named companies' material only: retrieve, drop every reference whose document
+    # row is not one of those companies, and generate again from what is left (app/scoped_pass.py).
+    # `retrieval` costs a second model call and, on the bridge, the token stream - which is exactly
+    # why it is an explicit value rather than a side effect of the flag above.
+    company_scope_enforcement: str = Field(default="citations", alias="COMPANY_SCOPE_ENFORCEMENT")
+
+    # Ceiling on the scoped pass's prompt, in characters, whole references only. Measured prompt
+    # pressure on this stack (docs/ops/runs/prompt-size-investigation.md) is the reason a cap exists
+    # at all; dropping a whole reference rather than cutting one keeps a citation in the prompt
+    # complete or absent.
+    company_scoped_context_max_chars: int = Field(default=12000,
+                                                  alias="COMPANY_SCOPED_CONTEXT_MAX_CHARS")
+
     # packet-27: the worker extracts .pptx itself (python-pptx) into structured
     # text and submits it through /documents/text, because LightRAG's built-in
     # pptx extractor drops tables, grouped shapes, speaker notes and slide

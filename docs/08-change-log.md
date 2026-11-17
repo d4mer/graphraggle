@@ -871,3 +871,37 @@ is the reading of the question, behind `COMPANY_FROM_QUESTION` (default **off**)
   `list_distinct_companies`, the company-set filter including the missing-row exclusion, and the
   bridge on/off/cross-company/unknown-name cases. Suite:
   `1509 passed, 2 skipped, 297 subtests passed` (base `317c077`: 1481).
+
+## 2026-11-17 — GL-10 part 3: the company named in the question scopes the answer, not just the Sources
+
+Part 2 filtered the citations after the answer existed, which leaves the model having answered from
+another company's material. Part 3 is `app/scoped_pass.py`: retrieve with `include_chunk_content`,
+drop every reference whose `documents` row does not belong to a company the question named, and
+generate again from what remains using `mode: bypass` — the retrieve-then-generate pattern
+`app/generation.py` already ships, so no unprobed upstream capability is assumed.
+
+- `COMPANY_SCOPE_ENFORCEMENT=citations` (default) is part 2's behaviour; `retrieval` turns the
+  scoped pass on. The master gate stays `COMPANY_FROM_QUESTION=false`, so with the shipped defaults
+  no part of this runs.
+- The evidence-**adding** stages are skipped while a scoped pass runs: multi-query rewrites, the
+  naive weak-signal fallback, and graph expansion would each put the excluded companies' material
+  back into the answer. They are recorded as `stages_skipped_for_scope`.
+- Attribution is the boundary, and it is honest about itself: a reference with no joinable
+  `documents` row (the upload-door basename case, `app/lightrag_client.py:25-31`) is dropped as
+  `unattributable` rather than assumed to belong to the company asked about. If nothing attributable
+  survives the answer says so — no second model call, and never a silent fall back to the unscoped
+  draft, including when the regeneration itself comes back blank.
+- The trade-off, stated in the docs rather than buried: `retrieval` costs a second model call and,
+  on the Open WebUI bridge, the token stream (`/query/stream` is not called at all on that path).
+  That is why it is an explicit value and why the operator, not the code, decides.
+- Log fields (counts and company names, never reference text): `companies_detected`,
+  `company_detected_from`, `company_candidates`, `scoped_pass`,
+  `scoped_pass_references_kept`, `..._dropped_other_company`, `..._unattributable`,
+  `..._dropped_by_context_cap`, `..._second_model_call`, `..._declined_reason`.
+- Tests: 22 new in `tests/test_scoped_pass.py`. The load-bearing one asserts that the prompt of the
+  second call contains the named company's chunk text and **not** the other company's. Also pinned:
+  two-company questions keep both; unattributable references refuse rather than guess; kept
+  references with no chunk text refuse while still listing the documents; a blank regeneration
+  refuses; the context cap drops whole references; `/query` makes exactly one upstream call at the
+  default enforcement and two at `retrieval`; the bridge does not stream when scoped.
+  Suite: `1531 passed, 2 skipped, 300 subtests passed` (base `317c077`: 1481).

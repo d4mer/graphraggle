@@ -1,0 +1,386 @@
+"""GL-10 part 3: the scoped pass — retrieve, restrict to the named companies, answer again.
+
+Why this exists
+---------------
+Part 2 filters the citations after the answer exists, so another company's material is still what
+the model answered from. This packet makes the retrieval result itself the boundary. The tests here
+are the proof of the one claim that matters: **the text handed to the second model call contains
+the named company's chunks and none of the other company's.** Everything else is bookkeeping.
+
+What the tests pin
+------------------
+- reference classification: the named companies' documents are kept, another company's are dropped,
+  and a reference the gateway cannot join to any row is dropped as unattributable (the upload-door
+  basename case) rather than assumed to belong here
+- a path owned by two companies (one ingested, one a `skipped` duplicate) is kept for either
+- the context cap drops whole references, never part of one, and counts what it dropped
+- nothing attributable survives -> an honest refusal, no second model call, no invented answer
+- kept references that carry no chunk text -> the same refusal, citations still shown
+- a blank regeneration -> refusal, never a silent pass-through of the unscoped draft
+- the `/query` door: with `COMPANY_SCOPE_ENFORCEMENT=citations` (the shipped default) exactly one
+  upstream call happens, as today; with `retrieval` there are two, the second is `mode: bypass`,
+  and the evidence-adding stages (multi-query, naive fallback, graph expansion) are skipped
+- the bridge door: with `retrieval` the streaming call is not made at all; with the default it is,
+  and no scoped pass runs
+
+The "LightRAG" here is a fake that records every payload; the store is a temp DB of invented rows.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import app.api as api
+import app.observability
+import app.scoped_pass as scoped_pass
+import app.state_store as state_store
+from app.models import QueryRequest
+
+NW = "Northwind Chemicals"
+CP = "Contoso Pharma"
+NW_PATH = "/source_docs/Northwind Chemicals/northwind-q3.pdf"
+CP_PATH = "/source_docs/Contoso Pharma/contoso-q3.pdf"
+GHOST_PATH = "contoso-q3.pdf"          # an upload-door basename: never joins a stored path
+NW_CHUNK = "Northwind lead times rose by four days in Q3."
+CP_CHUNK = "Contoso lead times fell by one day in Q3."
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _ref(index: str, path: str, chunks: list[str] | None) -> dict:
+    reference = {"reference_id": index, "file_path": path}
+    if chunks is not None:
+        reference["content"] = chunks
+    return reference
+
+
+class FakeLightRAG:
+    """Records payloads; answers a retrieval with fixed references and a bypass with fixed text."""
+
+    def __init__(self, references: list[dict], generation_text: str = "the scoped answer",
+                 response_text: str = "the unscoped draft answer") -> None:
+        self.references = references
+        self.generation_text = generation_text
+        self.response_text = response_text
+        self.calls: list[tuple[str, dict]] = []
+
+    async def post_json(self, path: str, payload: dict) -> dict:
+        self.calls.append((path, payload))
+        if payload.get("mode") == "bypass":
+            return {"response": self.generation_text}
+        return {"response": self.response_text, "references": self.references}
+
+    @property
+    def bypass_prompts(self) -> list[str]:
+        return [payload["query"] for _, payload in self.calls if payload.get("mode") == "bypass"]
+
+    @property
+    def retrieval_payloads(self) -> list[dict]:
+        return [payload for _, payload in self.calls if payload.get("mode") != "bypass"]
+
+
+class _TempStore(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="grg-gl10p3-")
+        self.base = Path(self._tmp.name)
+        settings = state_store.settings
+        self._saved = (settings.state_db_path, settings.source_docs_dir, settings.uploads_dir)
+        settings.state_db_path = str(self.base / "state.db")
+        settings.source_docs_dir = str(self.base / "source_docs")
+        settings.uploads_dir = str(self.base / "uploads")
+        (self.base / "source_docs").mkdir()
+        (self.base / "uploads").mkdir()
+        _run(state_store.init_db())
+        self.seed(NW_PATH, NW, document_id="doc-nw")
+        self.seed(CP_PATH, CP, document_id="doc-cp")
+
+    def tearDown(self) -> None:
+        for name, value in zip(("state_db_path", "source_docs_dir", "uploads_dir"), self._saved):
+            setattr(state_store.settings, name, value)
+        self._tmp.cleanup()
+
+    def seed(self, path: str, company: str | None, *, document_id: str,
+             status: str = "ingested") -> None:
+        _run(state_store.upsert_document(
+            document_id, path, "scan", company, Path(path).name, None, f"sha-{path}", status, None))
+
+
+class TestReferenceClassification(unittest.TestCase):
+    rows = {
+        NW_PATH: [{"path": NW_PATH, "company": NW}],
+        CP_PATH: [{"path": CP_PATH, "company": CP}],
+    }
+
+    def test_named_companies_are_kept_and_another_company_is_dropped(self):
+        refs = [_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])]
+        kept, counts = scoped_pass.classify_references(refs, self.rows, [NW])
+        self.assertEqual([ref["file_path"] for ref in kept], [NW_PATH])
+        self.assertEqual(counts, {"total": 2, "kept": 1, "other_company": 1, "unattributable": 0})
+
+    def test_an_unjoinable_reference_is_dropped_not_assumed(self):
+        refs = [_ref("1", GHOST_PATH, [CP_CHUNK])]
+        kept, counts = scoped_pass.classify_references(refs, self.rows, [CP])
+        self.assertEqual(kept, [])
+        self.assertEqual(counts["unattributable"], 1)
+
+    def test_a_path_owned_by_two_companies_is_kept_for_either(self):
+        rows = dict(self.rows)
+        rows[NW_PATH] = [{"path": NW_PATH, "company": NW}, {"path": NW_PATH, "company": CP}]
+        for allowed in ([NW], [CP], [NW, CP]):
+            with self.subTest(allowed=allowed):
+                kept, counts = scoped_pass.classify_references(
+                    [_ref("1", NW_PATH, [NW_CHUNK])], rows, allowed)
+                self.assertEqual(len(kept), 1)
+                self.assertEqual(counts["unattributable"], 0)
+
+    def test_a_row_with_no_company_is_unattributable(self):
+        rows = {"/source_docs/unscoped/x.pdf": [{"path": "/source_docs/unscoped/x.pdf",
+                                                 "company": None}]}
+        kept, counts = scoped_pass.classify_references(
+            [_ref("1", "/source_docs/unscoped/x.pdf", ["text"])], rows, [NW])
+        self.assertEqual(kept, [])
+        self.assertEqual(counts["unattributable"], 1)
+
+
+class TestContextBuilding(unittest.TestCase):
+    def test_whole_references_only_under_the_cap(self):
+        refs = [_ref("1", NW_PATH, ["a" * 100]), _ref("2", NW_PATH, ["b" * 100])]
+        # The cap counts the whole block, including its "Source:" line.
+        context, meta = scoped_pass.build_scoped_context(refs, 200)
+        self.assertIn("a" * 100, context)
+        self.assertNotIn("b" * 100, context, "a reference over the cap goes whole, not trimmed")
+        self.assertEqual(meta["dropped_by_cap"], 1)
+
+    def test_a_reference_without_text_is_counted_not_invented(self):
+        context, meta = scoped_pass.build_scoped_context([_ref("1", NW_PATH, None)], 1000)
+        self.assertEqual(context, "")
+        self.assertEqual(meta["without_content"], 1)
+
+    def test_list_and_string_content_both_reach_the_context(self):
+        reference = {"file_path": NW_PATH, "content": ["first chunk", "second chunk"]}
+        context, _ = scoped_pass.build_scoped_context([reference], 1000)
+        self.assertIn("first chunk\n\nsecond chunk", context)
+
+
+class TestScopedPass(_TempStore):
+    def test_the_second_call_sees_only_the_named_company_text(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass(
+            "what happened to lead times in Q3?", [NW],
+            payload_base={"mode": "mix", "top_k": 12, "chunk_top_k": 5}, client=client))
+        self.assertTrue(result.used)
+        self.assertEqual(result.answer, "the scoped answer")
+        self.assertEqual(len(client.bypass_prompts), 1)
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt)
+        self.assertNotIn(CP_CHUNK, prompt, "the whole point: the other company is not in the prompt")
+        self.assertIn(NW_PATH, prompt)
+        self.assertNotIn(CP_PATH, prompt)
+        self.assertEqual([c["file_path"] for c in result.citations], [NW_PATH])
+        self.assertEqual(result.meta["references_dropped_other_company"], 1)
+        self.assertTrue(result.meta["second_model_call"])
+
+    def test_a_cross_company_question_keeps_both_companies(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass(
+            "compare Northwind Chemicals and Contoso Pharma", [NW, CP],
+            payload_base={"mode": "mix"}, client=client))
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt)
+        self.assertIn(CP_CHUNK, prompt)
+        self.assertEqual(len(result.citations), 2)
+        self.assertFalse(result.meta["declined_reason"])
+
+    def test_retrieval_asks_for_chunk_content_and_generation_bypasses_retrieval(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        _run(scoped_pass.company_scoped_pass("q", [NW], payload_base={"mode": "mix", "top_k": 9},
+                                             client=client))
+        retrieval = client.retrieval_payloads[0]
+        self.assertTrue(retrieval["include_chunk_content"])
+        self.assertTrue(retrieval["include_references"])
+        self.assertEqual(retrieval["top_k"], 9)
+        self.assertEqual(client.calls[-1][1]["mode"], "bypass")
+        self.assertFalse(client.calls[-1][1]["include_references"])
+
+    def test_nothing_joinable_refuses_without_a_second_call(self):
+        client = FakeLightRAG([_ref("1", CP_PATH, [CP_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertEqual(client.bypass_prompts, [], "a refusal must not spend a model call")
+        self.assertIn("could not find", result.answer)
+        self.assertNotIn(CP_CHUNK, result.answer)
+        self.assertEqual(result.citations, [])
+        self.assertEqual(result.meta["declined_reason"], "no_reference_joins_a_named_company")
+
+    def test_an_unattributable_reference_leads_to_a_refusal_not_a_guess(self):
+        client = FakeLightRAG([_ref("1", GHOST_PATH, [CP_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("anything", [CP], payload_base={},
+                                                      client=client))
+        self.assertEqual(result.meta["references_unattributable"], 1)
+        self.assertEqual(client.bypass_prompts, [])
+        self.assertIn("could not find", result.answer)
+
+    def test_kept_references_without_chunk_text_refuse_but_still_show_documents(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, None)])
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertEqual(result.meta["declined_reason"], "kept_references_carry_no_chunk_text")
+        self.assertEqual([c["file_path"] for c in result.citations], [NW_PATH])
+        self.assertEqual(client.bypass_prompts, [])
+
+    def test_a_blank_regeneration_never_falls_back_to_the_unscoped_draft(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], generation_text="   ")
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertIn("could not find", result.answer)
+        self.assertNotIn("the unscoped draft answer", result.answer)
+        self.assertEqual(result.meta["declined_reason"], "regeneration_returned_no_text")
+
+    def test_the_context_cap_is_enforced_and_counted(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", NW_PATH, ["x" * 400])])
+        with patch.object(scoped_pass.settings, "company_scoped_context_max_chars", 120):
+            result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                          client=client))
+        self.assertNotIn("x" * 400, client.bypass_prompts[0])
+        self.assertEqual(result.meta["references_dropped_by_context_cap"], 1)
+
+    def test_no_companies_named_declines_the_pass_immediately(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("anything", [], payload_base={},
+                                                      client=client))
+        self.assertFalse(result.used)
+        self.assertEqual(client.calls, [])
+
+    def test_the_refusal_says_which_companies_were_searched(self):
+        message = scoped_pass.no_scoped_material_message([NW, CP])
+        self.assertIn(NW, message)
+        self.assertIn(CP, message)
+        self.assertNotIn(", and", message.split("documents of")[1][:60])
+
+
+class _PipelineSettings(unittest.TestCase):
+    """Everything that could add evidence of its own, held off so the door under test is visible."""
+
+    OFF = {
+        "multi_query_enabled": False,
+        "graph_native_enabled": False,
+        "graph_expansion_enabled": False,
+        "graph_synthesis_replace_answer": False,
+        "grounding_check_asked_identifier": False,
+        "rerank_enabled": False,
+        "rerank_binding_host": None,
+    }
+
+    def setUp(self) -> None:
+        patches = [patch.object(api.settings, name, value) for name, value in self.OFF.items()]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
+class TestQueryDoor(_TempStore, _PipelineSettings):
+    def test_default_enforcement_makes_one_upstream_call_as_today(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        with patch.object(api.settings, "company_from_question", True), \
+                patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                request_id="req-1", timer=api.StageTimer(), t_start=0.0))
+        self.assertEqual(len(client.calls), 1)
+        data = envelope.data if isinstance(envelope.data, dict) else envelope.data.model_dump()
+        self.assertEqual(data["answer"], "the unscoped draft answer")
+        self.assertEqual([c["file_path"] for c in data["citations"]], [NW_PATH])
+        self.assertNotIn("scoped_pass", data["query_scope"])
+
+    def test_retrieval_enforcement_answers_from_the_scoped_pass(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        with patch.object(api.settings, "company_from_question", True), \
+                patch.object(api.settings, "company_scope_enforcement", "retrieval"), \
+                patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                request_id="req-2", timer=api.StageTimer(), t_start=0.0))
+        data = envelope.data if isinstance(envelope.data, dict) else envelope.data.model_dump()
+        self.assertEqual(data["answer"], "the scoped answer")
+        self.assertEqual([c["file_path"] for c in data["citations"]], [NW_PATH])
+        self.assertEqual(len(client.bypass_prompts), 1)
+        self.assertNotIn(CP_CHUNK, client.bypass_prompts[0])
+        scope = data["query_scope"]
+        self.assertEqual(scope["scoped_pass"]["references_dropped_other_company"], 1)
+        self.assertEqual(scope["stages_skipped_for_scope"],
+                         ["multi_query", "naive_fallback", "graph_expansion"])
+        self.assertIn("regenerated", scope["warning"])
+
+    def test_the_flag_off_pipeline_never_runs_a_scoped_pass(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        with patch.object(api.settings, "company_from_question", False), \
+                patch.object(api.settings, "company_scope_enforcement", "retrieval"), \
+                patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                request_id="req-3", timer=api.StageTimer(), t_start=0.0))
+        data = envelope.data if isinstance(envelope.data, dict) else envelope.data.model_dump()
+        self.assertEqual(len(client.calls), 1, "the master flag gates everything")
+        self.assertEqual(data["answer"], "the unscoped draft answer")
+        self.assertNotIn("company_scope", data["query_scope"])
+
+
+class _BridgeResp:
+    def __init__(self, content: bytes):
+        self.content = content
+
+
+def _stream_body(chunks: list[dict]) -> bytes:
+    return "\n".join(json.dumps(c) for c in chunks).encode("utf-8")
+
+
+class TestBridgeDoor(_TempStore, _PipelineSettings):
+    stream_body = _stream_body([
+        {"references": [{"reference_id": "1", "file_path": NW_PATH},
+                        {"reference_id": "2", "file_path": CP_PATH}], "response": ""},
+        {"response": "streamed answer"},
+    ])
+
+    def _bridge(self, question: str, client: FakeLightRAG) -> str:
+        proxy = AsyncMock(return_value=_BridgeResp(self.stream_body))
+        client.proxy = proxy
+        with patch.object(api, "client", client), \
+                patch.object(api.settings, "bridge_sources_enabled", True):
+            answer = _run(api.answer_ollama_bridge_direct(
+                {"messages": [{"role": "user", "content": question}]}))
+        self.proxy_calls = proxy.call_count
+        return answer
+
+    def test_retrieval_enforcement_skips_the_stream_entirely(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        with patch.object(api.settings, "company_from_question", True), \
+                patch.object(api.settings, "company_scope_enforcement", "retrieval"):
+            answer = self._bridge("what did Northwind Chemicals report for Q3?", client)
+        self.assertTrue(answer.startswith("the scoped answer"))
+        self.assertIn("northwind-q3.pdf", answer)
+        self.assertNotIn("contoso-q3.pdf", answer)
+        self.assertNotIn("streamed answer", answer)
+        self.assertEqual(self.proxy_calls, 0, "the streaming call is not made when scoped")
+
+    def test_default_enforcement_keeps_the_stream_and_filters_only_the_sources(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        with patch.object(api.settings, "company_from_question", True), \
+                patch.object(api.settings, "company_scope_enforcement", "citations"):
+            answer = self._bridge("what did Northwind Chemicals report for Q3?", client)
+        self.assertIn("streamed answer", answer)
+        self.assertEqual(client.calls, [], "no scoped pass runs at the default enforcement")
+        self.assertEqual(self.proxy_calls, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

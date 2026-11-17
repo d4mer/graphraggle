@@ -48,6 +48,7 @@ from .keywords import KeywordResult, extract_keywords
 from .rewrite import RewriteResult, rewrite_query
 from .rerank import rerank_citations, truncate_citations
 from .company_scope import detect_companies, parse_alias_map, validate_aliases
+from .scoped_pass import ScopedPass, company_scoped_pass
 from .state_store import (
     build_company_attribution,
     derive_readiness,
@@ -566,6 +567,39 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     )
     kw_log = _keyword_log_fields(kw, kw_step_ms)
     rw_log = _rewrite_log_fields(rw, rw_step_ms)
+
+    # GL-10 part 3 on the path the operator actually uses. With COMPANY_SCOPE_ENFORCEMENT=retrieval
+    # and a company named, the bridge stops streaming: retrieve with chunk content, keep only the
+    # named companies' documents, answer from those. The trade (a second model call, no token
+    # stream) is written out in app/scoped_pass.py, and it is why the setting defaults to
+    # `citations` and this branch does not run by default.
+    if settings.company_from_question and settings.company_scope_enforcement == "retrieval":
+        company_meta = await resolve_company_scope(retrieval_query, None)
+        log_fields["company_scope"] = company_meta
+        if company_meta["company_mode"] != "unscoped":
+            scoped_base = {key: value for key, value in bridge_payload.items()
+                           if key not in ("query", "stream", "include_references",
+                                          "include_chunk_content", "response_type")}
+            scoped = await company_scoped_pass(
+                retrieval_query, list(company_meta["companies"]),
+                payload_base=scoped_base, client=client)
+            if scoped.used:
+                citations, _bridge_scope = await scope_query_citations(
+                    scoped.citations, requested_company=None,
+                    allowed_companies=list(company_meta["companies"]))
+                answer = scoped.answer
+                if settings.bridge_sources_enabled:
+                    answer += build_sources_block(citations)
+                log_fields["scoped_pass"] = scoped.meta
+                _safe_emit_bridge(
+                    log_fields, status="scoped_pass", answer_chars_raw=0,
+                    reasoning_chars_removed=0, answer_chars_final=len(answer),
+                    answer_words_final=len(answer.split()), reference_count=len(citations),
+                    canned_failure=False,
+                    honest_failure=scoped.meta.get("declined_reason") is not None,
+                    empty_retries_used=0, **kw_log, **rw_log)
+                return answer
+
     empty_retries_used = 0
     try:
         resp = await client.proxy(
@@ -1448,10 +1482,31 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
     fallback_answer_used = False
     all_citations_fallback: list[dict[str, Any]] = []
 
-    # ── First pass: original query ──────────────────────────────────────
-    timer.start("first_pass")
-    answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
-    timer.stop("first_pass")
+    # ── First pass: original query, or the company-scoped pass ──────────
+    # COMPANY_SCOPE_ENFORCEMENT=retrieval replaces the pass when the question named companies: an
+    # unscoped retrieval would put the other companies' material straight back into the answer this
+    # exists to keep out. The stages that ADD evidence (multi-query, naive fallback, graph
+    # expansion) are skipped for the same reason, and say so in the log.
+    scoped: ScopedPass | None = None
+    if allowed_companies and settings.company_scope_enforcement == "retrieval":
+        scoped_payload: dict[str, Any] = {"mode": retrieval_mode, "top_k": top_k,
+                                          "chunk_top_k": chunk_top_k}
+        if req.conversation_history:
+            scoped_payload["conversation_history"] = req.conversation_history
+        timer.start("scoped_pass")
+        scoped = await company_scoped_pass(req.query, allowed_companies,
+                                           payload_base=scoped_payload, client=client)
+        timer.stop("scoped_pass")
+
+    scoped_used = scoped is not None and scoped.used
+    if scoped_used:
+        assert scoped is not None
+        answer, all_citations = scoped.answer, scoped.citations
+        first_weak_reason = None
+    else:
+        timer.start("first_pass")
+        answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
+        timer.stop("first_pass")
     citations_raw = len(all_citations)
 
     # Compute weak signal from first pass
@@ -1464,13 +1519,16 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
     mq_error = None
     mq_rewrite_count = 0
 
-    if mq_enabled:
+    if mq_enabled and not scoped_used:
         mq_triggered, mq_trigger_reason = should_trigger_multi_query(
             req.query,
             transcript_keywords=mq_transcript_keywords,
             long_query_words=settings.multi_query_long_query_words,
             weak_signal=first_weak_signal,
         )
+
+    if scoped_used:
+        mq_trigger_reason = "skipped_company_scoped_pass"
 
     # ── Multi-query expansion (if triggered and enabled) ────────────────
     merged_citations = all_citations  # default: single-query path
@@ -1524,7 +1582,7 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
     # A precise answer citing a single document is not a failure, so the
     # naive-mode answer is only used when the primary answer is empty.
     weak_reason = None
-    if first_weak_reason and retrieval_mode != "bypass":
+    if first_weak_reason and retrieval_mode != "bypass" and not scoped_used:
         fallback_used = True
         fallback_reason = first_weak_reason
         fallback_mode = "naive"
@@ -1577,7 +1635,7 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
     graph_neighbor_count = 0
     graph_hops_used = 0
 
-    if graph_enabled:
+    if graph_enabled and not scoped_used:
         try:
             if not is_graph_expansion_target(req.query):
                 graph_error = "graph_query_family_skipped"
@@ -1746,6 +1804,10 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
         # what keeps the shipped response byte-for-byte what it was.
         query_scope["grounding"] = grounding_result
 
+    if scoped_used and scoped is not None:
+        query_scope["scoped_pass"] = scoped.meta
+        query_scope["stages_skipped_for_scope"] = [
+            "multi_query", "naive_fallback", "graph_expansion"]
     if company_scope_meta is not None:
         # Added only with the flag on, so an off-flag envelope is byte-identical. `company` and
         # `mode` above keep their existing meaning (what the CALLER asked for); this block is what
@@ -1758,7 +1820,13 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
             query_scope["companies"] = allowed_companies
 
     if requested_company is not None or allowed_companies:
-        query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
+        if settings.company_scope_enforcement == "retrieval":
+            query_scope["warning"] = ("The answer was regenerated from the retrieved references that "
+                                      "join a named company's documents; the rest of LightRAG's index "
+                                      "was still searched, and references the gateway cannot attribute "
+                                      "to any company were dropped")
+        else:
+            query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
 
     emit_query_log(
         request_id=request_id,
