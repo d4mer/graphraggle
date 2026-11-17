@@ -82,13 +82,46 @@ generation call at all: they come from the kept references, which go through the
 suffix are unchanged. LightRAG's own answer prompt is not reused; that is the honest cost of the
 guarantee, and it is why `COMPANY_SCOPE_ENFORCEMENT` defaults to `citations` and the operator decides.
 
+## Cost correction: the retrieval leg must not pay for an answer (2026-11-17)
+
+The first implementation retrieved the scoped material through `POST /query` with
+`include_chunk_content`. That was a retrieval **and a generation**: LightRAG wrote a complete answer
+that was thrown away, so a scoped question paid for two model calls while an unscoped one paid for
+one.
+
+LightRAG 1.5.7 has a retrieval-only endpoint, `POST /query/data` (same auth and body model), returning
+`status`, `message`, `data{entities, relationships, chunks, references}` and `metadata` with **no
+generation**; `include_chunk_content` puts chunk text into the returned items. Reading its source also
+confirmed the negative: there is no per-request document, file-path or workspace filter in `/query`, so
+post-filtering remains the only route. Only where the material comes from changes, not how it is
+scoped. A scoped question is now one retrieval plus one generation - the same cost as an unscoped one.
+
+The parsing is deliberately not a bet on an unobserved shape. Which list carries the chunk text
+(`references`, or `chunks`) and under which key has not been seen on this stack, so both are read;
+chunk items are grouped by document path, because the scoping decision is per document rather than per
+chunk; the accepted path keys are the ones this repo already has evidence for (`file_path`,
+`file_source`, `path`, `source`, `filename`) and the text is read through the shared citation accessor
+`app/citation_text.py`. Every run logs a census: references found, chunks found, items carrying text,
+text-carrying items with no path, chunk-only paths, which content keys appeared. A chunk is never
+invented a path - an item with text and no path stays unattributable and is counted as such. If
+`/query/data` fails or returns nothing usable the pass falls back to the `/query` retrieval it used
+before and records `retrieval_route` plus `retrieval_fallback_reason`, with `model_calls: 2` marking
+the discarded generation that route forces.
+
+`COMPANY_KEYWORD_HINT` (off by default) additionally names the scoped company in the
+`hl_keywords`/`ll_keywords` of the retrieval payload - the same keys the bridge already sends. That is
+a bias toward the right chunks in a bounded pool, never a boundary: the exclusion comes entirely from
+the state-store join, and a test asserts the hint does not stand in for the filter.
+
 ## What would change this ranking
 
 Answers to the stack questions in `docs/decisions/gl10-company-from-question-map.md`:
 
-- If LightRAG 1.5.7 `/query` accepts a document-id or path filter, the filter could move upstream and
-  design (b)'s second model call disappears — the guarantee stays, the cost drops. That is the single
-  most valuable probe.
+- ~~If LightRAG 1.5.7 `/query` accepts a document-id or path filter…~~ Answered: it does not, read
+  from the 1.5.7 source. What it does have is the retrieval-only `/query/data`, now used for the
+  retrieval leg, so the wasted generation is gone. A native path filter would still be worth having -
+  it would let the named company's material be retrieved rather than filtered after the fact, which
+  matters for recall on a large store - but it no longer buys a model call.
 - If it supports per-company workspaces with a shared-file exception, (d) becomes worth pricing
   against real numbers rather than the synthetic ones above.
 - If `only_need_context` returns per-chunk text with document ids, the filtering step could run

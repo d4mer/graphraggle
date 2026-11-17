@@ -327,8 +327,18 @@ Gateway defaults that are **in force without being written in `.env`**:
      `app/generation.py` already ships). The evidence-adding stages (multi-query, naive fallback,
      graph expansion) are skipped while that pass runs, because they would put the other companies'
      material back in.
-   **The trade-off is real and it is the operator's call.** `retrieval` costs a second model call,
-   and on the Open WebUI bridge it also loses the token stream (the answer arrives at the end, not
+   The retrieval leg uses LightRAG's retrieval-only `POST /query/data`, so `retrieval` does **not**
+   cost an extra model call - one retrieval plus one generation, like an unscoped question. If
+   `/query/data` is unavailable or returns no usable chunk text the pass falls back to retrieving
+   through `/query` (which does force a discarded generation) and logs
+   `scoped_pass_retrieval_route` / `..._retrieval_fallback_reason` / `..._model_calls` so the route is
+   visible rather than inferred. Which of `data.references` or `data.chunks` carries the chunk text,
+   and under which key, has not been observed on this stack: both are read, chunk items are grouped by
+   document path, and the counts of each are logged (`scoped_pass_retrieval_shape`).
+   `COMPANY_KEYWORD_HINT` (default false) is a separate opt-in that names the company in the
+   `hl_keywords`/`ll_keywords` of that retrieval; it changes recall, never the guarantee.
+   **The trade-off that remains is the operator's call.** On the Open WebUI bridge `retrieval` loses
+   the token stream (the answer arrives at the end, not
    progressively). It is also only as good as attribution: a reference is kept only when its
    `file_path` joins a `documents` row, and upload-door citations carry a basename that can never
    equal the stored path, so on an upload-ingested corpus they are dropped as `unattributable` and a

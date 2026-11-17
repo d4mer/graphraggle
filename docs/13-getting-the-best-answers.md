@@ -255,8 +255,14 @@ Two levels of "scoped", set by `COMPANY_SCOPE_ENFORCEMENT`:
 
 - `citations` (default): the Sources list is filtered. The answer is still whatever the retrieval
   produced, so it can be about material you did not ask for.
-- `retrieval`: the answer is written again from the named companies' documents only. It costs a
-  second model call, and in Open WebUI the answer arrives at the end instead of streaming.
+- `retrieval`: the answer is written again from the named companies' documents only. In Open WebUI the
+  answer arrives at the end instead of streaming. It does not cost an extra model call: the scoped
+  material is fetched from LightRAG's retrieval-only `/query/data` (no answer is generated to be thrown
+  away), so the question pays one retrieval and one generation like any other. If that endpoint is
+  unavailable the gateway falls back to retrieving through `/query`, which does cost the extra
+  generation, and the log says which ran (`scoped_pass_retrieval_route`, `..._model_calls`).
+  `COMPANY_KEYWORD_HINT` (off) only biases which chunks the retrieval pool holds; what keeps the other
+  company out is the document ownership check, never the keyword.
 
 If scoped retrieval finds nothing it says so plainly — "I could not find an answer to that in the
 … documents I was given". That is deliberate: an answer from another company's documents would be

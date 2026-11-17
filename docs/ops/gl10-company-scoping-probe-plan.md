@@ -102,5 +102,8 @@ behaviour; a GL-10 scorer is a sibling, not a modification of it.
   `references_dropped_other_company` and `references_kept` are the first real numbers for that.
 - Real-corpus attribution: the upload-door basename gap and any path drift between saved extractions
   and stored `documents.path`.
-- What the second model call costs on the deployment's model, and whether losing the token stream on
-  the bridge is acceptable to the operator. That is a product decision, not a measurement.
+- Whether losing the token stream on the bridge is acceptable to the operator. That is a product
+  decision, not a measurement. (The extra model call this used to imply is gone: the scoped pass
+  retrieves through `/query/data`, so R2 costs one retrieval and one generation. `R3`, the keyword
+  hint, is the run that measures whether naming the company in the retrieval keywords improves
+  recall.)

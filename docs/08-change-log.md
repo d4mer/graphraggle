@@ -948,3 +948,41 @@ reaches stdout) and 17 in `tests/test_make_gl10_probes.py` (shape counts, byte-i
 600, refuse-to-write-in-repo, the detection/sentence-copy properties across the whole built set, and
 each validation rule firing on a tampered row while writing nothing). Suite:
 `1569 passed, 2 skipped, 304 subtests passed` (base `17332fe`: 1538).
+
+## 2026-11-17 — GL-10 correction: the scoped pass retrieves through `/query/data`, not `/query`
+
+**Area:** `app/scoped_pass.py`, `app/config.py` · **Tests:** `tests/test_scoped_pass.py` (+12)
+**Flag:** the fix lives inside `COMPANY_FROM_QUESTION`; one new dark setting, `COMPANY_KEYWORD_HINT=false`
+
+Hermes read the production LightRAG 1.5.7 source: there is no per-request document, file-path or
+workspace filter in `/query`, so post-filtering really is the only route — but `POST /query/data`
+exists with the same auth and body model and returns `status`, `message`,
+`data{entities, relationships, chunks, references}` and `metadata` with **no LLM generation**. The
+scoped pass had been retrieving through `/query`, so LightRAG wrote a full answer that was thrown away
+and every scoped question paid for two generations while an unscoped question paid for one. The
+retrieval leg now calls `/query/data` with `include_references` and `include_chunk_content`: one
+retrieval plus one generation, the same cost as an unscoped question.
+
+The response shape has not been observed on this stack, so the code does not guess. `data.references`
+and `data.chunks` are both read; chunk items are grouped by document path, because the scoping decision
+is per document and not per chunk; the accepted path keys are `file_path`, `file_source`, `path`,
+`source`, `filename` — every name this repo already tolerates elsewhere — and the text is read through
+the shared `app/citation_text.py` accessor, which already handles string- and list-valued content. Each
+run logs a census (`scoped_pass_retrieval_shape`: references found, chunks found, items carrying text,
+text-carrying items with no path, chunk-only paths, content-key counts). A chunk is never invented a
+path: text with no path stays `unattributable` and is counted as such. If `/query/data` errors or
+yields nothing usable the pass falls back to the `/query` retrieval it used before and records
+`scoped_pass_retrieval_route`, `..._retrieval_fallback_reason` and `..._model_calls` (2 on that route,
+marking the discarded generation it forces). `second_model_call` keeps the meaning the scorer already
+reads; `model_calls` is what says whether it was genuinely second.
+
+`COMPANY_KEYWORD_HINT` (off) is the separate optional piece: it names the scoped company in the
+`hl_keywords`/`ll_keywords` of the retrieval payload — the same keys the Open WebUI bridge already
+sends. It is a bias toward the right chunks in a bounded pool, never a boundary; a test asserts that
+turning it on does not stand in for the ownership filter. The stack2 runbook gained `R3` for it.
+
+The load-bearing test still asserts that the generation prompt carries the named company's chunk text
+and none of the other company's — and now asserts the same on the fallback route. Flag-off behaviour is
+unchanged. `scripts/score_gl10_run.py` reports the new cost keys (`model_calls`, per-route counts,
+fallback reasons, hint applied) so a run shows which route actually ran. Suite:
+`1581 passed, 2 skipped, 304 subtests passed` (base `ebae97b`: 1569).
