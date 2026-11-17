@@ -52,11 +52,15 @@ first. It is the most common cause of a "bad answer".
 Differences that affect your answers:
 
 1. **Open WebUI always retrieves in `mix` mode with reranking on**, uses the last 3
-   conversation turns, and appends a **Sources** block to the answer. It has **no
-   company filter**: put the company or client name in the question itself.
+   conversation turns, and appends a **Sources** block to the answer. It never sends a
+   `company` field, so with `COMPANY_FROM_QUESTION=false` (the shipped default) it has
+   **no company filter**: put the company or client name in the question itself. With that
+   setting on, naming the company in the question IS the filter — see "Naming the
+   company" below.
 2. **`/query` defaults to `mix`** when `mode` is omitted (older pages that say
    `hybrid` are out of date). It can be scoped with `"company": "Acme Corp"`, which
-   returns only citations from that company's documents.
+   returns only citations from that company's documents. That field always wins over a
+   company named in the question text.
 3. In both, answers are generated from retrieved passages plus the knowledge graph.
    Neither can see a document that is not `query_ready`.
 
@@ -225,10 +229,40 @@ Work down this list; stop at the first fix.
 4. **Different words:** use the document's vocabulary, or the likely mis-transcription.
 5. **Different mode:** `naive` for exact wording; `mix` for relationships.
 6. **More depth:** `"top_k": 24` or add "transcript"/"meeting" to deepen retrieval.
-7. **Scope it:** on `/query` add `company`; in Open WebUI put the company in the
-   question.
+7. **Scope it:** name the company in the question — with `COMPANY_FROM_QUESTION=true`
+   that scopes both doors (in Open WebUI it is the only way); on `/query` the `company`
+   field still overrides whatever the question says.
 8. **Still wrong?** Capture the question, the answer, the citations and the time, and
    send them to the admin. Do not keep rephrasing indefinitely.
+
+## Naming the company (GL-10)
+
+With `COMPANY_FROM_QUESTION=true` you do not select a company and there is no syntax to learn:
+the company you name in the question is the company the answer comes from.
+
+- **One company named** → the answer and the Sources come from that company's documents.
+- **Two or more named** ("compare Northwind Chemicals and Contoso Pharma") → from those, and the
+  Sources show a company next to each document.
+- **None named** → everything, exactly as before. Naming nothing never fails.
+- Punctuation and capitalisation do not matter ("NORTHWIND CHEMICALS'" still matches), and a short
+  form can be taught with `COMPANY_ALIASES` (`Northwind Chemicals=nwind,north wind`).
+- A one-word company name that is also an ordinary word ("Target", "Pilot") only counts when you
+  capitalise it, so "what did the target say" does not silently scope anything.
+- A company the system has no documents for is not an error: the question is answered unscoped, and
+  the log records what it saw so the admin can add an alias.
+
+Two levels of "scoped", set by `COMPANY_SCOPE_ENFORCEMENT`:
+
+- `citations` (default): the Sources list is filtered. The answer is still whatever the retrieval
+  produced, so it can be about material you did not ask for.
+- `retrieval`: the answer is written again from the named companies' documents only. It costs a
+  second model call, and in Open WebUI the answer arrives at the end instead of streaming.
+
+If scoped retrieval finds nothing it says so plainly — "I could not find an answer to that in the
+… documents I was given". That is deliberate: an answer from another company's documents would be
+the worse failure. If you see it for a document you know exists, tell the admin which document; the
+usual cause is that the document was uploaded rather than filed under the company folder, so the
+gateway cannot tell which company owns it.
 
 An empty answer is rare (the Open WebUI bridge retries once automatically). If you get one, ask
 again; if it persists, report it.
