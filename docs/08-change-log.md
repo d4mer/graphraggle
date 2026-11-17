@@ -1034,3 +1034,56 @@ Flag-off behaviour is unchanged. Suite: `1597 passed, 2 skipped, 306 subtests pa
 still propagates as a 500. Its body is now covered by the strict fake, so a shape error there cannot
 appear silently, but a server-side refusal of the prompt itself (e.g. too long) is still an unhandled
 path and is worth its own row.
+
+## 2026-11-17 — GL-10 join fix: a citation's bare filename reaches its row (attribution has never worked end to end)
+
+**Area:** `app/document_identity.py` (new), `app/scoped_pass.py`, `app/api.py`, `app/state_store.py`,
+`app/worker.py`, `app/config.py`, `scripts/score_gl10_run.py` · **Tests:** +24 (`tests/test_document_identity.py`,
+`tests/test_worker_submitted_source.py`, `tests/test_gl10_basename_audit.py`, bare-filename cases in
+`tests/test_scoped_pass.py`)
+**New dark setting:** `COMPANY_QUALIFIED_FILE_SOURCE=false`
+
+Stack2 R1/R2 proved the company join never matched: every scoped question declined with
+`no_reference_joins_a_named_company` (unattributable 1046, kept 0), R1 dropped every scoped-row
+citation, and in R0 company was set on 0 of 815 citations. Cause: `get_documents_by_paths` is
+`WHERE path IN (...)`, but LightRAG strips directories at store time — the citation's `file_path` is a
+bare basename and `documents.path` is absolute. Hermes' report read this as stack2-only; it is
+production too (its `doc_status` values are bare filenames against absolute state paths), so **GL-09's
+attribution has never worked on the filesystem door**, and the GL-10 code ignored Hermes' GL-09 Q7
+finding that the join must key on BASENAME. The offline tests passed only because the fakes used
+matching paths.
+
+`app/document_identity.py` is now the single join used by every door, ordered and stated: recorded
+`documents.submitted_source` → exact `path` (upload door) → `filename` / `original_filename` → the
+citation's **basename** against those columns and the tail of `path` → content-hash widening. LIKE
+metacharacters in real filenames are escaped. SQL moved into `state_store` so name-fetched rows carry
+the same `query_ready` / `readiness_reason` annotation path-fetched rows do (a raw query in the first
+cut dropped them, caught by `test_skipped_duplicate_rows`).
+
+The basename rule is written down where it can be tested: rows agreeing on bytes, or belonging to one
+company, attribute to the union, so a `COMPANY_AWARE_DEDUPE` shared file stays reachable under either
+owner; rows with **different bytes for different companies** are ambiguous and are never attributed —
+counted apart (`scoped_pass_references_ambiguous`, `ambiguous_citation_count`) with its own decline
+reason (`every_reference_is_ambiguous_across_companies`). "Cannot tell" and "no owner" are different
+faults; conflating them sends an operator to re-ingest for a bug, or to ignore a real collision.
+
+`COMPANY_QUALIFIED_FILE_SOURCE` (off) makes new ingests unambiguous: the text door submits
+`<company-slug>--<basename>` and records it. A test proves the ingest payload's `text` and `chunking`
+object are identical with the flag on and off — the chunker is still called with the file's own name, so
+no header or piece boundary moves — and an unattributed document is never given a prefix. `documents.
+submitted_source` is a nullable column on the normal migration path, with a test that builds a
+pre-migration database, migrates it and asserts the row survives with the new column NULL.
+
+`scripts/score_gl10_run.py` reads the log shape the gateway actually emits (flat `scoped_pass_*` keys
+beside a boolean `scoped_pass`) instead of calling `.get()` on that boolean and raising; both shapes
+score, and the fixtures are now real `emit_query_log` projections rather than hand-written lookalikes —
+which is how the mismatch survived review.
+
+`scripts/gl10_basename_audit.py` answers the re-ingest question from a corpus or a state database:
+measured on this stack2 corpus, 30 files / 26 basenames → 22 unique, 1 shared identical, **3 ambiguous**
+(`inbox-scanning-procedure-copy-a.txt`, `inbox-scanning-procedure-copy-b.txt`, `manifest.json`), no
+qualified-name prefix collisions. So R1/R2/R3 can re-run on the existing index with the join alone.
+
+Reported, not fixed: because `.json` is a text extension, each company's generator `manifest.json` is
+ingested — and it lists the planted fact codes. That is a probe-hygiene problem for synthetic runs.
+Suite: `1637 passed, 2 skipped, 316 subtests passed` (base `0830fa3`: 1617).

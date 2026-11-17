@@ -266,9 +266,16 @@ Two levels of "scoped", set by `COMPANY_SCOPE_ENFORCEMENT`:
 
 If scoped retrieval finds nothing it says so plainly — "I could not find an answer to that in the
 … documents I was given". That is deliberate: an answer from another company's documents would be
-the worse failure. If you see it for a document you know exists, tell the admin which document; the
-usual cause is that the document was uploaded rather than filed under the company folder, so the
-gateway cannot tell which company owns it.
+the worse failure. If you see it for a document you know exists, tell the admin which document. The
+two causes an admin can actually act on:
+
+- the document is not under a company folder (an upload, or a folder the store has no company for), so
+  the gateway cannot tell who owns it — the log counts these as `scoped_pass_references_unattributable`;
+- **two companies have different files with the same filename**. The gateway will not guess which one a
+  citation meant, so it refuses and counts `scoped_pass_references_ambiguous`. That is an ingest
+  problem, not a search problem: the fix is a re-ingest under
+  `COMPANY_QUALIFIED_FILE_SOURCE=true`, which gives each company's file a distinct stored name. Ask the
+  admin to run the audit in `docs/ops/gl10-stack2-runbook.md` to see which names collide.
 
 An empty answer is rare (the Open WebUI bridge retries once automatically). If you get one, ask
 again; if it persists, report it.

@@ -88,6 +88,26 @@ QUERY_LOG_PATH=/app/logs/gl10-R0.query-log.jsonl   # and -R1, -R2
 (`./logs/` is bind-mounted, so the host path is `logs/gl10-R<run>.query-log.jsonl`.) Truncate or
 remove the previous run's file before starting a run so one capture never mixes two runs.
 
+## Before the runs: audit the name space (one command, read-only)
+
+```bash
+python scripts/gl10_basename_audit.py \
+  --state-db /srv/graphraggle/state/state.db \
+  --corpus "/app/source_docs/Northwind Chemicals" --corpus "/app/source_docs/Contoso Pharma" \
+  --show-names --json logs/gl10-basename-audit.json
+```
+
+It counts basenames apart: `unique`, `shared_identical` (same bytes, both owners reachable - correct),
+and `ambiguous` (one name, different bytes, different companies - those citations are refused, and only
+a re-ingest under `COMPANY_QUALIFIED_FILE_SOURCE=true` fixes them). Measured on this index on
+2026-11-17: 30 files, 26 distinct basenames, 22 unique, 1 shared identical
+(`cutover-freeze-checklist.txt`), 3 ambiguous - `inbox-scanning-procedure-copy-a.txt`,
+`inbox-scanning-procedure-copy-b.txt` (the planted cross-company duplicate pair) and `manifest.json`
+(the generator writes one per company; `.json` is ingested as text, so each company's manifest is in
+the index and lists planted fact codes - report that separately, it is a probe-hygiene problem, not a
+join problem). No qualified-name prefix collisions. **Rule (1) alone is enough to re-run R1/R2/R3 on
+the existing index; no re-ingest for the measurement.**
+
 ## Probe rows
 
 49 rows per company, ten shapes: `scoped` 12, `cross_company` 9, `unscoped` 6, `unanswerable` 6,

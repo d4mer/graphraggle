@@ -339,6 +339,25 @@ Gateway defaults that are **in force without being written in `.env`**:
    the company filter still applied to the citations. Which of `data.references` or `data.chunks` carries the chunk text,
    and under which key, has not been observed on this stack: both are read, chunk items are grouped by
    document path, and the counts of each are logged (`scoped_pass_retrieval_shape`).
+   The citation→document join is shared by every door (`app/document_identity.py`) and is ordered:
+   the recorded `documents.submitted_source`, then exact `path`, then `filename` /
+   `original_filename`, then the citation's **basename** against those columns and the tail of `path`,
+   then content-hash widening. The basename step is not a convenience: LightRAG strips directories from
+   `file_source`, so a citation's `file_path` is a bare filename while `documents.path` is absolute —
+   an exact-path join attributed nothing on the filesystem door (stack2 R0: 815 citations, company set
+   on 0). One stored name holding **different bytes for different companies** is never attributed: the
+   citation is dropped and counted (`scoped_pass_references_ambiguous`,
+   `ambiguous_citation_count` on a citation scope) because guessing here credits one company with
+   another's document.
+   `COMPANY_QUALIFIED_FILE_SOURCE` (default false) makes that case impossible for **new** ingests: the
+   text door submits `<company-slug>--<basename>` and records it in `documents.submitted_source`, the
+   key the join prefers. It changes no bytes, no chunk boundaries and no chunker header (a test submits
+   the same file with the flag on and off and compares the payload); the upload door already stores a
+   unique `<uuid>--<name>`, and its name is now recorded rather than inferred. Treat it as a policy for
+   future files: re-submitting an existing document under a new name creates a second LightRAG document,
+   and every existing row keeps resolving through the basename rule.
+   `scripts/gl10_basename_audit.py` counts the cases apart over a corpus or a state database, which is
+   how you decide whether a corpus needs that re-ingest or the join alone is enough.
    `COMPANY_KEYWORD_HINT` (default false) is a separate opt-in that names the company in the
    `hl_keywords`/`ll_keywords` of that retrieval; it changes recall, never the guarantee.
    **The trade-off that remains is the operator's call.** On the Open WebUI bridge `retrieval` loses
