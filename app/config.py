@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     company_scoped_context_max_chars: int = Field(default=12000,
                                                   alias="COMPANY_SCOPED_CONTEXT_MAX_CHARS")
 
+    # GL-10: name the scoped companies in the retrieval keywords (`hl_keywords`/`ll_keywords`) so
+    # similar chunks from other companies are less likely to fill the pool. A bias, not a boundary:
+    # the state-join filter is what excludes, and the guarantee does not depend on this. Off by
+    # default so a run can measure whether the bias is worth its effect on recall.
+    company_keyword_hint: bool = Field(default=False, alias="COMPANY_KEYWORD_HINT")
+
     # packet-27: the worker extracts .pptx itself (python-pptx) into structured
     # text and submits it through /documents/text, because LightRAG's built-in
     # pptx extractor drops tables, grouped shapes, speaker notes and slide

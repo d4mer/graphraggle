@@ -33,11 +33,166 @@ this packet exists to prevent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
-from .citation_text import citation_content
+from .citation_text import CITATION_TEXT_KEYS, citation_content
 from .config import settings
 from .state_store import get_documents_by_paths, get_documents_by_sha256
+
+# Which keys carry a document's path. `file_path` is what /query references use; `file_source` is
+# what the worker submits upstream; the others are the names the gateway already tolerates in
+# app/api.py. The chunk items of /query/data have not been seen on this stack, so the reader accepts
+# every name the repo has evidence for and counts what it found rather than betting on one.
+PATH_KEYS: tuple[str, ...] = ("file_path", "file_source", "path", "source", "filename")
+
+
+def path_of(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    for key in PATH_KEYS:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Turn a `/query/data` body into reference-shaped items, plus a census of what was there.
+
+    `/query/data` returns `data{entities, relationships, chunks, references}` with no generation, and
+    `include_chunk_content` puts chunk text into the reference items. Which of the two lists carries
+    the text, and under which key, has not been observed on this stack - so both are read, both are
+    counted, and the caller decides whether the result is usable. Chunk items are grouped by their
+    document path, because the scoping decision is per document, not per chunk. A chunk is never
+    invented a path it does not carry: an item with text and no path stays pathless and is then
+    counted as unattributable, exactly as an unattributable citation is.
+    """
+    census: dict[str, Any] = {"top_level_keys": sorted(payload) if isinstance(payload, dict) else [],
+                              "data_keys": [], "references_found": 0, "chunks_found": 0,
+                              "items_with_text": 0, "items_without_path": 0,
+                              "chunk_only_paths": 0, "content_keys_seen": {}}
+    if not isinstance(payload, dict):
+        return [], census
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = payload                                    # tolerate a body with no envelope
+    census["data_keys"] = sorted(data)
+
+    items: list[dict[str, Any]] = []
+    paths_with_text: set[str] = set()
+    references = data.get("references")
+    if isinstance(references, list):
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            census["references_found"] += 1
+            text = citation_content(reference)
+            if text:
+                census["items_with_text"] += 1
+                paths_with_text.add(path_of(reference))
+                for key in CITATION_TEXT_KEYS:
+                    if reference.get(key) is not None:
+                        census["content_keys_seen"][key] = census["content_keys_seen"].get(key, 0) + 1
+            items.append(reference)
+
+    chunks = data.get("chunks")
+    if isinstance(chunks, list):
+        grouped: dict[str, list[str]] = {}
+        order: list[str] = []
+        for chunk in chunks:
+            census["chunks_found"] += 1
+            text = citation_content(chunk)
+            if not text:
+                continue
+            path = path_of(chunk) or ""
+            if path in paths_with_text:
+                continue                                   # the reference already carries this doc
+            if path not in grouped:
+                grouped[path] = []
+                order.append(path)
+            grouped[path].append(text)
+        for path in order:
+            census["chunk_only_paths"] += 1
+            census["items_with_text"] += 1
+            if not path:
+                census["items_without_path"] += 1
+            items.append({"file_path": path, "content": grouped[path]})
+    census["content_key_counts"] = census.pop("content_keys_seen")
+    return items, census
+
+
+def apply_keyword_hint(payload: dict[str, Any], companies: Sequence[str]) -> bool:
+    """Add the named companies to the retrieval keywords. Returns whether anything was added.
+
+    The bridge already supplies `hl_keywords`/`ll_keywords`, so the keys are known, and a payload may
+    already carry question keywords - those are kept and the company names appended, never replaced.
+    This cannot exclude anything: the state-join filter is what excludes. It is a separate opt-in whose
+    only claim is to pull the right company's chunks into a bounded retrieval pool.
+    """
+    names = [name for name in companies if name]
+    if not names:
+        return False
+    added = False
+    for key in ("hl_keywords", "ll_keywords"):
+        existing = payload.get(key)
+        merged = [item for item in (existing if isinstance(existing, list) else [])
+                  if isinstance(item, str)]
+        before = len(merged)
+        merged += [name for name in names if name not in merged]
+        payload[key] = merged
+        added = added or len(merged) > before
+    return added
+
+
+async def retrieve_context(question: str, payload_base: dict[str, Any], client: Any,
+                           companies: Sequence[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Get the chunk text and document paths WITHOUT paying for an answer that will be thrown away.
+
+    `/query/data` is the retrieval-only endpoint; a scoped question then costs one retrieval and one
+    generation, the same as an unscoped one. It is tried first and abandoned on evidence, not on
+    assumption: if the call fails, or the body carries no usable chunk text, the pass falls back to
+    the `/query` retrieval it used before (which does cost an extra generation) and records why.
+    """
+    # Counted separately from the answer the pass later writes, so a run that declines before
+    # generating does not report a generation it never made.
+    meta: dict[str, Any] = {"retrieval_route": "query/data", "retrieval_fallback_reason": None,
+                            "keyword_hint_applied": False, "retrieval_model_calls": 0}
+    payload = {**payload_base, "include_references": True, "include_chunk_content": True}
+    if settings.company_keyword_hint:
+        meta["keyword_hint_applied"] = apply_keyword_hint(payload, companies)
+    try:
+        body = await client.post_json("/query/data", payload)
+    except Exception as exc:
+        meta["retrieval_route"] = "query"
+        meta["retrieval_fallback_reason"] = f"query_data_error:{type(exc).__name__}"
+        return await _retrieve_via_query(question, payload_base, client, meta, companies)
+
+    items, census = normalize_data_payload(body)
+    meta["retrieval_shape"] = census
+    if not any(citation_content(item) for item in items):
+        meta["retrieval_route"] = "query"
+        meta["retrieval_fallback_reason"] = ("query_data_no_chunks" if items
+                                             else "query_data_no_items")
+        return await _retrieve_via_query(question, payload_base, client, meta, companies)
+    return items, meta
+
+
+async def _retrieve_via_query(question: str, payload_base: dict[str, Any], client: Any,
+                              meta: dict[str, Any],
+                              companies: Sequence[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The route this code used before: retrieve through the answered endpoint, and pay for it."""
+    payload = {**payload_base, "include_references": True, "include_chunk_content": True}
+    if settings.company_keyword_hint:
+        meta["keyword_hint_applied"] = apply_keyword_hint(payload, companies)
+    body = await client.post_json("/query", payload)
+    references = body.get("references") if isinstance(body, dict) else None
+    items = [item for item in (references or []) if isinstance(item, dict)]
+    meta["retrieval_shape"] = {"references_found": len(items),
+                               "items_with_text": sum(1 for item in items if citation_content(item))}
+    # The answered endpoint cannot retrieve without generating, so this route always costs one model
+    # call whose text is thrown away.
+    meta["retrieval_model_calls"] = 1
+    return items, meta
 
 
 def no_scoped_material_message(companies: list[str]) -> str:
@@ -118,7 +273,7 @@ def classify_references(
     kept: list[dict[str, Any]] = []
     counts = {"total": len(references), "kept": 0, "other_company": 0, "unattributable": 0}
     for reference in references:
-        path = reference.get("file_path") or reference.get("path") or ""
+        path = path_of(reference)
         companies = owners_by_path.get(path) or set()
         if not companies:
             counts["unattributable"] += 1
@@ -167,11 +322,10 @@ async def company_scoped_pass(
     if not allowed_companies:
         return ScopedPass(answer="", used=False)
 
-    payload = {**payload_base, "include_references": True, "include_chunk_content": True}
-    retrieval = await client.post_json("/query", payload)
-    references = retrieval.get("references") or []
+    references, retrieval_meta = await retrieve_context(question, payload_base, client,
+                                                         allowed_companies)
 
-    paths = sorted({str(ref.get("file_path") or ref.get("path") or "") for ref in references} - {""})
+    paths = sorted({path_of(reference) for reference in references} - {""})
     owners_by_path = await companies_for_paths(paths)
     kept, counts = classify_references(references, owners_by_path, allowed_companies)
     context, context_meta = build_scoped_context(kept, settings.company_scoped_context_max_chars)
@@ -186,7 +340,15 @@ async def company_scoped_pass(
         "references_without_content": context_meta["without_content"],
         "context_chars": context_meta["context_chars"],
         "context_max_chars": settings.company_scoped_context_max_chars,
+        # `second_model_call` is kept as the log/scorer key it already is. Under `/query/data` it is
+        # the only model call the pass makes - `model_calls` says which - and it is genuinely the
+        # second one only on the `/query` fallback route.
         "second_model_call": False,
+        "model_calls": retrieval_meta.get("retrieval_model_calls", 0),
+        "retrieval_route": retrieval_meta["retrieval_route"],
+        "retrieval_fallback_reason": retrieval_meta["retrieval_fallback_reason"],
+        "keyword_hint_applied": retrieval_meta["keyword_hint_applied"],
+        "retrieval_shape": retrieval_meta.get("retrieval_shape", {}),
         "declined_reason": None,
     }
 
@@ -203,6 +365,7 @@ async def company_scoped_pass(
                           meta=meta, used=True)
 
     meta["second_model_call"] = True
+    meta["model_calls"] = retrieval_meta.get("retrieval_model_calls", 0) + 1
     generation = await client.post_json(
         "/query",
         {"query": scoped_generation_prompt(question, allowed_companies, context),

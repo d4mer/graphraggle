@@ -33,6 +33,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -65,20 +66,42 @@ def _ref(index: str, path: str, chunks: list[str] | None) -> dict:
 
 
 class FakeLightRAG:
-    """Records payloads; answers a retrieval with fixed references and a bypass with fixed text."""
+    """Records payloads; answers a retrieval with fixed references and a bypass with fixed text.
+
+    `/query/data` is answered with the envelope the brief describes (`status`, `message`,
+    `data{entities, relationships, chunks, references}`) unless a test supplies its own body or makes
+    the endpoint fail, which is how the fallback routes are exercised.
+    """
+
+    DEFAULT = object()
 
     def __init__(self, references: list[dict], generation_text: str = "the scoped answer",
-                 response_text: str = "the unscoped draft answer") -> None:
+                 response_text: str = "the unscoped draft answer", *,
+                 data_payload: object = DEFAULT, data_raises: Exception | None = None) -> None:
         self.references = references
         self.generation_text = generation_text
         self.response_text = response_text
+        self.data_payload = data_payload
+        self.data_raises = data_raises
         self.calls: list[tuple[str, dict]] = []
 
     async def post_json(self, path: str, payload: dict) -> dict:
         self.calls.append((path, payload))
         if payload.get("mode") == "bypass":
             return {"response": self.generation_text}
+        if path == "/query/data":
+            if self.data_raises is not None:
+                raise self.data_raises
+            if self.data_payload is not self.DEFAULT:
+                return self.data_payload
+            return {"status": "success", "message": "ok",
+                    "data": {"entities": [], "relationships": [], "chunks": [],
+                             "references": self.references}}
         return {"response": self.response_text, "references": self.references}
+
+    @property
+    def paths(self) -> list[str]:
+        return [path for path, _ in self.calls]
 
     @property
     def bypass_prompts(self) -> list[str]:
@@ -237,14 +260,21 @@ class TestScopedPass(_TempStore):
 
     def test_retrieval_asks_for_chunk_content_and_generation_bypasses_retrieval(self):
         client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
-        _run(scoped_pass.company_scoped_pass("q", [NW], payload_base={"mode": "mix", "top_k": 9},
-                                             client=client))
+        result = _run(scoped_pass.company_scoped_pass("q", [NW],
+                                                      payload_base={"mode": "mix", "top_k": 9},
+                                                      client=client))
+        # One retrieval plus one generation: the retrieval goes to the retrieval-only endpoint, so no
+        # answer is written and thrown away.
+        self.assertEqual(client.paths, ["/query/data", "/query"])
         retrieval = client.retrieval_payloads[0]
         self.assertTrue(retrieval["include_chunk_content"])
         self.assertTrue(retrieval["include_references"])
         self.assertEqual(retrieval["top_k"], 9)
         self.assertEqual(client.calls[-1][1]["mode"], "bypass")
         self.assertFalse(client.calls[-1][1]["include_references"])
+        self.assertEqual(result.meta["model_calls"], 1)
+        self.assertEqual(result.meta["retrieval_route"], "query/data")
+        self.assertFalse(result.meta["retrieval_fallback_reason"])
 
     def test_nothing_joinable_refuses_without_a_second_call(self):
         client = FakeLightRAG([_ref("1", CP_PATH, [CP_CHUNK])])
@@ -481,6 +511,234 @@ class TestBridgeDoor(_TempStore, _PipelineSettings):
         self.assertIn("streamed answer", answer)
         self.assertEqual(client.calls, [], "no scoped pass runs at the default enforcement")
         self.assertEqual(self.proxy_calls, 1)
+
+
+class TestQueryDataRoute(_TempStore):
+    """The retrieval leg: which endpoint, which keys, and what makes it fall back."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_hint = scoped_pass.settings.company_keyword_hint
+
+    def tearDown(self):
+        scoped_pass.settings.company_keyword_hint = self._saved_hint
+        super().tearDown()
+
+    def _pass(self, client, companies=(NW,)):
+        return _run(scoped_pass.company_scoped_pass("What changed on the line?", list(companies),
+                                                    payload_base={"mode": "mix", "top_k": 9},
+                                                    client=client))
+
+    def test_chunks_only_body_is_grouped_by_document(self):
+        client = FakeLightRAG([], data_payload={"data": {"chunks": [
+            {"file_path": NW_PATH, "content": NW_CHUNK},
+            {"file_path": NW_PATH, "content": "Northwind ran at 82 per cent utilisation."},
+            {"file_path": CP_PATH, "content": CP_CHUNK}],
+            "references": []}})
+        result = self._pass(client)
+        self.assertEqual([c.get("file_path") for c in result.citations], [NW_PATH])
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt)
+        self.assertNotIn(CP_CHUNK, prompt)
+        self.assertEqual(result.meta["retrieval_shape"]["chunks_found"], 3)
+        self.assertEqual(result.meta["retrieval_shape"]["chunk_only_paths"], 2)
+
+    def test_chunk_keys_the_gateway_already_tolerates_are_accepted(self):
+        items, census = scoped_pass.normalize_data_payload({"data": {"chunks": [
+            {"file_source": CP_PATH, "text": CP_CHUNK}]}})
+        self.assertEqual(scoped_pass.path_of(items[0]), CP_PATH)
+        self.assertEqual(census["items_with_text"], 1)
+
+    def test_references_win_when_they_already_carry_the_document(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              data_payload={"data": {"references": [_ref("1", NW_PATH, [NW_CHUNK])],
+                                                     "chunks": [{"file_path": NW_PATH,
+                                                                 "content": "duplicate chunk"}]}})
+        result = self._pass(client)
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt)
+        self.assertNotIn("duplicate chunk", prompt)      # not counted twice into the context
+        self.assertEqual(result.meta["retrieval_shape"]["chunk_only_paths"], 0)
+        self.assertEqual([c.get("file_path") for c in result.citations], [NW_PATH])
+
+    def test_text_without_a_path_stays_unattributable(self):
+        client = FakeLightRAG([], data_payload={"data": {"chunks": [{"content": NW_CHUNK}],
+                                                         "references": []}})
+        result = self._pass(client)
+        self.assertEqual(result.meta["retrieval_shape"]["items_without_path"], 1)
+        self.assertEqual(result.meta["references_kept"], 0)
+        self.assertEqual(result.meta["references_unattributable"], 1)
+        self.assertEqual(result.meta["declined_reason"], "no_reference_joins_a_named_company")
+        self.assertEqual(result.citations, [])
+
+    def test_an_absent_query_data_endpoint_falls_back_and_pays_for_the_generation(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              data_raises=RuntimeError("404 from /query/data"))
+        result = self._pass(client)
+        self.assertEqual(client.paths, ["/query/data", "/query", "/query"])
+        self.assertEqual(result.meta["retrieval_route"], "query")
+        self.assertTrue(result.meta["retrieval_fallback_reason"].startswith("query_data_error:"))
+        self.assertEqual(result.meta["model_calls"], 2)   # the discarded answer this route forces
+        self.assertEqual([c.get("file_path") for c in result.citations], [NW_PATH])
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt)
+        self.assertNotIn(CP_CHUNK, prompt)               # the guarantee survives the fallback
+
+    def test_a_query_data_body_with_no_usable_text_falls_back(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              data_payload={"status": "success", "message": "ok",
+                                            "data": {"entities": [], "relationships": [],
+                                                     "chunks": [], "references": []}})
+        result = self._pass(client)
+        self.assertEqual(result.meta["retrieval_route"], "query")
+        self.assertEqual(result.meta["retrieval_fallback_reason"], "query_data_no_items")
+        self.assertEqual([c.get("file_path") for c in result.citations], [NW_PATH])
+
+    def test_a_body_of_the_wrong_shape_falls_back_rather_than_crashing(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], data_payload={"detail": "not what we asked for"})
+        result = self._pass(client)
+        self.assertEqual(result.meta["retrieval_fallback_reason"], "query_data_no_items")
+        self.assertEqual([c.get("file_path") for c in result.citations], [NW_PATH])
+
+    def test_the_shape_census_is_logged_without_content(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._pass(client)
+        census = result.meta["retrieval_shape"]
+        self.assertEqual(census["references_found"], 1)
+        self.assertEqual(census["items_with_text"], 1)
+        self.assertEqual(census["content_key_counts"], {"content": 1})
+        self.assertNotIn(NW_CHUNK, json.dumps(census))
+
+
+class TestCompanyKeywordHint(_TempStore):
+    """A retrieval bias, off by default, never a guarantee."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_hint = scoped_pass.settings.company_keyword_hint
+
+    def tearDown(self):
+        scoped_pass.settings.company_keyword_hint = self._saved_hint
+        super().tearDown()
+
+    def _pass(self, client):
+        return _run(scoped_pass.company_scoped_pass("What changed on the line?", [NW],
+                                                    payload_base={"mode": "mix", "top_k": 9},
+                                                    client=client))
+
+    def test_off_by_default_and_absent_from_the_payload(self):
+        self.assertFalse(scoped_pass.settings.company_keyword_hint)
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._pass(client)
+        self.assertNotIn("hl_keywords", client.retrieval_payloads[0])
+        self.assertNotIn("ll_keywords", client.retrieval_payloads[0])
+        self.assertFalse(result.meta["keyword_hint_applied"])
+
+    def test_on_names_the_company_in_both_keyword_lists(self):
+        scoped_pass.settings.company_keyword_hint = True
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._pass(client)
+        payload = client.retrieval_payloads[0]
+        self.assertEqual(payload["hl_keywords"], [NW])
+        self.assertEqual(payload["ll_keywords"], [NW])
+        self.assertTrue(result.meta["keyword_hint_applied"])
+
+    def test_the_hint_travels_on_the_fallback_route_too(self):
+        scoped_pass.settings.company_keyword_hint = True
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], data_raises=RuntimeError("down"))
+        result = self._pass(client)
+        self.assertEqual(result.meta["retrieval_route"], "query")
+        self.assertTrue(result.meta["keyword_hint_applied"])
+        self.assertEqual(client.retrieval_payloads[-1]["hl_keywords"], [NW])
+
+    def test_the_hint_adds_to_question_keywords_rather_than_replacing_them(self):
+        scoped_pass.settings.company_keyword_hint = True
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        _run(scoped_pass.company_scoped_pass("What changed on the line?", [NW],
+                                             payload_base={"mode": "mix",
+                                                           "hl_keywords": ["lead times"],
+                                                           "ll_keywords": ["lead times"]},
+                                             client=client))
+        payload = client.retrieval_payloads[0]
+        self.assertEqual(payload["hl_keywords"], ["lead times", NW])
+        self.assertEqual(payload["ll_keywords"], ["lead times", NW])
+
+    def test_hint_never_substitutes_for_the_filter(self):
+        scoped_pass.settings.company_keyword_hint = True
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        result = self._pass(client)
+        self.assertEqual([c.get("file_path") for c in result.citations], [NW_PATH])
+        self.assertNotIn(CP_CHUNK, client.bypass_prompts[0])
+
+
+class TestModelCallAccounting(_TempStore):
+    """One generation for a scoped answer; none for a refusal made before generating."""
+
+    def _pass(self, client):
+        return _run(scoped_pass.company_scoped_pass("What changed on the line?", [NW],
+                                                    payload_base={"mode": "mix", "top_k": 9},
+                                                    client=client))
+
+    def test_a_scoped_answer_costs_one_retrieval_and_one_generation(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._pass(client)
+        self.assertEqual(result.meta["model_calls"], 1)
+        self.assertEqual(client.paths.count("/query"), 1)     # the generation, not a retrieval
+
+    def test_a_refusal_before_generation_costs_no_generation(self):
+        # Nothing retrieved joins the named company, so no answer is ever asked for.
+        client = FakeLightRAG([_ref("1", CP_PATH, [CP_CHUNK])])
+        result = self._pass(client)
+        self.assertEqual(result.meta["declined_reason"], "no_reference_joins_a_named_company")
+        self.assertEqual(result.meta["model_calls"], 0)
+        self.assertEqual(client.bypass_prompts, [])
+
+    def test_the_fallback_route_costs_its_discarded_answer_plus_the_generation(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], data_raises=RuntimeError("404"))
+        result = self._pass(client)
+        self.assertEqual(result.meta["model_calls"], 2)
+
+    def test_the_fallback_route_reports_the_discard_even_when_it_declines(self):
+        client = FakeLightRAG([_ref("1", CP_PATH, [CP_CHUNK])], data_raises=RuntimeError("404"))
+        result = self._pass(client)
+        self.assertEqual(result.meta["declined_reason"], "no_reference_joins_a_named_company")
+        self.assertEqual(result.meta["model_calls"], 1)       # the answer /query forced, nothing more
+
+
+class TestQueryLogCarriesTheRetrievalRoute(unittest.TestCase):
+    def _emit(self, scoped: dict) -> dict:
+        timer = app.observability.StageTimer()
+        with patch("app.observability._emit") as emit:
+            app.observability.emit_query_log(
+                request_id="req-1", query="q", company=None, mode_requested="mix",
+                mode_used="mix", top_k=12, chunk_top_k=16,
+                query_scope={"company_scope": {"companies": [NW], "company_detected_from": "question",
+                                               "company_candidates": []},
+                             "scoped_pass": scoped},
+                citations_raw=1, citations_merged=1, citations_final=1, answer="a",
+                timer=timer, started=0.0)
+        self.assertEqual(emit.call_count, 1)
+        return emit.call_args.args[0]
+
+    def test_the_route_and_census_are_logged(self):
+        line = self._emit({"references_kept": 1, "references_dropped_other_company": 1,
+                           "references_unattributable": 0, "references_dropped_by_context_cap": 0,
+                           "second_model_call": True, "model_calls": 1,
+                           "retrieval_route": "query/data", "retrieval_fallback_reason": None,
+                           "keyword_hint_applied": False,
+                           "retrieval_shape": {"references_found": 2, "chunks_found": 0,
+                                               "items_with_text": 1, "items_without_path": 0},
+                           "declined_reason": None})
+        self.assertEqual(line["scoped_pass_model_calls"], 1)
+        self.assertEqual(line["scoped_pass_retrieval_route"], "query/data")
+        self.assertIsNone(line["scoped_pass_retrieval_fallback_reason"])
+        self.assertIs(line["scoped_pass_keyword_hint_applied"], False)
+        self.assertEqual(line["scoped_pass_retrieval_shape"]["references_found"], 2)
+
+    def test_chunk_text_never_reaches_the_line(self):
+        line = self._emit({"retrieval_shape": {"items_with_text": 1}, "model_calls": 1})
+        self.assertNotIn(NW_CHUNK, json.dumps(line))
+        self.assertNotIn(CP_CHUNK, json.dumps(line))
 
 
 if __name__ == "__main__":

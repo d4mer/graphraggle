@@ -334,6 +334,16 @@ def emit_query_log(
             "scoped_pass_references_unattributable": scoped.get("references_unattributable"),
             "scoped_pass_dropped_by_context_cap": scoped.get("references_dropped_by_context_cap"),
             "scoped_pass_second_model_call": scoped.get("second_model_call"),
+            # A scoped question should cost one generation. `model_calls` counts every model call the
+            # pass made (0 when it declined before generating, 2 when the /query retrieval fallback
+            # forced a discarded answer), and the route keys say which retrieval ran and why.
+            "scoped_pass_model_calls": scoped.get("model_calls"),
+            "scoped_pass_retrieval_route": scoped.get("retrieval_route"),
+            "scoped_pass_retrieval_fallback_reason": scoped.get("retrieval_fallback_reason"),
+            "scoped_pass_keyword_hint_applied": scoped.get("keyword_hint_applied"),
+            # Counts of what the retrieval-only endpoint returned (references, chunks, how many carried
+            # text, how many had no path). Counts only - never chunk text.
+            "scoped_pass_retrieval_shape": scoped.get("retrieval_shape"),
             "scoped_pass_declined_reason": scoped.get("declined_reason"),
             "latency_ms_total": timer.total_ms(started),
             "latency_ms_by_stage": timer.elapsed_ms,
