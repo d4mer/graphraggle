@@ -37,7 +37,7 @@ from typing import Any
 
 from .citation_text import citation_content
 from .config import settings
-from .state_store import get_documents_by_paths
+from .state_store import get_documents_by_paths, get_documents_by_sha256
 
 
 def no_scoped_material_message(companies: list[str]) -> str:
@@ -72,25 +72,54 @@ class ScopedPass:
     used: bool = False          # False = the pass declined and the caller's normal path stands
 
 
+async def companies_for_paths(paths: list[str]) -> dict[str, set[str]]:
+    """Which companies own each retrieved path, widening the answer by content hash.
+
+    The path join is the primary route and the honest one. The hash widening is not a courtesy:
+    with ``COMPANY_AWARE_DEDUPE`` on (the production state) a file owned by two companies is indexed
+    upstream exactly once - measured on stack2 and recorded in docs/05 - so the citation that comes
+    back carries one company's path while both companies own those bytes. Joining on the path alone
+    would make a shared document invisible to its other owner, which is the failure the dedupe
+    setting exists to prevent. A path with no row stays empty: nothing is invented.
+    """
+    if not paths:
+        return {}
+    rows = await get_documents_by_paths(paths)
+    owners: dict[str, set[str]] = {}
+    hashes: dict[str, str] = {}
+    for row in rows:
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        if row.get("company"):
+            owners.setdefault(path, set()).add(str(row["company"]))
+        if row.get("sha256"):
+            hashes[path] = str(row["sha256"])
+    for path, sha256 in hashes.items():
+        for row in await get_documents_by_sha256(sha256):
+            if row.get("company"):
+                owners.setdefault(path, set()).add(str(row["company"]))
+    return owners
+
+
 def classify_references(
     references: list[dict[str, Any]],
-    rows_by_path: dict[str, list[dict[str, Any]]],
+    owners_by_path: dict[str, set[str]],
     allowed_companies: list[str],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Split references into the named companies' and the rest.
 
-    A path with rows for several companies (the shared-file case: one company ingested it, another
-    has a `skipped` duplicate row) counts as allowed if any of its rows belongs to a named company,
-    because that company does own the document. A path with no row, or whose rows carry no company,
-    is `unattributable` and goes: the gateway cannot say it belongs to the company asked about.
+    A reference is kept when the gateway can show that one of the named companies owns that path. A
+    path with no row, or whose rows carry no company, is `unattributable` and goes: the gateway
+    cannot claim it belongs to the company asked about, and a citation shown under the wrong company
+    is worse than a citation withheld.
     """
     allowed = set(allowed_companies)
     kept: list[dict[str, Any]] = []
     counts = {"total": len(references), "kept": 0, "other_company": 0, "unattributable": 0}
     for reference in references:
         path = reference.get("file_path") or reference.get("path") or ""
-        rows = rows_by_path.get(path) or []
-        companies = {row.get("company") for row in rows if row.get("company")}
+        companies = owners_by_path.get(path) or set()
         if not companies:
             counts["unattributable"] += 1
             continue
@@ -143,12 +172,8 @@ async def company_scoped_pass(
     references = retrieval.get("references") or []
 
     paths = sorted({str(ref.get("file_path") or ref.get("path") or "") for ref in references} - {""})
-    rows = await get_documents_by_paths(paths) if paths else []
-    rows_by_path: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        rows_by_path.setdefault(str(row.get("path") or ""), []).append(row)
-
-    kept, counts = classify_references(references, rows_by_path, allowed_companies)
+    owners_by_path = await companies_for_paths(paths)
+    kept, counts = classify_references(references, owners_by_path, allowed_companies)
     context, context_meta = build_scoped_context(kept, settings.company_scoped_context_max_chars)
 
     meta = {

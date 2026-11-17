@@ -116,40 +116,74 @@ class _TempStore(unittest.TestCase):
 
 
 class TestReferenceClassification(unittest.TestCase):
-    rows = {
-        NW_PATH: [{"path": NW_PATH, "company": NW}],
-        CP_PATH: [{"path": CP_PATH, "company": CP}],
-    }
+    owners = {NW_PATH: {NW}, CP_PATH: {CP}}
 
     def test_named_companies_are_kept_and_another_company_is_dropped(self):
         refs = [_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])]
-        kept, counts = scoped_pass.classify_references(refs, self.rows, [NW])
+        kept, counts = scoped_pass.classify_references(refs, self.owners, [NW])
         self.assertEqual([ref["file_path"] for ref in kept], [NW_PATH])
         self.assertEqual(counts, {"total": 2, "kept": 1, "other_company": 1, "unattributable": 0})
 
     def test_an_unjoinable_reference_is_dropped_not_assumed(self):
         refs = [_ref("1", GHOST_PATH, [CP_CHUNK])]
-        kept, counts = scoped_pass.classify_references(refs, self.rows, [CP])
+        kept, counts = scoped_pass.classify_references(refs, self.owners, [CP])
         self.assertEqual(kept, [])
         self.assertEqual(counts["unattributable"], 1)
 
     def test_a_path_owned_by_two_companies_is_kept_for_either(self):
-        rows = dict(self.rows)
-        rows[NW_PATH] = [{"path": NW_PATH, "company": NW}, {"path": NW_PATH, "company": CP}]
+        owners = dict(self.owners)
+        owners[NW_PATH] = {NW, CP}
         for allowed in ([NW], [CP], [NW, CP]):
             with self.subTest(allowed=allowed):
                 kept, counts = scoped_pass.classify_references(
-                    [_ref("1", NW_PATH, [NW_CHUNK])], rows, allowed)
+                    [_ref("1", NW_PATH, [NW_CHUNK])], owners, allowed)
                 self.assertEqual(len(kept), 1)
                 self.assertEqual(counts["unattributable"], 0)
 
-    def test_a_row_with_no_company_is_unattributable(self):
-        rows = {"/source_docs/unscoped/x.pdf": [{"path": "/source_docs/unscoped/x.pdf",
-                                                 "company": None}]}
+    def test_a_path_whose_rows_carry_no_company_is_unattributable(self):
         kept, counts = scoped_pass.classify_references(
-            [_ref("1", "/source_docs/unscoped/x.pdf", ["text"])], rows, [NW])
+            [_ref("1", "/source_docs/unscoped/x.pdf", ["text"])],
+            {"/source_docs/unscoped/x.pdf": set()}, [NW])
         self.assertEqual(kept, [])
         self.assertEqual(counts["unattributable"], 1)
+
+
+class TestSharedFileOwnership(_TempStore):
+    """A file two companies own, indexed once upstream: both must still be able to reach it."""
+
+    def setUp(self):
+        super().setUp()
+        # The shared-file pair: identical bytes, one row per company, different paths.
+        self.shared_bytes = "identical cutover checklist\n" * 4
+        self.nw_shared = "/source_docs/Northwind Chemicals/shared/cutover.txt"
+        self.cp_shared = "/source_docs/Contoso Pharma/shared/cutover.txt"
+        for path, company, document_id in ((self.nw_shared, NW, "doc-shared-nw"),
+                                           (self.cp_shared, CP, "doc-shared-cp")):
+            _run(state_store.upsert_document(
+                document_id, path, "scan", company, Path(path).name, None, "sha-shared",
+                "ingested", None))
+
+    def test_a_shared_paths_ownership_extends_to_the_other_company_by_content_hash(self):
+        owners = _run(scoped_pass.companies_for_paths([self.nw_shared]))
+        self.assertEqual(owners[self.nw_shared], {NW, CP},
+                         "COMPANY_AWARE_DEDUPE indexes identical bytes once, so the citation carries "
+                         "one path while both companies own the document")
+
+    def test_a_scoped_question_for_either_company_keeps_the_shared_reference(self):
+        reference = _ref("1", self.nw_shared, ["Cutover freezes at 18:00 on the freeze date."])
+        for allowed in ([NW], [CP]):
+            with self.subTest(allowed=allowed):
+                client = FakeLightRAG([reference])
+                result = _run(scoped_pass.company_scoped_pass("when does the freeze start?", allowed,
+                                                              payload_base={}, client=client))
+                self.assertEqual([c["file_path"] for c in result.citations], [self.nw_shared])
+                self.assertFalse(result.meta["declined_reason"])
+
+    def test_a_path_with_no_row_owns_nothing(self):
+        self.assertEqual(_run(scoped_pass.companies_for_paths(["/source_docs/Ghost/x.pdf"])), {})
+
+    def test_no_paths_makes_no_query(self):
+        self.assertEqual(_run(scoped_pass.companies_for_paths([])), {})
 
 
 class TestContextBuilding(unittest.TestCase):
@@ -333,6 +367,73 @@ class TestQueryDoor(_TempStore, _PipelineSettings):
         self.assertEqual(len(client.calls), 1, "the master flag gates everything")
         self.assertEqual(data["answer"], "the unscoped draft answer")
         self.assertNotIn("company_scope", data["query_scope"])
+
+
+class TestGeneratedSharedFilePair(_TempStore):
+    """The GL-07 generator's own shared file: same bytes, one row per company.
+
+    This is the case the design doc prices for per-company workspaces, and the reason the scoped
+    pass widens ownership by content hash: with COMPANY_AWARE_DEDUPE on, upstream indexes identical
+    bytes once, so a Contoso question retrieves the path Northwind's row holds. A path-only join would
+    make that document invisible to Contoso.
+    """
+
+    def setUp(self):
+        super().setUp()
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+            from make_synthetic_company import SHARED_FILE_REL, generate_company
+        except ImportError as exc:               # the generator needs python-pptx for the deck
+            self.skipTest(f"GL-07 generator unavailable: {exc}")
+        self.out = Path(self._tmp.name) / "synth"
+        self.out.mkdir()
+        self.shares: dict[str, Path] = {}
+        for company in (NW, CP):
+            try:
+                generate_company(company, 7, self.out)
+            except Exception as exc:
+                self.skipTest(f"GL-07 generator failed: {exc}")
+            self.shares[company] = self.out / company / SHARED_FILE_REL
+
+    def test_the_generated_shared_files_are_the_same_bytes_under_different_paths(self):
+        first = self.shares[NW].read_bytes()
+        second = self.shares[CP].read_bytes()
+        self.assertEqual(first, second, "the generator's shared file must be byte-identical")
+        self.assertNotEqual(self.shares[NW], self.shares[CP])
+
+    def test_a_company_question_reaches_the_shared_file_through_the_other_companys_path(self):
+        nw_path = str(self.shares[NW])
+        cp_path = str(self.shares[CP])
+        shared_sha = "sha-generated-shared"
+        for path, company, document_id in ((nw_path, NW, "doc-gen-nw"), (cp_path, CP, "doc-gen-cp")):
+            _run(state_store.upsert_document(
+                document_id, path, "scan", company, Path(path).name, None, shared_sha,
+                "ingested", None))
+        chunk = self.shares[NW].read_text(encoding="utf-8").splitlines()
+        chunk = [line for line in chunk if line.strip()][:3]
+        # LightRAG returns ONE reference for identical bytes - the one it indexed first.
+        client = FakeLightRAG([_ref("1", nw_path, chunk)])
+        for allowed, other in ((CP, NW), (NW, CP)):
+            with self.subTest(asked=allowed):
+                result = _run(scoped_pass.company_scoped_pass("when does the cutover freeze start?",
+                                                              [allowed], payload_base={},
+                                                              client=client))
+                self.assertEqual([c["file_path"] for c in result.citations], [nw_path],
+                                 f"{allowed} owns those bytes and must see the document")
+                self.assertEqual(result.meta["references_unattributable"], 0)
+                # The prompt holds the one reference that was indexed, whichever company asked.
+                self.assertIn(nw_path, client.bypass_prompts[0])
+
+    def test_a_company_that_does_not_own_the_file_still_cannot_reach_it(self):
+        outsider = "/source_docs/Zenith/cutover.txt"
+        _run(state_store.upsert_document("doc-gen-zen", outsider, "scan", "Zenith",
+                                         "cutover.txt", None, "sha-generated-unique", "ingested",
+                                         None))
+        client = FakeLightRAG([_ref("1", outsider, ["freeze at 18:00"])])
+        result = _run(scoped_pass.company_scoped_pass("when does the freeze start?", [NW],
+                                                      payload_base={}, client=client))
+        self.assertEqual(result.citations, [])
+        self.assertEqual(result.meta["references_dropped_other_company"], 1)
 
 
 class _BridgeResp:
