@@ -332,6 +332,10 @@ def emit_query_log(
             "scoped_pass_references_dropped_other_company": scoped.get(
                 "references_dropped_other_company"),
             "scoped_pass_references_unattributable": scoped.get("references_unattributable"),
+            # One stored name, different bytes, different companies: the citation cannot be decided
+            # from. Counted apart from a missing join so an operator can tell "the join is broken" from
+            # "the corpus has colliding names" - the first is a bug, the second is an ingest problem.
+            "scoped_pass_references_ambiguous": scoped.get("references_ambiguous"),
             "scoped_pass_dropped_by_context_cap": scoped.get("references_dropped_by_context_cap"),
             "scoped_pass_second_model_call": scoped.get("second_model_call"),
             # A scoped question should cost one generation. `model_calls` counts every model call the

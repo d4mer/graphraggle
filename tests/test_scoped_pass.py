@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app.api as api
 import app.observability
+import app.document_identity as document_identity
 import app.scoped_pass as scoped_pass
 import app.state_store as state_store
 from app.models import QueryRequest
@@ -193,19 +194,28 @@ class _TempStore(unittest.TestCase):
         self._tmp.cleanup()
 
     def seed(self, path: str, company: str | None, *, document_id: str,
-             status: str = "ingested") -> None:
+             status: str = "ingested", sha: str | None = None,
+             submitted_source: str | None = None) -> None:
         _run(state_store.upsert_document(
-            document_id, path, "scan", company, Path(path).name, None, f"sha-{path}", status, None))
+            document_id, path, "scan", company, Path(path).name, None, sha or f"sha-{path}",
+            status, None, submitted_source=submitted_source))
+
+
+def _owners(**companies_by_path: dict[str, set[str]]) -> dict[str, document_identity.Ownership]:
+    """Build the ownership map the classifier consumes, from a path -> companies shorthand."""
+    return {path: document_identity.Ownership(companies=set(companies), via="path")
+            for path, companies in companies_by_path.items()}
 
 
 class TestReferenceClassification(unittest.TestCase):
-    owners = {NW_PATH: {NW}, CP_PATH: {CP}}
+    owners = _owners(**{NW_PATH: {NW}, CP_PATH: {CP}})
 
     def test_named_companies_are_kept_and_another_company_is_dropped(self):
         refs = [_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])]
         kept, counts = scoped_pass.classify_references(refs, self.owners, [NW])
         self.assertEqual([ref["file_path"] for ref in kept], [NW_PATH])
-        self.assertEqual(counts, {"total": 2, "kept": 1, "other_company": 1, "unattributable": 0})
+        self.assertEqual(counts, {"total": 2, "kept": 1, "other_company": 1, "unattributable": 0,
+                                  "ambiguous": 0})
 
     def test_an_unjoinable_reference_is_dropped_not_assumed(self):
         refs = [_ref("1", GHOST_PATH, [CP_CHUNK])]
@@ -215,7 +225,7 @@ class TestReferenceClassification(unittest.TestCase):
 
     def test_a_path_owned_by_two_companies_is_kept_for_either(self):
         owners = dict(self.owners)
-        owners[NW_PATH] = {NW, CP}
+        owners[NW_PATH] = document_identity.Ownership(companies={NW, CP}, via="path")
         for allowed in ([NW], [CP], [NW, CP]):
             with self.subTest(allowed=allowed):
                 kept, counts = scoped_pass.classify_references(
@@ -226,7 +236,7 @@ class TestReferenceClassification(unittest.TestCase):
     def test_a_path_whose_rows_carry_no_company_is_unattributable(self):
         kept, counts = scoped_pass.classify_references(
             [_ref("1", "/source_docs/unscoped/x.pdf", ["text"])],
-            {"/source_docs/unscoped/x.pdf": set()}, [NW])
+            _owners(**{"/source_docs/unscoped/x.pdf": set()}), [NW])
         self.assertEqual(kept, [])
         self.assertEqual(counts["unattributable"], 1)
 
@@ -263,7 +273,9 @@ class TestSharedFileOwnership(_TempStore):
                 self.assertFalse(result.meta["declined_reason"])
 
     def test_a_path_with_no_row_owns_nothing(self):
-        self.assertEqual(_run(scoped_pass.companies_for_paths(["/source_docs/Ghost/x.pdf"])), {})
+        owners = _run(scoped_pass.companies_for_paths(["/source_docs/Ghost/x.pdf"]))
+        self.assertEqual(owners.get("/source_docs/Ghost/x.pdf", set()), set(),
+                         "no row, no company: nothing is invented")
 
     def test_no_paths_makes_no_query(self):
         self.assertEqual(_run(scoped_pass.companies_for_paths([])), {})
@@ -347,7 +359,9 @@ class TestScopedPass(_TempStore):
         self.assertEqual(result.meta["declined_reason"], "no_reference_joins_a_named_company")
 
     def test_an_unattributable_reference_leads_to_a_refusal_not_a_guess(self):
-        client = FakeLightRAG([_ref("1", GHOST_PATH, [CP_CHUNK])])
+        # A name the store has no row for at all. A bare basename that DOES match a stored file is no
+        # longer unattributable - that is the basename join, tested in tests/test_document_identity.py.
+        client = FakeLightRAG([_ref("1", "phantom-q3.pdf", [CP_CHUNK])])
         result = _run(scoped_pass.company_scoped_pass("anything", [CP], payload_base={},
                                                       client=client))
         self.assertEqual(result.meta["references_unattributable"], 1)
@@ -670,6 +684,76 @@ class TestRetrievalRequestBody(_TempStore):
         self.assertNotIn(NW_CHUNK, dumped)
         self.assertNotIn("Invalid request parameters", result.meta["declined_reason"],
                          "the declined_reason names codes, not the server body")
+
+
+class TestBareFilenameReferences(_TempStore):
+    """The stack2 shape: citations carry a basename, `documents.path` is absolute.
+
+    Hermes' R1/R2 run made every citation unattributable (1046 of them) because the join was exact
+    path. These rows are seeded the way the filesystem door seeds them, and the references are the
+    bare names LightRAG actually returns.
+    """
+
+    NW_PDF = "/source_docs/Northwind Chemicals/northwind-q3.pdf"
+    CP_PDF = "/source_docs/Contoso Pharma/contoso-q3.pdf"
+
+    def setUp(self):
+        super().setUp()
+        self.seed(self.NW_PDF, NW, document_id="doc-nw")
+        self.seed(self.CP_PDF, CP, document_id="doc-cp")
+
+    def test_the_load_bearing_prompt_test_with_bare_filename_references(self):
+        client = FakeLightRAG([_ref("1", "northwind-q3.pdf", [NW_CHUNK]),
+                               _ref("2", "contoso-q3.pdf", [CP_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("what did Northwind Chemicals report?", [NW],
+                                                      payload_base={"mode": "mix"}, client=client))
+        self.assertEqual([c.get("file_path") for c in result.citations], ["northwind-q3.pdf"])
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt)
+        self.assertNotIn(CP_CHUNK, prompt)
+        self.assertEqual(result.meta["references_dropped_other_company"], 1)
+        self.assertEqual(result.meta["references_unattributable"], 0)
+
+    def test_the_shared_file_is_reachable_under_either_company(self):
+        self.seed("/source_docs/shared/cutover-checklist.txt", NW, document_id="doc-nw-shared",
+                  sha="sha-shared")
+        self.seed("/source_docs/shared-2/cutover-checklist.txt", CP, document_id="doc-cp-shared",
+                  sha="sha-shared")
+        for company in (NW, CP):
+            with self.subTest(company=company):
+                client = FakeLightRAG([_ref("1", "cutover-checklist.txt", ["checklist text"])])
+                result = _run(scoped_pass.company_scoped_pass("what is frozen?", [company],
+                                                              payload_base={}, client=client))
+                self.assertEqual([c.get("file_path") for c in result.citations],
+                                 ["cutover-checklist.txt"])
+
+    def test_one_name_two_companies_different_bytes_is_refused_as_ambiguous(self):
+        # Identical basename, different bytes, different owners: nothing can be attributed.
+        self.seed("/source_docs/Northwind Chemicals/transcript.txt", NW, document_id="doc-nw-t",
+                  sha="sha-nw-t")
+        self.seed("/source_docs/Contoso Pharma/transcript.txt", CP, document_id="doc-cp-t",
+                  sha="sha-cp-t")
+        client = FakeLightRAG([_ref("1", "transcript.txt", [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("what did we agree?", [NW], payload_base={},
+                                                      client=client))
+        self.assertEqual(result.meta["references_ambiguous"], 1)
+        self.assertEqual(result.meta["references_kept"], 0)
+        self.assertEqual(result.meta["declined_reason"],
+                         "every_reference_is_ambiguous_across_companies")
+        self.assertEqual(client.bypass_prompts, [], "an ambiguous name never reaches the model")
+
+    def test_ambiguity_is_counted_apart_from_a_missing_join(self):
+        client = FakeLightRAG([_ref("1", "transcript.txt", [NW_CHUNK]),
+                               _ref("2", "phantom.txt", [NW_CHUNK])])
+        self.seed("/source_docs/Northwind Chemicals/transcript.txt", NW, document_id="doc-nw-t2",
+                  sha="sha-nw-t2")
+        self.seed("/source_docs/Contoso Pharma/transcript.txt", CP, document_id="doc-cp-t2",
+                  sha="sha-cp-t2")
+        result = _run(scoped_pass.company_scoped_pass("what did we agree?", [NW], payload_base={},
+                                                      client=client))
+        self.assertEqual(result.meta["references_ambiguous"], 1)
+        self.assertEqual(result.meta["references_unattributable"], 1)
+        self.assertEqual(result.meta["declined_reason"], "no_reference_joins_a_named_company")
 
 
 class TestQueryDataRoute(_TempStore):

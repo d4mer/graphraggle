@@ -35,16 +35,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from . import document_identity
 from .citation_text import CITATION_TEXT_KEYS, citation_content
 from .config import settings
-from .state_store import get_documents_by_paths, get_documents_by_sha256
 
-# Which keys carry a document's path: exactly the four app/api.py:extract_citation_path already
-# tolerates (`file_source`, `path`, `source`, `file_path`). No fifth name is invented, because the
-# chunk items of /query/data have not been observed on this stack - instead the census below counts
-# which of these keys actually appeared, so an unseen key name shows up immediately as
-# `items_without_path` plus an empty path-key count rather than as a silent attribution failure.
-PATH_KEYS: tuple[str, ...] = ("file_source", "path", "source", "file_path")
+# Path keys and the shared citation→document join live in app/document_identity.py: LightRAG returns a
+# bare basename, the store holds an absolute path, and every door must resolve that the same way or the
+# same citation is attributed in one place and unattributable in another. `path_of` is kept as this
+# module's name for the accessor.
+PATH_KEYS = document_identity.PATH_KEYS
+path_of = document_identity.citation_path
 
 
 def error_detail(exc: BaseException) -> dict[str, Any]:
@@ -63,16 +63,6 @@ def error_detail(exc: BaseException) -> dict[str, Any]:
     if isinstance(body, str) and body.strip():
         detail["message"] = " ".join(body.split())[:300]
     return detail
-
-
-def path_of(item: Any) -> str:
-    if not isinstance(item, dict):
-        return ""
-    for key in PATH_KEYS:
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
 
 
 def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -277,33 +267,13 @@ class ScopedPass:
 
 
 async def companies_for_paths(paths: list[str]) -> dict[str, set[str]]:
-    """Which companies own each retrieved path, widening the answer by content hash.
+    """Compatibility wrapper: the companies that own each citation name.
 
-    The path join is the primary route and the honest one. The hash widening is not a courtesy:
-    with ``COMPANY_AWARE_DEDUPE`` on (the production state) a file owned by two companies is indexed
-    upstream exactly once - measured on stack2 and recorded in docs/05 - so the citation that comes
-    back carries one company's path while both companies own those bytes. Joining on the path alone
-    would make a shared document invisible to its other owner, which is the failure the dedupe
-    setting exists to prevent. A path with no row stays empty: nothing is invented.
+    Kept for callers that only want the company set. It cannot express ambiguity, which is why the
+    scoped pass uses `document_identity.ownership_for_paths` directly.
     """
-    if not paths:
-        return {}
-    rows = await get_documents_by_paths(paths)
-    owners: dict[str, set[str]] = {}
-    hashes: dict[str, str] = {}
-    for row in rows:
-        path = str(row.get("path") or "")
-        if not path:
-            continue
-        if row.get("company"):
-            owners.setdefault(path, set()).add(str(row["company"]))
-        if row.get("sha256"):
-            hashes[path] = str(row["sha256"])
-    for path, sha256 in hashes.items():
-        for row in await get_documents_by_sha256(sha256):
-            if row.get("company"):
-                owners.setdefault(path, set()).add(str(row["company"]))
-    return owners
+    ownership = await document_identity.ownership_for_paths(paths)
+    return {path: set(entry.companies) for path, entry in ownership.items()}
 
 
 def classify_references(
@@ -320,10 +290,17 @@ def classify_references(
     """
     allowed = set(allowed_companies)
     kept: list[dict[str, Any]] = []
-    counts = {"total": len(references), "kept": 0, "other_company": 0, "unattributable": 0}
+    counts = {"total": len(references), "kept": 0, "other_company": 0, "unattributable": 0,
+              "ambiguous": 0}
     for reference in references:
         path = path_of(reference)
-        companies = owners_by_path.get(path) or set()
+        entry = owners_by_path.get(path)
+        companies = set(entry.companies) if entry is not None else set()
+        if entry is not None and entry.ambiguous:
+            # The same name, different bytes, different companies: no honest answer exists, so none is
+            # given. This is deliberately its own count - "we cannot tell" is not "this has no owner".
+            counts["ambiguous"] += 1
+            continue
         if not companies:
             counts["unattributable"] += 1
             continue
@@ -394,7 +371,7 @@ async def company_scoped_pass(
         })
 
     paths = sorted({path_of(reference) for reference in references} - {""})
-    owners_by_path = await companies_for_paths(paths)
+    owners_by_path = await document_identity.ownership_for_paths(paths)
     kept, counts = classify_references(references, owners_by_path, allowed_companies)
     context, context_meta = build_scoped_context(kept, settings.company_scoped_context_max_chars)
 
@@ -404,6 +381,7 @@ async def company_scoped_pass(
         "references_kept": counts["kept"],
         "references_dropped_other_company": counts["other_company"],
         "references_unattributable": counts["unattributable"],
+        "references_ambiguous": counts["ambiguous"],
         "references_dropped_by_context_cap": context_meta["dropped_by_cap"],
         "references_without_content": context_meta["without_content"],
         "context_chars": context_meta["context_chars"],
@@ -424,8 +402,14 @@ async def company_scoped_pass(
     }
 
     if not kept:
-        meta["declined_reason"] = ("no_reference_joins_a_named_company"
-                                   if counts["total"] else "no_references_returned")
+        if not counts["total"]:
+            meta["declined_reason"] = "no_references_returned"
+        elif counts["ambiguous"] and not counts["unattributable"]:
+            # Everything retrieved was a name shared by different companies' files. Refusing is the
+            # only honest move, and the reason says so rather than blaming a missing join.
+            meta["declined_reason"] = "every_reference_is_ambiguous_across_companies"
+        else:
+            meta["declined_reason"] = "no_reference_joins_a_named_company"
         return ScopedPass(answer=no_scoped_material_message(allowed_companies), citations=[],
                           meta=meta, used=True)
     if not context:

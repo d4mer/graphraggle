@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS documents (
     company_source_detail TEXT,
     filename TEXT NOT NULL,
     original_filename TEXT,
+    submitted_source TEXT,
     sha256 TEXT NOT NULL,
     status TEXT NOT NULL,
     validation_state TEXT NOT NULL DEFAULT 'not_run',
@@ -72,6 +73,11 @@ MIGRATIONS: dict[str, str] = {
     "original_filename": "ALTER TABLE documents ADD COLUMN original_filename TEXT",
     "company_source": "ALTER TABLE documents ADD COLUMN company_source TEXT NOT NULL DEFAULT 'unscoped'",
     "company_source_detail": "ALTER TABLE documents ADD COLUMN company_source_detail TEXT",
+    # The exact name this gateway submitted upstream. LightRAG stores its own (it strips directories
+    # on /documents/text and keeps the upload name on /documents/upload), so a citation carries THAT
+    # name and nothing else to go on. Recording what we sent is the one join key that cannot drift;
+    # nullable and never rewritten for rows that predate it.
+    "submitted_source": "ALTER TABLE documents ADD COLUMN submitted_source TEXT",
 }
 
 UNSET = object()
@@ -340,6 +346,7 @@ async def upsert_document(
     warnings_json: str | None = None,
     company_source: str = COMPANY_SOURCE_UNSCOPED,
     company_source_detail: str | None = None,
+    submitted_source: str | None = None,
 ) -> bool:
     """Insert a row, or update it on a path conflict. Returns True if written.
 
@@ -358,13 +365,13 @@ async def upsert_document(
             f'''
             INSERT INTO documents (
               document_id, path, source_type, company, company_source, company_source_detail,
-              filename, original_filename, sha256, status,
+              filename, original_filename, submitted_source, sha256, status,
               validation_state, error_stage, error_code, error_message, error_detail,
               query_ready, retry_count, track_id, last_error, created_at, updated_at,
               content_hash, detected_mime, detected_encoding, byte_size, page_count,
               source_uri, supersedes_document_id, ingested_at, warnings_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, datetime('now'), datetime('now'),
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, datetime('now'), datetime('now'),
                 ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
               company=excluded.company,
@@ -372,6 +379,7 @@ async def upsert_document(
               company_source_detail=excluded.company_source_detail,
               filename=excluded.filename,
               original_filename=excluded.original_filename,
+              submitted_source=COALESCE(excluded.submitted_source, documents.submitted_source),
               sha256=excluded.sha256,
               status=excluded.status,
               validation_state=excluded.validation_state,
@@ -403,6 +411,7 @@ async def upsert_document(
                 company_source_detail,
                 filename,
                 original_filename,
+                submitted_source,
                 sha256,
                 status,
                 validation_state,
