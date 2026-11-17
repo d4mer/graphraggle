@@ -905,3 +905,46 @@ generate again from what remains using `mode: bypass` — the retrieve-then-gene
   refuses; the context cap drops whole references; `/query` makes exactly one upstream call at the
   default enforcement and two at `retrieval`; the bridge does not stream when scoped.
   Suite: `1531 passed, 2 skipped, 300 subtests passed` (base `317c077`: 1481).
+
+## 2026-11-17 — GL-10 measurement kit: the probe set and the counts-only scorer for the stack2 run
+
+The GL-10 plan (approved by the lead) is a stack measurement, so the kit for it is built here rather
+than improvised on the stack. Three pieces, no behaviour change:
+
+- `scripts/make_gl10_probes.py` (+370) builds the ten probe shapes of the plan per company from the
+  ingested GL-07 corpora (seed 20261101, Northwind Chemicals + Contoso Pharma): 49 rows per company —
+  scoped 12, cross_company 9, unscoped 6, unanswerable 6, shared_file 2, alias 3, near_miss_word 3,
+  unknown_org 2, punctuation_case 3, upload_door 3. Output is off-repo, mode 600, and byte-identical
+  on a rerun. It **validates before writing** and refuses the whole set otherwise: every expected
+  planted code exists (and an unanswerable code exists in no document), every question scopes to
+  exactly its `expected_companies` under the shipped detector (`app.company_scope`), the near-miss and
+  unknown-org shapes scope to nothing, no question contains four consecutive words from any fact
+  sentence (topic vocabulary excepted, because a probe has to name its topic), shared-file rows point
+  at a real shared document, and ids are unique, `gl10-`-prefixed and cannot be mistaken for GL-13
+  ids. Current set: 98 rows, sha256 `ab46a98c3e35…` (Northwind) and `aff2a0241062…` (Contoso).
+- `scripts/score_gl10_run.py` (+430) is the sibling of `scripts/score_grounding_run.py`: same
+  join-by-`request_id`, same refusal to guess, counts only. It reports rows by shape, by
+  `company_detected_from` and detected mode, detection right/wrong split into over-scoped,
+  under-scoped and wrong (they have different fixes), the asked-company × cited-company matrix, the
+  planted-code membership per asked company, `scoped_pass` sums and declined reasons, verdict-based
+  refusals on unanswerable rows, latency median/p95, and an acceptance block with the four targets
+  (0 other-company citations, 0 other-company codes in scoped answers, cross-company named companies
+  cited ≥ 80%, 0 unscoped rows changed versus the baseline). Guard keys are always emitted at zero so
+  a reader never confuses "absent" with "not measured"; when the export carries no citations the
+  matrix says `available: false` and acceptance says "not computable" instead of inferring a company
+  from a path. Exit 2 with no headline numbers on: no log capture, a repeated question with no
+  `request_id`, a `request_id` repeated in the log, a probe id in two manifests, or a verdict naming
+  an unknown probe.
+- `docs/ops/gl10-stack2-runbook.md`: the R0/R1/R2 env blocks (R2 also pins
+  `COMPANY_ALIASES='Northwind Chemicals=northwind;Contoso Pharma=contoso'`, which is what the alias
+  rows were built against), `QUERY_LOG_PATH` per run, the `structure-cutover-5` image and its
+  rollback tag, the fields the runner must record (`request_id` included, because the scorer refuses
+  on repeats without it), the upload-door group's separate index, the scoring command and teardown.
+
+Tests: 31 new — 14 in `tests/test_score_gl10_run.py` (invented fixtures: the four guards, the matrix,
+detection classes, unscoped-unchanged compared by counts so the new `company_scope` keys do not read
+as a change, every refusal path, `--map` aliasing, and a test that no question, answer or file path
+reaches stdout) and 17 in `tests/test_make_gl10_probes.py` (shape counts, byte-identical rerun, mode
+600, refuse-to-write-in-repo, the detection/sentence-copy properties across the whole built set, and
+each validation rule firing on a tampered row while writing nothing). Suite:
+`1569 passed, 2 skipped, 304 subtests passed` (base `17332fe`: 1538).

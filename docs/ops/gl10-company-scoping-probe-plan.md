@@ -1,9 +1,13 @@
 # GL-10 stack2 probe plan — does the company named in the question really scope the search and answer
 
-Written 2026-11-17 on `worker/gl10-company-from-question` for Hermes to run on stack2. Nothing here
-was run by the worker: the offline part is the unit suite plus `scripts/gl10_design_measure.py` on
-invented documents. Every reported number is a count — no question text, no answer text, no
-reference content.
+Written 2026-11-17 on `worker/gl10-company-from-question` for Hermes to run on stack2, and approved
+as the run. The settings blocks, the image tag, the runner's required fields and the teardown are in
+`docs/ops/gl10-stack2-runbook.md`; the rows are built by `scripts/make_gl10_probes.py` into
+`/home/maverick/work/synthetic-co-probes/gl10/<Company>/manifest.json` (mode 600, off-repo), and
+`scripts/score_gl10_run.py` is the counts-only scorer described below. Nothing here was run by the
+worker: the offline part is the unit suite plus `scripts/gl10_design_measure.py` on invented
+documents. Every reported number is a count — no question text, no answer text, no reference
+content.
 
 ## Corpora
 
