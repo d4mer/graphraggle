@@ -320,7 +320,7 @@ class QueryLoggingTests(SettingsBackupMixin):
         with patch.object(api, "client") as client, _LogCapture() as cap:
             client.post_json = post_json
             client.proxy = AsyncMock(return_value=_Resp(b'{"documents": []}'))
-            with patch.object(api, "get_documents_by_paths", new=AsyncMock(return_value=[])):
+            with patch.object(api.document_identity, "ownership_for_paths", new=AsyncMock(return_value={})):
                 envelope = _run_async(api.query(QueryRequest(query="what is eCommit", top_k=12)))
         lines = cap.lines()
         self.assertEqual(len(lines), 1)
@@ -356,7 +356,7 @@ class QueryLoggingTests(SettingsBackupMixin):
         post_json = AsyncMock(return_value={"response": CANNED_FAILURE_RESPONSE, "references": []})
         with patch.object(api, "client") as client, _LogCapture() as cap:
             client.post_json = post_json
-            with patch.object(api, "get_documents_by_paths", new=AsyncMock(return_value=[])):
+            with patch.object(api.document_identity, "ownership_for_paths", new=AsyncMock(return_value={})):
                 _run_async(api.query(QueryRequest(query="q", top_k=12)))
         line = cap.lines()[0]
         self.assertTrue(line["canned_failure"])

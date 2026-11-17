@@ -29,9 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Sequence
 
-import aiosqlite
-
-from .config import settings
+from . import state_store
 
 # The names a citation may carry a document under. These are the four app/api.py already tolerates;
 # no fifth is invented, because a wrong guess here is silent (the citation simply looks unowned).
@@ -158,52 +156,32 @@ def decide_ownership(matched: Sequence[dict[str, Any]], via: str,
 
 
 async def ownership_for_paths(paths: Iterable[str]) -> dict[str, Ownership]:
-    """Resolve citation names to store rows: submitted name, exact path, basename, then hash."""
+    """Resolve citation names to store rows: submitted name, exact path, basename, then hash.
+
+    All SQL lives in app/state_store.py so every reader gets annotated rows (`query_ready`,
+    `readiness_reason`) and one place to change.
+    """
     wanted = [path for path in dict.fromkeys(paths) if path]
     if not wanted:
         return {}
 
-    async with aiosqlite.connect(settings.state_db_path) as db:
-        db.row_factory = aiosqlite.Row
+    exact_rows = await state_store.get_documents_by_exact_names(wanted)
+    unresolved = [path for path in wanted if not _matched_by(path, exact_rows)[0]]
+    basename_rows = (await state_store.get_documents_by_basenames(
+        [name for name in dict.fromkeys(basename_of(path) for path in unresolved) if name])
+        if unresolved else [])
 
-        placeholders = ", ".join("?" for _ in wanted)
-        exact = await db.execute(
-            f"SELECT * FROM documents WHERE path IN ({placeholders})"
-            f" OR submitted_source IN ({placeholders})"
-            f" OR filename IN ({placeholders}) OR original_filename IN ({placeholders})",
-            tuple(wanted) * 4,
-        )
-        exact_rows = [dict(row) for row in await exact.fetchall()]
-
-        unresolved = [path for path in wanted
-                      if not _matched_by(path, exact_rows)[0]]
-        basename_rows: list[dict[str, Any]] = []
-        if unresolved:
-            names = [name for name in dict.fromkeys(basename_of(path) for path in unresolved) if name]
-            clauses, params = [], []
-            for name in names:
-                clauses.append("(filename=? OR original_filename=? OR submitted_source=?"
-                               " OR path LIKE ? ESCAPE '\\')")
-                params.extend([name, name, name, "%/" + _like_escape(name)])
-            found = await db.execute(
-                f"SELECT * FROM documents WHERE {' OR '.join(clauses)}", tuple(params))
-            basename_rows = [dict(row) for row in await found.fetchall()]
-
-        ownership: dict[str, Ownership] = {}
-        for path in wanted:
-            matched, via = _matched_by(path, exact_rows)
-            if not matched:
-                matched, via = _basename_matched(path, basename_of(path), basename_rows)
-            if not matched:
-                ownership[path] = Ownership()
-                continue
-            # Widen by content hash: with COMPANY_AWARE_DEDUPE (the production state) identical bytes
-            # are indexed once, so the citation carries one company's name while both own the file.
-            extra: list[dict[str, Any]] = []
-            for content_hash in _hashes(matched):
-                by_hash = await db.execute(
-                    "SELECT * FROM documents WHERE sha256=?", (content_hash,))
-                extra.extend(dict(row) for row in await by_hash.fetchall())
-            ownership[path] = decide_ownership(matched, via, extra)
-
-        return ownership
+    ownership: dict[str, Ownership] = {}
+    for path in wanted:
+        matched, via = _matched_by(path, exact_rows)
+        if not matched:
+            matched, via = _basename_matched(path, basename_of(path), basename_rows)
+        if not matched:
+            ownership[path] = Ownership()
+            continue
+        # Widen by content hash: with COMPANY_AWARE_DEDUPE (the production state) identical bytes are
+        # indexed once, so the citation carries one company's name while both companies own the file.
+        extra = [row for content_hash in _hashes(matched)
+                 for row in await state_store.get_documents_by_sha256(content_hash)]
+        ownership[path] = decide_ownership(matched, via, extra)
+    return ownership

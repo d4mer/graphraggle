@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import app.api as api
 import app.document_identity as document_identity
 import app.state_store as state_store
 from app.config import settings
@@ -209,6 +210,56 @@ class TestJoinHygiene(SeededStore):
         self.assertEqual(rows[0]["company"], NW)
         self.assertIsNone(rows[0].get("submitted_source"),
                           "the migration leaves existing rows untouched")
+
+
+class TestCitationAttributionThroughTheJoin(SeededStore):
+    """The R0 symptom: 815 citations came back and `company` was set on none of them."""
+
+    def test_a_bare_filename_citation_comes_back_with_a_company_and_a_document_id(self):
+        self.add(path=f"{NW_DIR}/omp-profile.pdf", company=NW, sha256="sha-nw")
+        included, scope = _run(api.scope_query_citations([{"file_path": "omp-profile.pdf"}],
+                                                         requested_company=NW))
+        self.assertEqual(len(included), 1, "the join reaches the row the path join could not")
+        self.assertEqual(included[0]["company"], NW)
+        self.assertEqual(included[0]["document_id"], self.rows[0]["document_id"])
+        self.assertEqual(scope["excluded_citation_count"], 0)
+
+    def test_an_exact_upload_door_path_still_joins(self):
+        self.add(path=f"{settings.uploads_dir}/6f2a--q3.pdf", company=NW, sha256="sha-up",
+                 source_type="upload")
+        included, _scope = _run(api.scope_query_citations(
+            [{"file_path": f"{settings.uploads_dir}/6f2a--q3.pdf"}], requested_company=NW))
+        self.assertEqual([c["company"] for c in included], [NW])
+
+    def test_an_ambiguous_basename_is_never_shown_and_is_counted_apart(self):
+        self.add(path=f"{NW_DIR}/transcript.txt", company=NW, sha256="sha-nw")
+        self.add(path=f"{CP_DIR}/transcript.txt", company=CP, sha256="sha-cp")
+        included, scope = _run(api.scope_query_citations([{"file_path": "transcript.txt"}],
+                                                         requested_company=NW))
+        self.assertEqual(included, [], "no company may be credited for an undecided name")
+        self.assertEqual(scope["ambiguous_citation_count"], 1)
+        self.assertEqual(scope["excluded_citation_count"], 0,
+                         "ambiguous is not the same fault as unowned")
+
+    def test_a_shared_file_is_listed_under_both_owners_on_the_gl10_path(self):
+        self.add(path=f"{NW_DIR}/cutover-checklist.txt", company=NW, sha256="sha-shared")
+        self.add(path=f"{CP_DIR}/cutover-checklist.txt", company=CP, sha256="sha-shared")
+        included, _scope = _run(api.scope_query_citations(
+            [{"file_path": "cutover-checklist.txt"}], requested_company=None,
+            allowed_companies=[NW]))
+        self.assertEqual(len(included), 1)
+        self.assertEqual(included[0]["company"], NW, "the row shown belongs to the company asked for")
+        self.assertEqual(included[0]["companies"], sorted([NW, CP]))
+
+    def test_the_older_single_company_envelope_is_unchanged(self):
+        # `companies` is added only on the GL-10 (allowed_companies) path: the pre-GL-10 company
+        # request must keep the exact envelope shape it has today.
+        self.add(path=f"{NW_DIR}/cutover-checklist.txt", company=NW, sha256="sha-shared")
+        self.add(path=f"{CP_DIR}/cutover-checklist.txt", company=CP, sha256="sha-shared")
+        included, _scope = _run(api.scope_query_citations([{"file_path": "cutover-checklist.txt"}],
+                                                          requested_company=NW))
+        self.assertEqual(len(included), 1)
+        self.assertNotIn("companies", included[0])
 
 
 class TestMigrationIsNoOpForExistingRows(unittest.TestCase):

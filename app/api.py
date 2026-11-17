@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Respon
 
 from . import grounding
 from .auth import require_bearer
+from . import document_identity
 from .config import settings
 from .generation import generate_document
 from .lightrag_client import client
@@ -885,6 +886,26 @@ def enrich_citation(citation: dict[str, Any], document: dict[str, Any] | None) -
     return enriched
 
 
+def _primary_row(entry: "document_identity.Ownership | None",
+                 allowed: list[str] | None) -> dict[str, Any] | None:
+    """The row that stands for this citation, chosen without guessing across companies.
+
+    Preference follows the join order, then a deterministic tie-break. A row owned by one of the
+    companies being answered for wins a tie, because that is the row the citation is being shown for -
+    and only among rows that are otherwise equally good matches (identical bytes under a shared name).
+    """
+    if entry is None or not entry.rows:
+        return None
+
+    def rank(row: dict[str, Any]) -> tuple[int, int, str, str]:
+        key = {"submitted_source": 0, "path": 1, "filename": 2, "original_filename": 3,
+               "basename": 4}.get(entry.via, 5)
+        return (key, 0 if (allowed and row.get("company") in allowed) else 1,
+                str(row.get("company") or ""), str(row.get("path") or ""))
+
+    return sorted(entry.rows, key=rank)[0]
+
+
 def company_alias_settings() -> dict[str, list[str]]:
     """`COMPANY_ALIASES` as written (validation against the store's names happens per query)."""
     return parse_alias_map(settings.company_aliases)
@@ -943,24 +964,39 @@ async def scope_query_citations(
     cross-company answer gets silently attributed to one company.
     """
     citation_paths = [path for citation in citations if (path := extract_citation_path(citation))]
-    documents = await get_documents_by_paths(citation_paths)
-    documents_by_path = {str(doc.get("path")): doc for doc in documents if doc.get("path")}
+    # One join for every door. LightRAG returns a bare basename while `documents.path` is absolute, so
+    # the previous exact-path lookup attributed nothing on the filesystem door - 815 citations in
+    # stack2 R0, company set on 0 of them. See app/document_identity.py for the order and the rule.
+    ownership = await document_identity.ownership_for_paths(citation_paths)
 
     included: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
+    ambiguous_citations: list[dict[str, Any]] = []
 
     for citation in citations:
-        citation_path = extract_citation_path(citation)
-        document = documents_by_path.get(citation_path) if citation_path else None
-        enriched = enrich_citation(citation, document)
-
-        company_of_row = document.get("company") if document else None
         if allowed_companies is not None:
             allowed = allowed_companies
         elif requested_company is not None:
             allowed = [requested_company]
         else:
             allowed = None
+
+        citation_path = extract_citation_path(citation)
+        entry = ownership.get(citation_path) if citation_path else None
+        if entry is not None and entry.ambiguous:
+            # Same stored name, different bytes, different companies: it cannot be shown to belong to
+            # the company asked about, so it is not shown - and it is counted apart from a citation
+            # that simply has no row.
+            ambiguous_citations.append(enrich_citation(citation, None))
+            continue
+        document = _primary_row(entry, allowed)
+        enriched = enrich_citation(citation, document)
+        if allowed_companies is not None and entry is not None and len(entry.companies) > 1:
+            # A shared document: honest about both owners rather than silently picking one. Added only
+            # on the GL-10 path, so the older single-company envelope keeps its exact shape.
+            enriched["companies"] = sorted(entry.companies)
+
+        company_of_row = document.get("company") if document else None
         if allowed is None or company_of_row in allowed:
             included.append(enriched)
         else:
@@ -983,6 +1019,8 @@ async def scope_query_citations(
         "included_citation_count": len(included),
         "excluded_citation_count": len(excluded),
         "excluded_citations": excluded,
+        "ambiguous_citation_count": len(ambiguous_citations),
+        "ambiguous_citations": ambiguous_citations,
     }
     if requested_company is not None:
         scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"

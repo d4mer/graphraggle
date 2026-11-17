@@ -654,6 +654,44 @@ async def get_documents_by_paths(paths: list[str]) -> list[dict]:
     return annotate_documents(documents)
 
 
+async def get_documents_by_exact_names(names: list[str]) -> list[dict]:
+    """Rows whose stored name IS one of these strings, in any of the four name columns.
+
+    `path` is the absolute path, `submitted_source` the exact name the gateway sent upstream, and
+    `filename` / `original_filename` the basenames. Annotation is applied here, as
+    `get_documents_by_paths` does: a row fetched by name still has to answer `query_ready`.
+    """
+    wanted = [name for name in dict.fromkeys(names) if name]
+    if not wanted:
+        return []
+    placeholders = ", ".join("?" for _ in wanted)
+    return annotate_documents(await _fetch_documents(
+        f"SELECT * FROM documents WHERE path IN ({placeholders})"
+        f" OR submitted_source IN ({placeholders})"
+        f" OR filename IN ({placeholders}) OR original_filename IN ({placeholders})",
+        tuple(wanted) * 4,
+    ))
+
+
+async def get_documents_by_basenames(basenames: list[str]) -> list[dict]:
+    """Rows reachable from a bare citation name: LightRAG strips directories at store time.
+
+    Matched against the name columns and the tail of `path`. LIKE metacharacters in a real filename
+    are escaped, or `100%.pdf` would also match `100x.pdf` and attribute the wrong company's file.
+    """
+    wanted = [name for name in dict.fromkeys(basenames) if name]
+    if not wanted:
+        return []
+    clauses, params = [], []
+    for name in wanted:
+        escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append("(filename=? OR original_filename=? OR submitted_source=?"
+                       " OR path LIKE ? ESCAPE '\\')")
+        params.extend([name, name, name, "%/" + escaped])
+    return annotate_documents(await _fetch_documents(
+        f"SELECT * FROM documents WHERE {' OR '.join(clauses)}", tuple(params)))
+
+
 async def list_distinct_companies() -> list[str]:
     """Every company the store has rows for, in a stable order.
 
