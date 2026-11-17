@@ -295,12 +295,12 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
             else:
                 code_guard["cross_company_missing_named"] += 1
 
-        scoped_meta = log_line.get("scoped_pass") or {}
+        scoped_meta = scoped_view(log_line)
         if scoped_meta:
             scoped_sums["rows_with_scoped_pass"] += 1
             for key in ("references_kept", "references_dropped_other_company",
-                        "references_unattributable", "references_dropped_by_context_cap",
-                        "model_calls"):
+                        "references_unattributable", "references_ambiguous",
+                        "references_dropped_by_context_cap", "model_calls"):
                 scoped_sums[key] += int(scoped_meta.get(key) or 0)
             if scoped_meta.get("second_model_call"):
                 scoped_sums["second_model_calls"] += 1
@@ -337,7 +337,8 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
     report["scoped_pass"] = {"rows": scoped_sums["rows_with_scoped_pass"],
                              **{key: scoped_sums[key] for key in
                                 ("references_kept", "references_dropped_other_company",
-                                 "references_unattributable", "references_dropped_by_context_cap",
+                                 "references_unattributable", "references_ambiguous",
+                                 "references_dropped_by_context_cap",
                                  "second_model_calls", "model_calls", "keyword_hint_applied")},
                              "retrieval_routes": dict(sorted(retrieval_routes.items())),
                              "retrieval_fallbacks": dict(sorted(retrieval_fallbacks.items(),
@@ -378,6 +379,42 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
         report["verdicts"] = {"available": False,
                               "note": "correct% and refusal% need the judge's verdicts file"}
     return report
+
+
+# The query log does NOT carry a `scoped_pass` object. app/observability.py projects named fields, so
+# the emitted line has `scoped_pass` as a boolean plus flat `scoped_pass_*` keys - and reading
+# `log_line["scoped_pass"].get(...)` raises AttributeError on every real line (Hermes hit this on the
+# stack2 run). Both shapes are accepted: flat keys from the shipped log, and a nested dict if an export
+# carries one, so a re-scored older artefact still works.
+SCOPED_LOG_KEYS: dict[str, str] = {
+    "references_kept": "scoped_pass_references_kept",
+    "references_dropped_other_company": "scoped_pass_references_dropped_other_company",
+    "references_unattributable": "scoped_pass_references_unattributable",
+    "references_ambiguous": "scoped_pass_references_ambiguous",
+    "references_dropped_by_context_cap": "scoped_pass_dropped_by_context_cap",
+    "second_model_call": "scoped_pass_second_model_call",
+    "model_calls": "scoped_pass_model_calls",
+    "retrieval_route": "scoped_pass_retrieval_route",
+    "retrieval_fallback_reason": "scoped_pass_retrieval_fallback_reason",
+    "retrieval_errors": "scoped_pass_retrieval_errors",
+    "keyword_hint_applied": "scoped_pass_keyword_hint_applied",
+    "retrieval_shape": "scoped_pass_retrieval_shape",
+    "declined_reason": "scoped_pass_declined_reason",
+}
+
+
+def scoped_view(log_line: dict) -> dict:
+    """The scoped-pass counts on a log line, from whichever shape the line uses."""
+    view: dict[str, object] = {}
+    nested = log_line.get("scoped_pass")
+    if isinstance(nested, dict):
+        view.update(nested)
+    for field, log_key in SCOPED_LOG_KEYS.items():
+        if log_key in log_line and log_line[log_key] is not None:
+            view[field] = log_line[log_key]
+    if isinstance(nested, bool) and nested:
+        view.setdefault("ran", True)
+    return view
 
 
 def _fingerprint(log_line: dict[str, Any]) -> tuple[Any, ...]:

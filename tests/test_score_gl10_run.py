@@ -117,6 +117,81 @@ class _Fixtures(unittest.TestCase):
         return str(path)
 
 
+class TestRealLogShape(_Fixtures):
+    """The shipped log line is flat: `scoped_pass` is a bool and the counts are `scoped_pass_*`.
+
+    The scorer used to read `log_line["scoped_pass"].get(...)` and raised AttributeError on every real
+    line - which is only how a measurement run finds out. So the fixture here is an actual projection
+    from app/observability.py, not a hand-written lookalike.
+    """
+
+    def _emitted_line(self, scoped_meta: dict) -> dict:
+        from unittest.mock import patch
+
+        import app.observability as observability
+
+        timer = observability.StageTimer()
+        with patch("app.observability._emit") as emit:
+            observability.emit_query_log(
+                request_id="req-flat", query=Q_SCOPED, company=None, mode_requested="mix",
+                mode_used="mix", top_k=12, chunk_top_k=16,
+                query_scope={"company_scope": {"companies": [ALPHA],
+                                               "company_detected_from": "question",
+                                               "company_candidates": []},
+                             "scoped_pass": scoped_meta},
+                citations_raw=3, citations_merged=2, citations_final=2,
+                answer="a", timer=timer, started=0.0)
+        return emit.call_args.args[0]
+
+    def _score(self, log_line: dict) -> dict:
+        manifest = self.root / "probes" / "manifest.json"
+        _manifest(manifest, {"scoped": [_probe("gl10-alpha-scop01", "scoped", Q_SCOPED, [ALPHA])]})
+        results = self.write("r.results.jsonl", [
+            _result("req-flat", "gl10-alpha-scop01", Q_SCOPED, "an answer",
+                    [{"file_path": "a/one.txt", "company": ALPHA}])])
+        logs = self.write("r.log.jsonl", [log_line])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = module.main(["--probe-manifest", str(manifest), "--run", f"R2={results}",
+                                "--log", f"R2={logs}"])
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        return _first_run(out.getvalue())["scoped_pass"]
+
+    def test_flat_counts_from_the_shipped_projection_are_read(self):
+        line = self._emitted_line({
+            "references_kept": 2, "references_dropped_other_company": 1,
+            "references_unattributable": 0, "references_ambiguous": 1,
+            "references_dropped_by_context_cap": 0, "second_model_call": True, "model_calls": 1,
+            "retrieval_route": "query/data", "retrieval_fallback_reason": None,
+            "keyword_hint_applied": False, "retrieval_errors": {}, "declined_reason": None})
+        self.assertIs(line["scoped_pass"], True, "the shipped line carries a bool, not a dict")
+        self.assertEqual(line["scoped_pass_references_kept"], 2)
+        report = self._score(line)
+        self.assertEqual(report["rows"], 1)
+        self.assertEqual(report["references_kept"], 2)
+        self.assertEqual(report["references_ambiguous"], 1)
+        self.assertEqual(report["model_calls"], 1)
+        self.assertEqual(report["retrieval_routes"], {"query/data": 1})
+
+    def test_a_fallback_is_visible_in_the_flat_shape(self):
+        line = self._emitted_line({
+            "references_kept": 0, "references_unattributable": 3, "second_model_call": False,
+            "model_calls": 2, "retrieval_route": "query",
+            "retrieval_fallback_reason": "query_data_http_400",
+            "retrieval_errors": {"/query/data": {"status": 400, "type": "HTTPStatusError"}},
+            "declined_reason": "no_reference_joins_a_named_company"})
+        report = self._score(line)
+        self.assertEqual(report["retrieval_routes"], {"query": 1})
+        self.assertEqual(report["retrieval_fallbacks"], {"query_data_http_400": 1})
+        self.assertEqual(report["declined_reasons"], {"no_reference_joins_a_named_company": 1})
+
+    def test_a_nested_export_still_scores(self):
+        line = _log_line("req-flat", Q_SCOPED, [ALPHA],
+                         scoped_pass={"references_kept": 4, "model_calls": 1,
+                                      "retrieval_route": "query/data"})
+        self.assertEqual(self._score(line)["references_kept"], 4)
+
+
 class TestScoring(_Fixtures):
     def setUp(self):
         super().setUp()
