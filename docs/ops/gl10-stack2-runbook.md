@@ -57,7 +57,25 @@ COMPANY_FROM_QUESTION=true
 COMPANY_SCOPE_ENFORCEMENT=retrieval
 COMPANY_SCOPED_CONTEXT_MAX_CHARS=12000
 COMPANY_ALIASES='Northwind Chemicals=northwind;Contoso Pharma=contoso'
+
+# R3 — optional, and only if R2 is accepted: the same plus a retrieval keyword hint
+COMPANY_FROM_QUESTION=true
+COMPANY_SCOPE_ENFORCEMENT=retrieval
+COMPANY_SCOPED_CONTEXT_MAX_CHARS=12000
+COMPANY_ALIASES='Northwind Chemicals=northwind;Contoso Pharma=contoso'
+COMPANY_KEYWORD_HINT=true
 ```
+
+R3 differs from R2 by one setting: the scoped retrieval also names the company in
+`hl_keywords`/`ll_keywords`. Compare it against R2 on the `scoped` and `cross_company` shapes
+(`scoped_pass_references_kept`, refusal counts, correct%) and confirm `other_company_citations` stays
+0 — the hint is a recall bias, never a boundary.
+
+The scoped pass retrieves its material through LightRAG's retrieval-only `/query/data`, so R2 and R3
+cost **one retrieval plus one generation**, like an unscoped question. `scoped_pass_model_calls` should
+read 1 in both. If it reads 2, `/query/data` did not work on that build: report
+`scoped_pass_retrieval_route`, `scoped_pass_retrieval_fallback_reason` and
+`scoped_pass_retrieval_shape` (the census of what came back) instead of re-running blind.
 
 `COMPANY_ALIASES` must be exactly that string: the alias probe rows were built against it
 (`aliases` block in each probe manifest). Restart the gateway after every change
@@ -114,6 +132,8 @@ duplicated id). Report the exit line and the reason rather than retrying with ed
 Send back: the acceptance block verbatim (it is counts only), the `other_company_citations` and
 `other_company_codes_in_scoped_answers` numbers per run, the cross-company citation rate, the
 `unscoped_rows_changed_vs_baseline` number, R2's `scoped_pass` counts (kept /
+dropped_other_company / unattributable / dropped_by_context_cap / model_calls / retrieval_route /
+retrieval_fallback_reason / retrieval_shape / keyword_hint_applied) /
 dropped_other_company / unattributable / dropped_by_context_cap / declined reasons), latency median
 and p95 per run, and the bridge Sources count. No question text, no answers, no reference content.
 

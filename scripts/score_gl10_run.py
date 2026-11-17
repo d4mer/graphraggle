@@ -239,6 +239,8 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                           "cross_company_all_named_cited": 0, "cross_company_missing_named": 0})
     scoped_sums: Counter[str] = Counter()
     declined: Counter[str] = Counter()
+    retrieval_routes: Counter[str] = Counter()
+    retrieval_fallbacks: Counter[str] = Counter()
     latency: list[float] = []
     unscoped_diff = 0
     citations_present = any(
@@ -297,10 +299,19 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
         if scoped_meta:
             scoped_sums["rows_with_scoped_pass"] += 1
             for key in ("references_kept", "references_dropped_other_company",
-                        "references_unattributable", "references_dropped_by_context_cap"):
+                        "references_unattributable", "references_dropped_by_context_cap",
+                        "model_calls"):
                 scoped_sums[key] += int(scoped_meta.get(key) or 0)
             if scoped_meta.get("second_model_call"):
                 scoped_sums["second_model_calls"] += 1
+            # Which retrieval route ran, and why it fell back. A scoped question should cost one
+            # retrieval plus one generation; `model_calls` above is the number that proves it.
+            if scoped_meta.get("retrieval_route"):
+                retrieval_routes[str(scoped_meta["retrieval_route"])] += 1
+            if scoped_meta.get("retrieval_fallback_reason"):
+                retrieval_fallbacks[str(scoped_meta["retrieval_fallback_reason"])] += 1
+            if scoped_meta.get("keyword_hint_applied"):
+                scoped_sums["keyword_hint_applied"] += 1
             reason = scoped_meta.get("declined_reason")
             if reason:
                 declined[str(reason)] += 1
@@ -327,7 +338,10 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                              **{key: scoped_sums[key] for key in
                                 ("references_kept", "references_dropped_other_company",
                                  "references_unattributable", "references_dropped_by_context_cap",
-                                 "second_model_calls")},
+                                 "second_model_calls", "model_calls", "keyword_hint_applied")},
+                             "retrieval_routes": dict(sorted(retrieval_routes.items())),
+                             "retrieval_fallbacks": dict(sorted(retrieval_fallbacks.items(),
+                                                                key=lambda item: -item[1])),
                              "declined_reasons": dict(sorted(declined.items(),
                                                              key=lambda item: -item[1]))}
     report["latency_ms"] = _latency(latency)
