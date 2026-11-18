@@ -344,7 +344,30 @@ class TestScoring(_Fixtures):
                                     "--run", f"R0={base_results}", "--run", f"R1={other_results}",
                                     "--log", f"R0={base_log}", "--log", f"R1={other_log}"])
         self.assertEqual(code, 0, err)
-        self.assertIn("R1: unscoped_rows_changed_vs_baseline=1 (target 0) FAIL", out)
+        self.assertIn("R1: unscoped_rows_changed_vs_baseline=1 (target 0, structural fields only)",
+                      out)
+        self.assertIn("FAIL", out)
+
+    def test_answer_length_drift_alone_is_not_a_gate_failure_but_is_reported(self):
+        """Generation is not deterministic: 12 stack2 rows differed in answer_chars only.
+
+        Folding that into the gate made it fail on rows nothing had changed, which trains nobody to
+        trust it. The gate compares control fields; the length drift is printed next to it.
+        """
+        base_results = self.write("d1.results.jsonl", [
+            _result("u1", "gl10-alpha-unsc01", Q_UNSCOPED, "a long answer", [{"company": ALPHA}])])
+        base_log = self.write("d1.log.jsonl", [_log_line("u1", Q_UNSCOPED, [], answer_chars=400)])
+        other_results = self.write("d2.results.jsonl", [
+            _result("u1", "gl10-alpha-unsc01", Q_UNSCOPED, "shorter", [{"company": ALPHA}])])
+        other_log = self.write("d2.log.jsonl", [_log_line("u1", Q_UNSCOPED, [], answer_chars=340)])
+        code, out, err = self._run(["--probe-manifest", str(self.probe_manifest),
+                                    "--run", f"R0={base_results}", "--run", f"R1={other_results}",
+                                    "--log", f"R0={base_log}", "--log", f"R1={other_log}"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("R1: unscoped_rows_changed_vs_baseline=0 (target 0, structural fields only) PASS",
+                      out)
+        self.assertIn("unscoped_answer_chars_drift=1 rows (max 60 chars", out)
+        self.assertIn("informational, not a gate", out)
 
     def test_no_question_answer_or_reference_text_reaches_stdout(self):
         results = self.write("quiet.results.jsonl", [

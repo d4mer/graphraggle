@@ -9,7 +9,10 @@ judge's `*.verdicts.jsonl`, and prints the acceptance numbers for the run:
     other_company_citations                  target 0
     other_company_codes_in_scoped_answers    target 0
     cross_company_named_companies_cited      target >= 80%
-    unscoped_rows_changed_vs_baseline        target 0
+    unscoped_rows_changed_vs_baseline        target 0   (structural fields only: mode, rerank,
+                                            grounding verdict, citation counts, status)
+    unscoped_answer_chars_drift              informational, reported separately - generation is not
+                                            deterministic, so answer length is never a gate
     scoped_correct / refused_ok              from the judge's verdicts, reported per run
 
 Nothing printed is question text, answer text, or reference content. Row references are `gl10-…` ids,
@@ -243,6 +246,10 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
     retrieval_fallbacks: Counter[str] = Counter()
     latency: list[float] = []
     unscoped_diff = 0
+    unscoped_diff_ids: list[str] = []
+    chars_drift_rows = 0
+    chars_deltas: list[int] = []
+    chars_drift_ids: list[str] = []
     citations_present = any(
         _pick(row["row"], FIELD_ALIASES["citations"])[1] is not None
         or _pick(row["row"], FIELD_ALIASES["citation_companies"])[1] is not None for row in rows)
@@ -304,6 +311,16 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                 scoped_sums[key] += int(scoped_meta.get(key) or 0)
             if scoped_meta.get("second_model_call"):
                 scoped_sums["second_model_calls"] += 1
+            # The scoped generation itself, counted apart from `second_model_calls` (which now means a
+            # SECOND generation ran, i.e. the /query retrieval fallback). A row that declined before
+            # generating has generated=0 and model_calls=0.
+            if scoped_meta.get("generated"):
+                scoped_sums["generated_rows"] += 1
+            if scoped_meta.get("hard_refusal_verdict"):
+                scoped_sums["hard_refusal_verdicts"] += 1
+            for key in ("context_chars", "context_blocks_kept", "context_unused_chars",
+                        "context_truncated_blocks"):
+                scoped_sums[key] += int(scoped_meta.get(key) or 0)
             # Which retrieval route ran, and why it fell back. A scoped question should cost one
             # retrieval plus one generation; `model_calls` above is the number that proves it.
             if scoped_meta.get("retrieval_route"):
@@ -322,8 +339,20 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
 
         if shape == "unscoped" and baseline is not None:
             other = baseline.get(entry["probe_id"])
-            if other is not None and _fingerprint(other) != _fingerprint(log_line):
-                unscoped_diff += 1
+            if other is not None:
+                if _fingerprint(other) != _fingerprint(log_line):
+                    unscoped_diff += 1
+                    if len(unscoped_diff_ids) < 25:
+                        unscoped_diff_ids.append(entry["probe_id"])
+                delta = _answer_chars_delta(other, log_line)
+                if delta:
+                    # Generation is not deterministic, so answer length moves run to run even when
+                    # nothing about the pipeline changed. Reported, never folded into the gate and never
+                    # suppressed: a large drift is worth reading, a few characters is noise.
+                    chars_drift_rows += 1
+                    chars_deltas.append(abs(delta))
+                    if len(chars_drift_ids) < 25:
+                        chars_drift_ids.append(entry["probe_id"])
 
     report["rows_by_shape"] = dict(sorted(by_shape.items()))
     report["rows_by_detected_from"] = dict(sorted(by_detected_from.items()))
@@ -339,7 +368,10 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                                 ("references_kept", "references_dropped_other_company",
                                  "references_unattributable", "references_ambiguous",
                                  "references_dropped_by_context_cap",
-                                 "second_model_calls", "model_calls", "keyword_hint_applied")},
+                                 "second_model_calls", "generated_rows", "model_calls",
+                                 "keyword_hint_applied", "context_chars", "context_blocks_kept",
+                                 "context_unused_chars", "context_truncated_blocks",
+                                 "hard_refusal_verdicts")},
                              "retrieval_routes": dict(sorted(retrieval_routes.items())),
                              "retrieval_fallbacks": dict(sorted(retrieval_fallbacks.items(),
                                                                 key=lambda item: -item[1])),
@@ -347,6 +379,14 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                                                              key=lambda item: -item[1]))}
     report["latency_ms"] = _latency(latency)
     report["unscoped_rows_changed_vs_baseline"] = unscoped_diff
+    report["unscoped_rows_changed_ids"] = unscoped_diff_ids
+    report["unscoped_answer_chars_drift"] = {
+        "rows": chars_drift_rows,
+        "max_delta": max(chars_deltas) if chars_deltas else 0,
+        "median_delta": int(round(sorted(chars_deltas)[len(chars_deltas) // 2])) if chars_deltas else 0,
+        "probe_ids": chars_drift_ids,
+        "note": "informational: generation is not deterministic; this is NOT a gate failure",
+    }
 
     if verdicts:
         verdict_counts: Counter[str] = Counter()
@@ -393,6 +433,14 @@ SCOPED_LOG_KEYS: dict[str, str] = {
     "references_ambiguous": "scoped_pass_references_ambiguous",
     "references_dropped_by_context_cap": "scoped_pass_dropped_by_context_cap",
     "second_model_call": "scoped_pass_second_model_call",
+    "generated": "scoped_pass_generated",
+    "hard_refusal_verdict": "scoped_pass_hard_refusal_verdict",
+    "context_chars": "scoped_pass_context_chars",
+    "context_max_chars": "scoped_pass_context_max_chars",
+    "context_blocks_kept": "scoped_pass_context_blocks_kept",
+    "context_truncated_blocks": "scoped_pass_context_truncated_blocks",
+    "context_unused_chars": "scoped_pass_context_unused_chars",
+    "context_first_dropped_index": "scoped_pass_context_first_dropped_index",
     "model_calls": "scoped_pass_model_calls",
     "retrieval_route": "scoped_pass_retrieval_route",
     "retrieval_fallback_reason": "scoped_pass_retrieval_fallback_reason",
@@ -418,13 +466,26 @@ def scoped_view(log_line: dict) -> dict:
 
 
 def _fingerprint(log_line: dict[str, Any]) -> tuple[Any, ...]:
-    """What 'unchanged' means for an unscoped row: same citation counts, same scope, same verdict.
+    """What 'unchanged' means for an unscoped row: same control path, same citation counts, same verdict.
 
-    Deliberately excludes `company_scope`, which the flag adds by design, and anything content-shaped.
+    Deliberately excludes `company_scope`, which the flag adds by design, and anything content-shaped -
+    including `answer_chars`. Generation is not deterministic, so answer length drifts between identical
+    runs; on stack2 that failed the gate on 12 rows that were otherwise identical and made the gate
+    untrustworthy. Length drift is reported separately as information (`unscoped_answer_chars_drift`),
+    not folded into the pass/fail. Counts stay in the fingerprint because they describe the pipeline, not
+    the prose.
     """
     keys = ("citations_raw", "citations_merged", "citations_scoped", "citations_final",
-            "mode_used", "rerank_applied", "grounding_verdict", "answer_chars", "status")
+            "mode_used", "rerank_applied", "grounding_verdict", "status")
     return tuple(log_line.get(key) for key in keys)
+
+
+def _answer_chars_delta(baseline: dict[str, Any], log_line: dict[str, Any]) -> int | None:
+    """Answer-length change for the same probe, or None when either side lacks the count."""
+    before, after = baseline.get("answer_chars"), log_line.get("answer_chars")
+    if not isinstance(before, int) or not isinstance(after, int):
+        return None
+    return after - before
 
 
 def _latency(values: Iterable[float]) -> dict[str, Any]:
@@ -458,8 +519,13 @@ def acceptance(reports: list[dict[str, Any]]) -> list[str]:
             lines.append(f"{run}: cross_company_named_companies_cited=not computable "
                          "(the export carried no citation companies)")
         changed = report["unscoped_rows_changed_vs_baseline"]
-        lines.append(f"{run}: unscoped_rows_changed_vs_baseline={changed} (target 0) "
-                     f"{'PASS' if changed == 0 else 'FAIL'}")
+        lines.append(f"{run}: unscoped_rows_changed_vs_baseline={changed} (target 0, structural fields "
+                     f"only) {'PASS' if changed == 0 else 'FAIL'}")
+        drift = report.get("unscoped_answer_chars_drift") or {}
+        if drift.get("rows"):
+            lines.append(f"{run}: unscoped_answer_chars_drift={drift['rows']} rows "
+                         f"(max {drift.get('max_delta', 0)} chars, median "
+                         f"{drift.get('median_delta', 0)}) - informational, not a gate")
         verdicts = report.get("verdicts") or {}
         if verdicts.get("available") is False:
             lines.append(f"{run}: scoped_correct=not computable (no verdicts file)")
