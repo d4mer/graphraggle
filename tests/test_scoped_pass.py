@@ -317,7 +317,12 @@ class TestScopedPass(_TempStore):
         self.assertNotIn(CP_PATH, prompt)
         self.assertEqual([c["file_path"] for c in result.citations], [NW_PATH])
         self.assertEqual(result.meta["references_dropped_other_company"], 1)
-        self.assertTrue(result.meta["second_model_call"])
+        # `/query/data` retrieval costs no generation, so this call is the pass's ONLY one: `generated`
+        # says the pass generated, `second_model_call` says a SECOND generation ran, and on this route it
+        # did not. (It used to be true here, which is why every scoped row looked like it had paid twice.)
+        self.assertTrue(result.meta["generated"])
+        self.assertFalse(result.meta["second_model_call"])
+        self.assertEqual(result.meta["model_calls"], 1)
 
     def test_a_cross_company_question_keeps_both_companies(self):
         client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
@@ -994,6 +999,280 @@ class TestQueryLogCarriesTheRetrievalRoute(unittest.TestCase):
         line = self._emit({"retrieval_shape": {"items_with_text": 1}, "model_calls": 1})
         self.assertNotIn(NW_CHUNK, json.dumps(line))
         self.assertNotIn(CP_CHUNK, json.dumps(line))
+
+
+class TestRefusalPrompt(_TempStore):
+    """Stack2 R2 refused 0/12 unanswerable questions while R0 refused 1/12.
+
+    `mode: bypass` sends the LLM only the text we hand it - LightRAG's own retrieval prompt, with its
+    "if you do not have enough information say so" instruction and its reference discipline, never
+    runs. So the scoped pass has to carry that discipline itself. These tests assert the request
+    carries it, because the model's compliance cannot be tested offline and the request can be.
+    """
+
+    def test_the_generation_request_carries_the_refusal_instruction(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        _run(scoped_pass.company_scoped_pass("what is CP-2507 batch yield?", [NW],
+                                             payload_base={}, client=client))
+        prompt = client.bypass_prompts[0]
+        self.assertIn(NW_CHUNK, prompt, "the kept chunk must be in the request")
+        self.assertIn(scoped_pass.REFUSAL_SENTENCE, prompt,
+                      "the model is told the exact refusal sentence, not asked to phrase one")
+        self.assertIn("do not have enough information", prompt.lower(),
+                      "the wording must be the one app/api.py:WEAK_ANSWER_MARKERS detects")
+        self.assertIn("MATERIAL START", prompt)
+        self.assertIn("MATERIAL END", prompt)
+        self.assertIn("First decide whether the material states", prompt,
+                      "the coverage check is asked for before the answer")
+        self.assertIn("Do not guess", prompt)
+
+    def test_the_refusal_the_gateway_writes_itself_is_detectable(self):
+        """Every refusal the pass can produce is recognised by the gateway's own weak-answer detector."""
+        messages = [scoped_pass.no_scoped_material_message([NW]),
+                    scoped_pass.no_scoped_material_message([NW, CP]),
+                    scoped_pass.REFUSAL_SENTENCE]
+        for message in messages:
+            with self.subTest(message=message[:40]):
+                self.assertTrue(api.has_weak_answer_signal(message),
+                                "a refusal nothing downstream can see is a refusal that never happened")
+        self.assertIn(NW, messages[0])
+        self.assertIn(CP, messages[1])
+
+    def test_a_refused_answer_is_left_as_the_model_wrote_it(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              generation_text="I do not have enough information in these documents "
+                                              "to answer that.")
+        result = _run(scoped_pass.company_scoped_pass("what is CP-2507 yield?", [NW],
+                                                      payload_base={}, client=client))
+        self.assertTrue(result.used)
+        self.assertTrue(api.has_weak_answer_signal(result.answer))
+        self.assertIsNone(result.meta["declined_reason"], "a refusal is an answer, not a declined pass")
+
+
+class TestHardRefusalFlag(_TempStore):
+    """COMPANY_SCOPED_HARD_REFUSAL: the one unanswerable case the gateway can decide for itself.
+
+    Off by default and off in every existing test; the M1 investigation never measured this
+    classifier's false-refusal rate on a dev set, so it ships as a knob to measure, not a promise.
+    """
+
+    def test_off_by_default_a_question_about_an_absent_code_still_generates(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("what was CP-2507's yield?", [NW],
+                                                      payload_base={}, client=client))
+        self.assertTrue(result.meta["generated"])
+        self.assertIsNone(result.meta["hard_refusal_verdict"])
+        self.assertEqual(len(client.bypass_prompts), 1)
+
+    def test_on_it_refuses_when_the_asked_code_is_nowhere_in_the_context(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        with patch.object(scoped_pass.settings, "company_scoped_hard_refusal", True):
+            result = _run(scoped_pass.company_scoped_pass("what was CP-2507's yield?", [NW],
+                                                          payload_base={}, client=client))
+        self.assertTrue(result.used)
+        self.assertEqual(client.bypass_prompts, [], "no model call: the gateway already knows")
+        self.assertTrue(api.has_weak_answer_signal(result.answer))
+        self.assertEqual(result.meta["hard_refusal_verdict"], "no_support_for_asked_identifier")
+        self.assertEqual(result.meta["declined_reason"],
+                         "asked_identifier_absent_from_scoped_context")
+        self.assertEqual(result.meta["model_calls"], 0)
+        self.assertEqual(result.citations, [_ref("1", NW_PATH, [NW_CHUNK])],
+                         "the documents searched are still shown")
+
+    def test_on_it_still_answers_when_the_asked_code_is_in_the_context(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK + " CP-2507 is unrelated here."])])
+        with patch.object(scoped_pass.settings, "company_scoped_hard_refusal", True):
+            result = _run(scoped_pass.company_scoped_pass("what was CP-2507's yield?", [NW],
+                                                          payload_base={}, client=client))
+        self.assertTrue(result.meta["generated"])
+        self.assertIsNone(result.meta["hard_refusal_verdict"])
+
+    def test_a_question_with_no_identifier_is_never_hard_refused(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        with patch.object(scoped_pass.settings, "company_scoped_hard_refusal", True):
+            result = _run(scoped_pass.company_scoped_pass("how did lead times move?", [NW],
+                                                          payload_base={}, client=client))
+        self.assertTrue(result.meta["generated"], "absence of a code proves nothing")
+
+    def test_a_code_lost_to_the_cap_says_so_in_the_reason(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]),
+                               _ref("2", NW_PATH, ["the CP-2507 pilot yield was 91 percent."])])
+        with patch.object(scoped_pass.settings, "company_scoped_hard_refusal", True), \
+                patch.object(scoped_pass.settings, "company_scoped_context_max_chars", 140):
+            result = _run(scoped_pass.company_scoped_pass("what was CP-2507's yield?", [NW],
+                                                          payload_base={}, client=client))
+        self.assertEqual(result.meta["declined_reason"],
+                         "asked_identifier_absent_from_scoped_context_after_context_cap")
+
+    def test_the_verdict_is_logged_without_the_codes_or_the_text(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        with patch.object(scoped_pass.settings, "company_scoped_hard_refusal", True):
+            result = _run(scoped_pass.company_scoped_pass("what was CP-2507's yield?", [NW],
+                                                          payload_base={}, client=client))
+        timer = app.observability.StageTimer()
+        with patch("app.observability._emit") as emit:
+            app.observability.emit_query_log(
+                request_id="req-1", query="q", company=None, mode_requested="mix", mode_used="mix",
+                top_k=12, chunk_top_k=16,
+                query_scope={"company_scope": {"companies": [NW], "company_detected_from": "question",
+                                               "company_candidates": []},
+                             "scoped_pass": result.meta},
+                citations_raw=1, citations_merged=1, citations_final=1, answer=result.answer,
+                timer=timer, started=0.0)
+        line = emit.call_args.args[0]
+        self.assertEqual(line["scoped_pass_hard_refusal_verdict"], "no_support_for_asked_identifier")
+        self.assertIs(line["scoped_pass_generated"], False)
+        self.assertEqual(line["scoped_pass_model_calls"], 0)
+        # The identifier that decided the refusal is a fact code, and codes are what a probe leaks on:
+        # the log carries the verdict, never the code or the chunk text.
+        self.assertNotIn("CP-2507", json.dumps(line))
+        self.assertNotIn(NW_CHUNK, json.dumps(line))
+
+
+class TestContextOrdering(unittest.TestCase):
+    """The cap is a decision about which evidence the model may see, so it is ranked, not first-fit."""
+
+    def test_a_lower_ranked_chunk_is_never_kept_over_a_higher_ranked_one(self):
+        refs = [_ref("1", NW_PATH, ["a" * 300]), _ref("2", NW_PATH, ["b" * 40]),
+                _ref("3", NW_PATH, ["c" * 40])]
+        context, meta = scoped_pass.build_scoped_context(refs, 160)
+        self.assertIn("a" * 40, context, "the top-ranked block is kept, cut, not dropped")
+        self.assertLess(len(context), 161, "the cut block still respects the cap")
+        self.assertNotIn("b" * 40, context, "the fill stops at the first block that does not fit")
+        self.assertNotIn("c" * 40, context,
+                         "keeping rank 3 while withholding rank 2 is what the old loop did")
+        self.assertEqual(meta["dropped_by_cap"], 2)
+        self.assertEqual(meta["first_dropped_index"], 1)
+        self.assertEqual(meta["truncated_blocks"], 1)
+        self.assertIn(scoped_pass.CONTEXT_CUT_MARKER, context,
+                      "a cut block is marked, so it cannot be quoted as complete evidence")
+
+    def test_an_ordinary_cap_cut_keeps_everything_above_the_cut(self):
+        refs = [_ref("1", NW_PATH, ["a" * 40]), _ref("2", NW_PATH, ["b" * 40]),
+                _ref("3", NW_PATH, ["c" * 300])]
+        context, meta = scoped_pass.build_scoped_context(refs, 220)
+        self.assertIn("a" * 40, context)
+        self.assertIn("b" * 40, context)
+        self.assertNotIn("c" * 300, context)
+        self.assertEqual(meta["blocks_kept"], 2)
+        self.assertEqual(meta["dropped_by_cap"], 1)
+        self.assertEqual(meta["first_dropped_index"], 2)
+        self.assertGreater(meta["unused_chars"], 0)
+
+    def test_chunk_only_items_do_not_join_a_reference_shaped_context(self):
+        """Two rankings cannot be compared, so they are never interleaved into one budget.
+
+        Appending chunk-only documents after the references put the answer-bearing document LAST
+        regardless of its rank, where the cap could drop it while keeping worse material.
+        """
+        payload = {"data": {"references": [{"reference_id": "1", "file_path": NW_PATH,
+                                            "content": ["the answer chunk"]}],
+                            "chunks": [{"file_path": "/other/doc.txt", "content": ["ranked first"]}]}}
+        items, census = scoped_pass.normalize_data_payload(payload)
+        self.assertEqual([scoped_pass.path_of(item) for item in items], [NW_PATH])
+        self.assertEqual(census["chunk_only_paths"], 1)
+        self.assertEqual(census["chunk_only_skipped"], 1)
+        self.assertEqual(census["chunk_only_used"], 0)
+
+    def test_a_chunk_shaped_body_is_read_in_chunk_order(self):
+        payload = {"data": {"references": [{"reference_id": "1", "file_path": NW_PATH}],
+                            "chunks": [{"file_path": NW_PATH, "content": ["first"]},
+                                       {"file_path": NW_PATH, "content": ["second"]}]}}
+        items, census = scoped_pass.normalize_data_payload(payload)
+        self.assertEqual(census["chunk_only_used"], 1)
+        self.assertEqual(items[-1]["file_path"], NW_PATH)
+        self.assertEqual(items[-1]["content"], ["first", "second"],
+                         "chunk order is retrieval order here, and one document is one block")
+
+
+class TestModelCallSemantics(_TempStore):
+    """`second_model_call` means a second GENERATION ran. It used to mean "this pass generated"."""
+
+    def test_on_the_query_data_route_one_call_ran_and_the_flag_is_false(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertTrue(result.meta["generated"])
+        self.assertFalse(result.meta["second_model_call"])
+        self.assertEqual(result.meta["model_calls"], 1)
+
+    def test_on_the_query_fallback_route_the_flag_is_true_and_the_cost_is_two(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], data_raises=LightRAGRejected(
+            400, '{"detail":"Invalid request parameters: include_chunk_content"}'))
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertTrue(result.meta["generated"])
+        self.assertTrue(result.meta["second_model_call"],
+                        "retrieval through /query already generated an answer that was thrown away")
+        self.assertEqual(result.meta["model_calls"], 2)
+        self.assertEqual(result.meta["retrieval_fallback_reason"], "query_data_http_400")
+
+    def test_declining_before_generating_reports_no_calls(self):
+        client = FakeLightRAG([_ref("1", GHOST_PATH, [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertFalse(result.meta["generated"])
+        self.assertFalse(result.meta["second_model_call"])
+        self.assertEqual(result.meta["model_calls"], 0)
+
+
+class TestAmbiguousNamesInTheScopedPass(_TempStore):
+    """Task 5 of the run report: the 100 ambiguous references, and what that rule does and does not do.
+
+    In the stack2 corpus the ambiguous names are the generator's own: `manifest.json` (one per
+    company, different bytes) and the planted cross-company duplicate pair. They must never be
+    credited to a named company - and a duplicate pair inside ONE company must stay reachable.
+    """
+
+    MANIFEST = "manifest.json"
+
+    def _seed_manifests(self, north_bytes: str, contoso_bytes: str | None):
+        self.seed(f"/source_docs/{NW}/{self.MANIFEST}", NW,
+                  document_id="doc-nw-manifest", sha="sha-nw-manifest")
+        if contoso_bytes is not None:
+            self.seed(f"/source_docs/{CP}/{self.MANIFEST}", CP,
+                      document_id="doc-cp-manifest", sha="sha-cp-manifest")
+
+    def test_both_companies_holding_a_manifest_never_attributes_it(self):
+        self._seed_manifests("north facts", "contoso facts")
+        refs = [_ref("1", self.MANIFEST, ["NC-3617 cutover freeze ran 5 hours"]),
+                _ref("2", NW_PATH, [NW_CHUNK])]
+        client = FakeLightRAG(refs)
+        result = _run(scoped_pass.company_scoped_pass("what happened under NC-3617?", [NW],
+                                                      payload_base={}, client=client))
+        prompt = client.bypass_prompts[0]
+        self.assertNotIn("NC-3617 cutover freeze", prompt,
+                         "a manifest two companies could both own is not evidence for either")
+        self.assertEqual(result.meta["references_ambiguous"], 1)
+        self.assertEqual(result.meta["references_kept"], 1)
+
+    def test_a_manifest_only_one_company_holds_attributes_to_that_company(self):
+        """The residual risk the lead should know about: a lone manifest IS citable, and it lists codes.
+
+        Nothing in the join can tell a manifest from any other document. This is why the generator's
+        manifest.json being ingested at all (.json is a text extension) is a probe-hygiene problem,
+        not a join problem.
+        """
+        self._seed_manifests("north facts", None)
+        refs = [_ref("1", self.MANIFEST, ["NC-3617 cutover freeze ran 5 hours"])]
+        client = FakeLightRAG(refs)
+        result = _run(scoped_pass.company_scoped_pass("what happened under NC-3617?", [NW],
+                                                      payload_base={}, client=client))
+        self.assertIn("NC-3617 cutover freeze", client.bypass_prompts[0])
+        self.assertEqual(result.meta["references_ambiguous"], 0)
+
+    def test_same_bytes_twice_inside_one_company_stays_reachable(self):
+        """A duplicate pair inside one company is a filing fact, not an ambiguity to refuse."""
+        for path, document_id in ((f"/source_docs/{NW}/copy-a.txt", "doc-copy-a"),
+                                  (f"/source_docs/{NW}/copy-b.txt", "doc-copy-b")):
+            self.seed(path, NW, document_id=document_id, sha="sha-shared-bytes")
+        refs = [_ref("1", "copy-a.txt", [NW_CHUNK]), _ref("2", "copy-b.txt", ["same bytes again"])]
+        client = FakeLightRAG(refs)
+        result = _run(scoped_pass.company_scoped_pass("what happened to lead times?", [NW],
+                                                      payload_base={}, client=client))
+        self.assertEqual(result.meta["references_ambiguous"], 0)
+        self.assertEqual(result.meta["references_kept"], 2)
+        self.assertIn("same bytes again", client.bypass_prompts[0])
 
 
 if __name__ == "__main__":

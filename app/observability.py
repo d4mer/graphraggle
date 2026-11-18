@@ -337,7 +337,11 @@ def emit_query_log(
             # "the corpus has colliding names" - the first is a bug, the second is an ingest problem.
             "scoped_pass_references_ambiguous": scoped.get("references_ambiguous"),
             "scoped_pass_dropped_by_context_cap": scoped.get("references_dropped_by_context_cap"),
+            # `second_model_call` means a SECOND generation ran (the /query retrieval fallback). The
+            # scoped generation itself is `scoped_pass_generated`; `model_calls` is the total. Hermes
+            # flagged the old reading: the flag was true on 70/70 rows while every row cost one call.
             "scoped_pass_second_model_call": scoped.get("second_model_call"),
+            "scoped_pass_generated": scoped.get("generated"),
             # A scoped question should cost one generation. `model_calls` counts every model call the
             # pass made (0 when it declined before generating, 2 when the /query retrieval fallback
             # forced a discarded answer), and the route keys say which retrieval ran and why.
@@ -351,6 +355,18 @@ def emit_query_log(
             # Counts of what the retrieval-only endpoint returned (references, chunks, how many carried
             # text, how many had no path). Counts only - never chunk text.
             "scoped_pass_retrieval_shape": scoped.get("retrieval_shape"),
+            # What the context cap did: the budget, what survived it, whether the highest-ranked block
+            # had to be cut, and the index at which the ranked list stopped being kept. A binding cap
+            # (stack2: 100 references dropped) is otherwise indistinguishable from bad retrieval.
+            "scoped_pass_context_chars": scoped.get("context_chars"),
+            "scoped_pass_context_max_chars": scoped.get("context_max_chars"),
+            "scoped_pass_context_blocks_kept": scoped.get("context_blocks_kept"),
+            "scoped_pass_context_truncated_blocks": scoped.get("context_truncated_blocks"),
+            "scoped_pass_context_unused_chars": scoped.get("context_unused_chars"),
+            "scoped_pass_context_first_dropped_index": scoped.get("context_first_dropped_index"),
+            # Set only with COMPANY_SCOPED_HARD_REFUSAL on: the classifier's verdict, never the codes it
+            # matched or any document text.
+            "scoped_pass_hard_refusal_verdict": scoped.get("hard_refusal_verdict"),
             "scoped_pass_declined_reason": scoped.get("declined_reason"),
             "latency_ms_total": timer.total_ms(started),
             "latency_ms_by_stage": timer.elapsed_ms,

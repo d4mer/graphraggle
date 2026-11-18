@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     company_scoped_context_max_chars: int = Field(default=12000,
                                                   alias="COMPANY_SCOPED_CONTEXT_MAX_CHARS")
 
+    # GL-10: when the question names an identifier (a code like NC-3617) and that identifier appears
+    # nowhere in the material the scoped pass chose to send, refuse instead of generating. This is the
+    # one unanswerable case the gateway can decide for itself; the matcher is the shipped
+    # app/grounding.py identifier/verbatim-token rule, not a new one. Off by default because the M1
+    # investigation measured this classifier's FALSE-REFUSAL risk only on synthetic probes, never on a
+    # dev set of answerable questions - measure it on stack2 (the log carries
+    # `scoped_pass_hard_refusal_verdict`) before trusting it on answers people read.
+    company_scoped_hard_refusal: bool = Field(default=False, alias="COMPANY_SCOPED_HARD_REFUSAL")
+
     # GL-10: name the scoped companies in the retrieval keywords (`hl_keywords`/`ll_keywords`) so
     # similar chunks from other companies are less likely to fill the pool. A bias, not a boundary:
     # the state-join filter is what excludes, and the guarantee does not depend on this. Off by

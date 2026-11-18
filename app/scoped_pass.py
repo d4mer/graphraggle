@@ -79,7 +79,8 @@ def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
     census: dict[str, Any] = {"top_level_keys": sorted(payload) if isinstance(payload, dict) else [],
                               "data_keys": [], "references_found": 0, "chunks_found": 0,
                               "items_with_text": 0, "items_without_path": 0,
-                              "chunk_only_paths": 0, "content_keys_seen": {},
+                              "chunk_only_paths": 0, "chunk_only_used": 0, "chunk_only_skipped": 0,
+                              "content_keys_seen": {},
                               "path_keys_seen": {}}
     if not isinstance(payload, dict):
         return [], census
@@ -114,6 +115,12 @@ def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
 
     chunks = data.get("chunks")
     if isinstance(chunks, list):
+        # The chunk list is used only when the document-shaped list carries no text at all. It is never
+        # appended below references that DO carry text: `references[]` and `chunks[]` are two separate
+        # rankings, and merging them into one context ordering would silently rank one system's output
+        # above the other's - and a chunk that landed at the end could be the one holding the answer. A
+        # chunk-shaped body is read in chunk order, which is retrieval order there. Either way the count
+        # is reported, so a shape that needs the fallback is visible in the log before it costs a run.
         grouped: dict[str, list[str]] = {}
         order: list[str] = []
         for chunk in chunks:
@@ -129,12 +136,16 @@ def normalize_data_payload(payload: Any) -> tuple[list[dict[str, Any]], dict[str
                 grouped[path] = []
                 order.append(path)
             grouped[path].append(text)
-        for path in order:
-            census["chunk_only_paths"] += 1
-            census["items_with_text"] += 1
-            if not path:
-                census["items_without_path"] += 1
-            items.append({"file_path": path, "content": grouped[path]})
+        census["chunk_only_paths"] = len(order)
+        if order and not paths_with_text:
+            census["chunk_only_used"] = len(order)
+            for path in order:
+                census["items_with_text"] += 1
+                if not path:
+                    census["items_without_path"] += 1
+                items.append({"file_path": path, "content": grouped[path]})
+        elif order:
+            census["chunk_only_skipped"] = len(order)
     census["content_key_counts"] = census.pop("content_keys_seen")
     return items, census
 
@@ -234,26 +245,93 @@ async def _retrieve_via_query(question: str, payload_base: dict[str, Any], clien
     return items, meta
 
 
+# The refusal the gateway gives is one wording family, and it deliberately contains the phrase
+# app/api.py:WEAK_ANSWER_MARKERS already looks for ("do not have enough information"). A refusal in
+# invented words is a refusal the gateway, the operator's tooling and the run scorer cannot see: the
+# scoped pass answers 0/12 unanswerable questions on stack2 partly because the only refusal instruction
+# in the prompt asked for words nothing downstream recognises.
+REFUSAL_SENTENCE = "I do not have enough information in these documents to answer that."
+
+
 def no_scoped_material_message(companies: list[str]) -> str:
-    """Said out loud when the named companies' documents hold nothing for the question."""
+    """Said out loud when the named companies' documents hold nothing for the question.
+
+    Carries the weak-answer marker phrase so this refusal is recognisable by the same detector the
+    normal path's refusals are recognisable by, and names the companies that were searched so the
+    reader knows what "these documents" means.
+    """
     if len(companies) == 1:
-        return (f"I could not find an answer to that in the {companies[0]} documents I was given. "
-                "I have not answered from any other company's material.")
-    joined = ", ".join(companies[:-1]) + " and " + companies[-1]
-    return (f"I could not find an answer to that in the documents of {joined}. "
-            "I have not answered from any other company's material.")
+        where = f"the {companies[0]} documents I was given"
+    else:
+        joined = ", ".join(companies[:-1]) + " and " + companies[-1]
+        where = f"the documents of {joined}"
+    return (f"I could not find an answer to that in {where}: I do not have enough information in them "
+            "to answer it. I have not answered from any other company's material.")
 
 
 def scoped_generation_prompt(question: str, companies: list[str], context: str) -> str:
-    """The instruction that makes the second call answer from the scoped material only."""
+    """The instruction that makes the generation call answer from the scoped material, or refuse.
+
+    Why it is this long. `mode: bypass` sends the LLM the text we hand it and nothing else: LightRAG's
+    own retrieval prompt - the one that carries its "if you do not have enough information, say so"
+    instruction and its reference discipline - never runs. So the scoped pass has to supply that
+    discipline itself, in the same terms, or the model treats the material as a starting point and
+    finishes the answer from what it already believes it knows about the company. That is exactly the
+    stack2 result: no leak, no extra latency, and a hallucination count that went UP (R1 37 -> R2 42).
+
+    Three things the prompt must do, in this order: bound the evidence (markers, no outside knowledge),
+    ask for the coverage check BEFORE the answer, and name the exact refusal sentence, so a refusal is
+    a fixed string the gateway can detect rather than a phrasing the model invents.
+    """
     joined = ", ".join(companies)
     return (
-        f"Answer the question using ONLY the material below. That material belongs to: {joined}. "
-        "Do not use knowledge about any other company, and do not name a document that is not "
-        "listed. If the material does not answer the question, say that you could not find it in "
-        f"these documents.\n\nQuestion: {question}\n\nMaterial:\n{context}\n\n"
+        "You are answering from a bounded set of documents, and from nothing else.\n"
+        f"The material below is the complete evidence available for this question. It belongs to: "
+        f"{joined}.\n"
+        "\n"
+        "Rules:\n"
+        "1. Use only the text between MATERIAL START and MATERIAL END. Do not use what you know about "
+        "these companies, their products, their industry, or any other company.\n"
+        "2. First decide whether the material states the specific fact being asked about. If it does "
+        "not, reply with exactly this sentence and nothing else:\n"
+        f"   {REFUSAL_SENTENCE}\n"
+        "3. Do not guess, estimate, or supply a name, number, date, code or document title that does "
+        "not appear in the material. A plausible answer that is not in the material is a wrong answer, "
+        "and refusing costs less than inventing.\n"
+        "4. Attribute every fact you state to one of the Source lines below, naming that file. Never "
+        "cite a document that is not listed.\n"
+        "5. If the material answers only part of the question, answer that part and then say which "
+        "part is not in these documents.\n"
+        "\n"
+        f"Question: {question}\n"
+        "\n"
+        "MATERIAL START\n"
+        f"{context}\n"
+        "MATERIAL END\n"
+        "\n"
         "Answer:"
     )
+
+
+def hard_refusal_verdict(question: str, context: str) -> str | None:
+    """`no_support_for_asked_identifier` when the question names an identifier the context lacks.
+
+    This is the one unanswerable case the gateway can decide for itself instead of asking the model to
+    be disciplined about it: the question names a code (NC-3617) and that code appears nowhere in the
+    material the model was given. The matcher is the shipped one - `app/grounding.py`'s identifier and
+    verbatim-token rules, the same vocabulary the M1 gate reports in - not a new one invented here.
+
+    A question with no identifier in it returns None: absence of a code proves nothing, and this check
+    must not become a hunch. Returns None rather than a verdict when everything asked is supported.
+    """
+    from .grounding import identifiers, verbatim_support
+
+    asked = identifiers(question or "")
+    if not asked:
+        return None
+    if all(verbatim_support(code, context) for code in asked):
+        return None
+    return "no_support_for_asked_identifier"
 
 
 @dataclass
@@ -312,29 +390,80 @@ def classify_references(
     return kept, counts
 
 
-def build_scoped_context(references: list[dict[str, Any]], max_chars: int) -> tuple[str, dict[str, int]]:
-    """Concatenate the kept references' chunk text, whole references only, under the cap.
+CONTEXT_CUT_MARKER = "[... material cut here by the gateway context cap ...]"
 
-    Dropping whole references rather than truncating one keeps a citation in the prompt complete or
-    absent, so a sentence cannot be cut off and then quoted as if it were evidence.
+
+def _truncate_block(block: str, limit: int) -> str:
+    """Cut a block to `limit` at a line boundary, with the cut marked.
+
+    The marker is not decoration: an unmarked cut block can be quoted as if it were complete evidence.
+    """
+    room = max(0, limit - len(CONTEXT_CUT_MARKER) - 1)
+    cut = block[:room]
+    header_end = block.find("\n")
+    boundary = cut.rfind("\n")
+    if boundary > header_end:
+        # Trim to a line boundary - but never past the "Source:" line, which would cut the block down
+        # to a label and no material at all.
+        cut = cut[:boundary]
+    return (cut.rstrip() + "\n" + CONTEXT_CUT_MARKER)[:limit]
+
+
+def build_scoped_context(references: list[dict[str, Any]],
+                         max_chars: int) -> tuple[str, dict[str, int]]:
+    """Concatenate the kept references' chunk text, in retrieval order, under the cap.
+
+    The two rules, because "apply a cap" hides a decision about which evidence the model is allowed to
+    see:
+
+    - **The kept set is a prefix of the retrieval order.** The old loop skipped a reference that did not
+      fit and kept the smaller ones below it, so a lower-ranked chunk could be in the prompt while a
+      higher-ranked one from the same retrieval was not - which makes an answer unreproducible and makes
+      "the answer chunk was dropped" undetectable from the counts. Now the first reference that does not
+      fit ends the fill, and everything below it is counted as dropped (`first_dropped_index` says where).
+    - **A block is included whole, except at the top.** Whole-or-absent keeps a citation in the prompt
+      complete or missing, so a sentence cannot be cut off and quoted as if it were evidence. The one
+      exception is the highest-ranked block: if it alone exceeds the cap, dropping it and answering from
+      nothing would be the worse failure, so it is cut to the budget with `CONTEXT_CUT_MARKER` in it.
+
+    Counted: `blocks_kept`, `dropped_by_cap`, `truncated_blocks`, `unused_chars` (budget left over when
+    the fill stopped) and `first_dropped_index` (-1 when nothing was dropped).
     """
     parts: list[str] = []
     used_chars = 0
     dropped_by_cap = 0
+    truncated_blocks = 0
     without_content = 0
-    for reference in references:
+    first_dropped_index = -1
+    fill_closed = False
+    for index, reference in enumerate(references):
         content = citation_content(reference)
         if not content:
             without_content += 1
             continue
         block = f"Source: {reference.get('file_path') or reference.get('path') or 'unknown'}\n{content}"
-        if used_chars + len(block) > max_chars:
+        if fill_closed or used_chars + len(block) > max_chars:
+            if not parts:
+                # Highest-ranked block, bigger than the whole budget: keep it cut, rather than answer
+                # from nothing while claiming the company's documents were searched.
+                block = _truncate_block(block, max_chars)
+                truncated_blocks += 1
+                parts.append(block)
+                used_chars += len(block)
+                fill_closed = True
+                continue
             dropped_by_cap += 1
+            if first_dropped_index < 0:
+                first_dropped_index = index
+            fill_closed = True
             continue
         parts.append(block)
         used_chars += len(block)
     return "\n\n".join(parts), {"context_chars": used_chars, "dropped_by_cap": dropped_by_cap,
-                                "without_content": without_content}
+                                "without_content": without_content, "blocks_kept": len(parts),
+                                "truncated_blocks": truncated_blocks,
+                                "unused_chars": max(0, max_chars - used_chars),
+                                "first_dropped_index": first_dropped_index}
 
 
 async def company_scoped_pass(
@@ -386,6 +515,21 @@ async def company_scoped_pass(
         "references_without_content": context_meta["without_content"],
         "context_chars": context_meta["context_chars"],
         "context_max_chars": settings.company_scoped_context_max_chars,
+        # The cap decision is auditable now: how many blocks the model actually saw, whether one was
+        # cut, how much budget was left unused, and the index at which the ranked list stopped being
+        # kept. Without `first_dropped_index` a binding cap looks like a retrieval problem.
+        "context_blocks_kept": context_meta["blocks_kept"],
+        "context_truncated_blocks": context_meta["truncated_blocks"],
+        "context_unused_chars": context_meta["unused_chars"],
+        "context_first_dropped_index": context_meta["first_dropped_index"],
+        # `second_model_call` now means what its name says: a SECOND generation ran, which happens only
+        # on the `/query` fallback route, where retrieval itself cost an answer that is thrown away. The
+        # scoped generation is reported by `generated` and counted by `model_calls`; on the `/query/data`
+        # route it is the pass's ONLY generation, and saying `second_model_call: true` there made every
+        # scoped row look like it had paid twice (Hermes: true on 70/70 rows while model_calls was 1).
+        "second_model_call": bool(retrieval_meta.get("retrieval_model_calls")),
+        "generated": False,
+        "hard_refusal_verdict": None,
         # `second_model_call` is kept as the log/scorer key it already is. Under `/query/data` it is
         # the only model call the pass makes - `model_calls` says which - and it is genuinely the
         # second one only on the `/query` fallback route.
@@ -419,7 +563,23 @@ async def company_scoped_pass(
         return ScopedPass(answer=no_scoped_material_message(allowed_companies), citations=kept,
                           meta=meta, used=True)
 
-    meta["second_model_call"] = True
+    if settings.company_scoped_hard_refusal:
+        # The deterministic half of the refusal fix: when the question names an identifier and that
+        # identifier is nowhere in the material we chose to send, the gateway refuses instead of asking
+        # the model to behave. Off by default - the M1 measurement of how often this classifier is wrong
+        # was never run over a dev set, so this is a knob for Hermes to measure, not a shipped promise.
+        verdict = hard_refusal_verdict(question, context)
+        meta["hard_refusal_verdict"] = verdict
+        if verdict:
+            meta["declined_reason"] = ("asked_identifier_absent_from_scoped_context_after_context_cap"
+                                       if context_meta["dropped_by_cap"] else
+                                       "asked_identifier_absent_from_scoped_context")
+            return ScopedPass(answer=no_scoped_material_message(allowed_companies), citations=kept,
+                              meta=meta, used=True)
+
+    meta["generated"] = True
+    if retrieval_meta.get("retrieval_model_calls"):
+        meta["second_model_call"] = True
     meta["model_calls"] = retrieval_meta.get("retrieval_model_calls", 0) + 1
     generation = await client.post_json(
         "/query",
