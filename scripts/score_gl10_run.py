@@ -318,6 +318,13 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                 scoped_sums["generated_rows"] += 1
             if scoped_meta.get("hard_refusal_verdict"):
                 scoped_sums["hard_refusal_verdicts"] += 1
+            # A scoped pass whose generation call failed served the request by degrading. Counted so a
+            # run with degradations cannot be read as a clean scoped run.
+            if scoped_meta.get("generation_error"):
+                scoped_sums["generation_errors"] += 1
+            if scoped_meta.get("fallback_error"):
+                scoped_sums["fallback_errors"] += 1
+            scoped_sums["history_messages"] += int(scoped_meta.get("history_messages") or 0)
             for key in ("context_chars", "context_blocks_kept", "context_unused_chars",
                         "context_truncated_blocks"):
                 scoped_sums[key] += int(scoped_meta.get(key) or 0)
@@ -371,7 +378,8 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                                  "second_model_calls", "generated_rows", "model_calls",
                                  "keyword_hint_applied", "context_chars", "context_blocks_kept",
                                  "context_unused_chars", "context_truncated_blocks",
-                                 "hard_refusal_verdicts")},
+                                 "hard_refusal_verdicts", "generation_errors", "fallback_errors",
+                                 "history_messages")},
                              "retrieval_routes": dict(sorted(retrieval_routes.items())),
                              "retrieval_fallbacks": dict(sorted(retrieval_fallbacks.items(),
                                                                 key=lambda item: -item[1])),
@@ -441,6 +449,9 @@ SCOPED_LOG_KEYS: dict[str, str] = {
     "context_truncated_blocks": "scoped_pass_context_truncated_blocks",
     "context_unused_chars": "scoped_pass_context_unused_chars",
     "context_first_dropped_index": "scoped_pass_context_first_dropped_index",
+    "generation_error": "scoped_pass_generation_error",
+    "fallback_error": "scoped_pass_fallback_error",
+    "history_messages": "scoped_pass_history_messages",
     "model_calls": "scoped_pass_model_calls",
     "retrieval_route": "scoped_pass_retrieval_route",
     "retrieval_fallback_reason": "scoped_pass_retrieval_fallback_reason",

@@ -185,6 +185,21 @@ class TestRealLogShape(_Fixtures):
         self.assertEqual(report["retrieval_fallbacks"], {"query_data_http_400": 1})
         self.assertEqual(report["declined_reasons"], {"no_reference_joins_a_named_company": 1})
 
+    def test_a_degraded_scoped_generation_is_counted_not_hidden(self):
+        """A pass whose generation call failed served the request another way; the report must say so."""
+        line = self._emitted_line({
+            "references_kept": 2, "generated": False, "second_model_call": False, "model_calls": 0,
+            "retrieval_route": "query/data", "history_messages": 2,
+            "generation_error": {"type": "HTTPStatusError", "status": 400},
+            "fallback_error": "fallback_pass_failed:HTTPStatusError",
+            "hard_refusal_verdict": None, "declined_reason": "generation_failed_400"})
+        report = self._score(line)
+        self.assertEqual(report["generated_rows"], 0)
+        self.assertEqual(report["generation_errors"], 1)
+        self.assertEqual(report["fallback_errors"], 1)
+        self.assertEqual(report["history_messages"], 2)
+        self.assertEqual(report["declined_reasons"], {"generation_failed_400": 1})
+
     def test_a_nested_export_still_scores(self):
         line = _log_line("req-flat", Q_SCOPED, [ALPHA],
                          scoped_pass={"references_kept": 4, "model_calls": 1,
