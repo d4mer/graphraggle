@@ -157,6 +157,36 @@ retrieval_fallback_reason / retrieval_shape / keyword_hint_applied) /
 dropped_other_company / unattributable / dropped_by_context_cap / declined reasons), latency median
 and p95 per run, and the bridge Sources count. No question text, no answers, no reference content.
 
+## What changed for the next run (structure-cutover-8)
+
+R2 on cutover-7 was leak-free and fast (median 15.7 s, one model call per scoped row) and refused
+**0/12** unanswerable questions while R0 refused 1/12, with the judge's hallucination count UP (R1 37 →
+R2 42). Four changes, all re-runnable as R2/R3; R0/R1 results stand:
+
+- **The scoped generation prompt now carries the refusal discipline itself.** `mode: bypass` sends the
+  LLM only the text we hand it — LightRAG's own "if you do not have enough information, say so"
+  instruction never runs — so the pass supplies it: bounded MATERIAL markers, a coverage check asked for
+  before the answer, mandatory attribution to a Source line, a ban on inventing a name/number/date/code,
+  and a fixed refusal sentence. Every refusal the pass can produce now contains the phrase
+  `not enough information`, so refusals are countable everywhere.
+- **`COMPANY_SCOPED_HARD_REFUSAL` (default off)** — worth one extra measurement column. Run R2 twice if
+  you have the budget: once with it off (the shipped default) and once on. Compare
+  `refused_unanswerable` against `scoped_correct`: the flag refuses without a model call when the asked
+  identifier is absent from the context, so any drop in `scoped_correct` is a false refusal and is the
+  number that decides whether it ever ships on.
+- **`second_model_call` means a second GENERATION ran.** It is false on the `/query/data` route (that
+  route's scoped generation is the pass's only call) and true only when retrieval fell back to `/query`,
+  where the answer is generated and discarded (`model_calls=2`). The pass's own generation is now
+  `scoped_pass_generated`. Do not read the old runs' `second_model_call` numbers with this meaning.
+- **The context cap is ranked.** The kept set is a prefix of the retrieval order; the counters are new.
+
+Send back the new numbers too: per scoped row `scoped_pass_generated`, `..._model_calls`,
+`..._context_blocks_kept`, `..._context_chars`, `..._context_unused_chars`,
+`..._context_truncated_blocks`, `..._context_first_dropped_index`, and (if measured)
+`..._hard_refusal_verdict` counts by value. From the scorer: `unscoped_rows_changed_vs_baseline`
+(structural fields only) **and** the separate `unscoped_answer_chars_drift=…` line — generation is not
+deterministic, so length drift is expected and must be reported, not gated.
+
 ## Teardown
 
 ```bash

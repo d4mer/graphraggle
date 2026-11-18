@@ -129,3 +129,27 @@ Answers to the stack questions in `docs/decisions/gl10-company-from-question-map
   without `include_chunk_content`, which is the cheaper payload.
 
 None of those is assumed by the shipped code.
+
+## Refusal discipline is ours to write (2026-11-18)
+
+R2 on cutover-7 refused 0/12 unanswerable questions (R0 1/12, R1 3/12) while leaking nothing. The scoped
+pass generates with `mode: bypass`, which sends the LLM only the text we hand it: LightRAG's retrieval
+prompt - the thing that carries its "if you do not have enough information, say so" instruction and its
+reference discipline - never runs. Choosing (b) bought the boundary and quietly removed the instruction
+that makes a RAG system admit it has nothing. So the boundary and the honesty are now both our
+responsibility in one prompt: bound the evidence, ask for the coverage check before the answer, require
+attribution to a Source line, forbid inventing identifiers, and name the refusal sentence. That sentence
+is one constant, and it contains the phrase `app/api.py:WEAK_ANSWER_MARKERS` already detects, so a
+refusal is a countable event instead of a phrasing.
+
+The deterministic half (`COMPANY_SCOPED_HARD_REFUSAL`, off) is kept separate and off because it is a
+different kind of claim: the gateway deciding a question is unanswerable from the identifier it asked
+about. The matcher is the shipped grounding classifier, whose false-refusal rate was measured only on
+synthetic probes. Measured on a stack run before it is trusted on answers; when it fires and the
+identifier was lost to the context cap, the reason string says so, because that is a budget decision
+rather than a fact about the corpus.
+
+Two consequences worth recording for anyone who changes this again: the cap is a claim about which
+evidence the model may see, so the kept set is a prefix of the retrieval order and only the top block may
+be cut (marked); and `data.references[]` and `data.chunks[]` are never merged into one ordering, because
+they are two rankings and only one of them can be trusted when the other carries no text.

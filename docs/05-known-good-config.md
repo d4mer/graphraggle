@@ -358,6 +358,21 @@ Gateway defaults that are **in force without being written in `.env`**:
    and every existing row keeps resolving through the basename rule.
    `scripts/gl10_basename_audit.py` counts the cases apart over a corpus or a state database, which is
    how you decide whether a corpus needs that re-ingest or the join alone is enough.
+   The cap is `COMPANY_SCOPED_CONTEXT_MAX_CHARS` (default 12000 characters) and it binds: a stack2 run
+   dropped 100 kept references to it. The kept set is a **prefix of the retrieval order** — the first
+   block that does not fit closes the fill — so a lower-ranked chunk is never in the prompt while a
+   higher-ranked one from the same retrieval is withheld. Only the highest-ranked block may be cut to
+   the budget, and the cut is marked in the text so it cannot be quoted as complete evidence. The log
+   reports `scoped_pass_context_blocks_kept`, `..._context_chars`, `..._context_unused_chars`,
+   `..._context_truncated_blocks` and `..._context_first_dropped_index` (where the ranked list stopped
+   being kept), which is how you tell "the cap is too small" from "retrieval found the wrong things".
+   `COMPANY_SCOPED_HARD_REFUSAL` (default **false**) refuses without asking the model when the question
+   names an identifier (a code like `NC-3617`) that appears nowhere in the material the pass chose to
+   send. It reuses the shipped `app/grounding.py` identifier and verbatim-token rules and reports the M1
+   vocabulary (`scoped_pass_hard_refusal_verdict=no_support_for_asked_identifier`), never the code or
+   the chunk text. Off by default because that classifier's false-refusal rate was measured on synthetic
+   probes and never on a dev set of answerable questions: measure it on a stack run before letting it
+   decide what a person reads.
    `COMPANY_KEYWORD_HINT` (default false) is a separate opt-in that names the company in the
    `hl_keywords`/`ll_keywords` of that retrieval; it changes recall, never the guarantee.
    **The trade-off that remains is the operator's call.** On the Open WebUI bridge `retrieval` loses

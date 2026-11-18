@@ -1087,3 +1087,62 @@ qualified-name prefix collisions. So R1/R2/R3 can re-run on the existing index w
 Reported, not fixed: because `.json` is a text extension, each company's generator `manifest.json` is
 ingested — and it lists the planted fact codes. That is a probe-hygiene problem for synthetic runs.
 Suite: `1637 passed, 2 skipped, 316 subtests passed` (base `0830fa3`: 1617).
+
+## 2026-11-18 — GL-10 scoped pass: it stopped leaking and started inventing — the refusal discipline was left upstream
+
+**Area:** `app/scoped_pass.py`, `app/config.py`, `app/observability.py`, `scripts/score_gl10_run.py` ·
+**Tests:** +20 (+3 subtests) · **New dark setting:** `COMPANY_SCOPED_HARD_REFUSAL=false`
+
+Stack2 R2 (`structure-cutover-7`): 0 other-company citations, 0 other-company codes in scoped answers,
+18/18 cross-company named citations, median 15.7 s vs R0's 42.5 s, one model call per scoped row — and
+`refused_unanswerable` **0/12** (R0 1/12, R1 3/12), `scoped_correct` 31/58 vs baseline 35/58, judge
+hallucination count **42** (R1 37). The pass bought the boundary and lost the honesty.
+
+**Cause, from the code, not the model.** The scoped pass generates with `mode: bypass`, which sends the
+LLM the text we hand it and nothing else — LightRAG's own retrieval prompt, which carries its
+"if you do not have enough information, say so" instruction and its reference discipline, never runs. Our
+prompt said "say that you could not find it in these documents": not the wording any detector knows, no
+bound on the evidence, no coverage check, and an invited answer. Three fixes, all offline-verifiable at
+the request boundary:
+
+- `REFUSAL_SENTENCE` is one constant and contains the phrase `app/api.py:WEAK_ANSWER_MARKERS` detects
+  (`do not have enough information`); `no_scoped_material_message` is built from the same wording, so
+  **every** refusal the pass emits is recognised by the same detector the normal path's refusals are.
+  The prompt now bounds the material (MATERIAL START/END), asks for the coverage check **before** the
+  answer, requires attribution to a Source line, forbids inventing a name/number/date/code, and permits a
+  partial answer with the uncovered part named.
+- `COMPANY_SCOPED_HARD_REFUSAL` (default off): when the question names an identifier and that identifier
+  is nowhere in the material the pass chose to send, the gateway refuses with no model call
+  (`asked_identifier_absent_from_scoped_context`, or `..._after_context_cap` when the cap lost it).
+  Matcher is the shipped `app/grounding.py` identifier + verbatim-token rule and the M1 verdict
+  vocabulary, never the code or chunk text in the log. Off because that classifier's false-refusal rate
+  was measured on synthetic probes only — Hermes measures it as an extra column before anyone ships it on.
+- A question with **no** identifier is never hard-refused: absence of a code proves nothing.
+
+**`dropped_by_context_cap=100` confirmed, and the cap was ordering evidence wrongly.** The cap is
+`COMPANY_SCOPED_CONTEXT_MAX_CHARS` (default 12000 characters) and it binds. Two faults: the fill was
+first-fit, so a lower-ranked chunk could sit in the prompt while a higher-ranked chunk from the same
+retrieval was withheld; and `data.chunks[]` items were appended **after** `data.references[]`, merging
+two rankings that are not comparable and putting an answer-bearing chunk at the end of the budget. Now the
+kept set is a **prefix of the retrieval order**, the chunk list is used only when the document-shaped list
+carries no text at all (`chunk_only_used` / `chunk_only_skipped` in the census), and only the
+highest-ranked block may be cut to budget — marked with `CONTEXT_CUT_MARKER`, because an unmarked cut is
+what the whole-reference rule exists to prevent. New log counters: `context_blocks_kept`,
+`context_chars`, `context_max_chars`, `context_unused_chars`, `context_truncated_blocks`,
+`context_first_dropped_index`.
+
+**`second_model_call` meant the wrong thing** (Hermes flagged it: true on 70/70 rows with `model_calls=1`).
+It is now a second *generation* — false on the `/query/data` route, true only on the `/query` retrieval
+fallback where an answer is generated and discarded (`model_calls=2`). The pass's own generation is
+`scoped_pass_generated`; a pass that declines before generating reports `generated=false, model_calls=0`.
+
+**Scorer gate fixed without hiding the noise.** `unscoped_rows_changed_vs_baseline` failed on 12 rows
+whose only difference was `answer_chars`; generation is not deterministic. The fingerprint now covers the
+control path (citation counts, `mode_used`, `rerank_applied`, `grounding_verdict`, `status`) and never
+answer length, and drift is reported separately with rows, max/median absolute delta and up to 25 probe
+ids. A test pins that a real `citations_final` change still fails the gate.
+
+Not fixed, reported: the scoped generation call does not carry `conversation_history`, so a follow-up
+question ("and the other one?") is retrieved with context and answered without it; and a 4xx on the
+scoped generation call still surfaces as a 500 (the retrieval legs degrade, the generation leg does not).
+Suite: `1657 passed, 2 skipped, 327 subtests passed` (base `9d95782`: 1637).

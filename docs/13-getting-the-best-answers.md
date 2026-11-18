@@ -265,7 +265,10 @@ Two levels of "scoped", set by `COMPANY_SCOPE_ENFORCEMENT`:
   company out is the document ownership check, never the keyword.
 
 If scoped retrieval finds nothing it says so plainly — "I could not find an answer to that in the
-… documents I was given". That is deliberate: an answer from another company's documents would be
+… documents I was given: I do not have enough information in them to answer it." When the company's
+material is present but does not answer the question, the reply is the same shape: "I do not have
+enough information in these documents to answer that." That wording is deliberate and shared with the
+gateway's other refusals, so the admin's log tools can count refusals at all. That is also deliberate: an answer from another company's documents would be
 the worse failure. If you see it for a document you know exists, tell the admin which document. The
 two causes an admin can actually act on:
 
