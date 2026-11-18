@@ -153,3 +153,24 @@ Two consequences worth recording for anyone who changes this again: the cap is a
 evidence the model may see, so the kept set is a prefix of the retrieval order and only the top block may
 be cut (marked); and `data.references[]` and `data.chunks[]` are never merged into one ordering, because
 they are two rankings and only one of them can be trusted when the other carries no text.
+
+## The scoped pass is inside a conversation (2026-11-18)
+
+Retrieval was given the conversation and generation was not, so a follow-up resolved for retrieval and not
+for the model. Two decisions, one of them a safety call rather than a convenience one:
+
+- The generation payload sends the same `conversation_history` the normal path sends, and the prompt also
+  carries a bounded block of the **earlier user turns**, because whether `mode: bypass` honours that field
+  upstream is unverified here. Sending the field is what upstream would honour; embedding the questions is
+  what makes the instruction work either way.
+- **Assistant turns are never embedded.** An earlier answer may have been written before any company
+  boundary existed and may quote another company's document; pasting it into a scoped generation puts the
+  excluded text back in front of the model. Earlier questions carry the referent without carrying facts.
+  The residual is stated, not hidden: if bypass does honour `conversation_history`, upstream may still feed
+  assistant turns back, and that is a source question for the stack, not something this repo can decide.
+
+Failure is a degradation, not an error: a rejected or timed-out scoped generation makes the pass
+`used=False` with `generation_failed_<status>`, hands over no text and no citations, lets the caller serve
+its citation-filtered path, and if that fails too the request is served with the honest decline. The
+decline sets no weak-signal reason, so the evidence-adding stages cannot re-open an unscoped search — that
+would trade a 500 for a leak, which is the one swap this feature refuses to make.

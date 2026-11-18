@@ -187,6 +187,19 @@ Send back the new numbers too: per scoped row `scoped_pass_generated`, `..._mode
 (structural fields only) **and** the separate `unscoped_answer_chars_drift=…` line — generation is not
 deterministic, so length drift is expected and must be reported, not gated.
 
+## Scoped-pass degradations are now visible in the log (cutover-8 follow-up)
+
+A scoped pass whose GENERATION call is rejected, fails or times out no longer surfaces as a 500: it
+degrades to the citation-filtered normal path, and the line says so —
+`scoped_pass_generation_error` (`{type, status}`, never body text), `scoped_pass_declined_reason`
+`generation_failed_<status>` / `generation_failed:<Exception>`, `scoped_pass_generated=false`,
+`scoped_pass_model_calls` without the failed call. If the fallback path fails as well, the request is
+served with the gateway's decline and `scoped_pass_fallback_error`. Count them in the report
+(`generation_errors`, `fallback_errors`): a run with degradations is not a clean scoped run, and its
+refusal/latency numbers should be read with that in mind. Follow-up rows now carry history into the
+generation leg (`scoped_pass_history_messages`); if it is 0 on a multi-turn row, history did not reach the
+door rather than the pass.
+
 ## Teardown
 
 ```bash

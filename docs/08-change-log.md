@@ -1146,3 +1146,40 @@ Not fixed, reported: the scoped generation call does not carry `conversation_his
 question ("and the other one?") is retrieved with context and answered without it; and a 4xx on the
 scoped generation call still surfaces as a 500 (the retrieval legs degrade, the generation leg does not).
 Suite: `1657 passed, 2 skipped, 327 subtests passed` (base `9d95782`: 1637).
+
+## 2026-11-18 — GL-10 follow-ups: the scoped pass could not see the conversation, and a failed generation was the user's 500
+
+**Area:** `app/scoped_pass.py`, `app/api.py`, `app/observability.py`, `scripts/score_gl10_run.py` ·
+**Tests:** +11 · no new setting
+
+**Follow-ups lost their referent.** The scoped retrieval leg received `conversation_history`; the scoped
+generation call did not, so "and what about their second contract?" retrieved the right material and then
+asked the model a question it could not resolve. The generation payload now carries the same history the
+normal `/query` path sends (added only when present — a single-turn generation payload is byte-identical,
+key set included), and the prompt carries a bounded block of the **earlier user turns** so the instruction
+is self-sufficient regardless of what `mode: bypass` does with the field. Assistant turns are not embedded:
+an earlier assistant turn may be an answer written before any company boundary existed — quoting another
+company's document and its path — and pasting it back into a scoped generation reintroduces exactly the
+text the pass exists to exclude. Unverified and reported, not assumed: whether bypass honours
+`conversation_history` upstream is a source question, and if it does, assistant turns can come back.
+
+**A scoped generation failure is now a degradation, not an error.** `used=False`,
+`declined_reason=generation_failed_<status>` (`generation_failed:<Exception>` with no message when there is
+no server body), the failed call is not counted (`generated=false`, excluded from `model_calls`), and the
+pass hands over no text and no citations. The caller serves its normal path with citation filtering — the
+shipped `citations` behaviour — and the packet's warning says the scoped answer could not be regenerated
+instead of claiming it was. If that fallback path raises too, the request is still served: the honest
+decline (naming the companies searched, containing the weak-answer marker phrase), zero citations,
+`scoped_pass_fallback_error` in the log, and **no weak-signal reason**, so the evidence-adding stages cannot
+re-search unscoped and put another company's text back in the answer. That branch fires only for a request
+the scoped pass attempted: an ordinary upstream failure still raises with its own status, so the flag-off
+envelope and status codes are unchanged.
+
+Reported, no change needed: with `COMPANY_SCOPE_ENFORCEMENT=retrieval` and a question naming **no**
+company, the pass never runs — the request costs exactly one upstream `/query` with the ordinary payload
+byte-for-byte, no `scoped_pass`, no `stages_skipped_for_scope`, no `warning` (now test-pinned).
+
+New log keys: `scoped_pass_generation_error` (class and status only, never body text),
+`scoped_pass_fallback_error`, `scoped_pass_history_messages`; the scorer reports `generation_errors`,
+`fallback_errors`, `generated_rows` and summed `history_messages`.
+Suite: `1669 passed, 2 skipped, 327 subtests passed` (base `5642ca9`: 1657).
