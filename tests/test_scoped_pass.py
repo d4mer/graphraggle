@@ -181,6 +181,33 @@ class FakeLightRAG:
         return [payload for _, payload in self.calls if payload.get("mode") != "bypass"]
 
 
+class FakePerRoundRetrieval(FakeLightRAG):
+    """A `/query/data` that answers differently per round: thin first, wider second.
+
+    The widening decision is a comparison between two retrievals, so a fake that returns the same pool
+    twice can only prove a second round happened, not that it helped or hurt. A pool entry that is an
+    Exception makes that round fail, which is how the no-extra-generation rule is exercised. All the
+    strictness and recording of FakeLightRAG is inherited.
+    """
+
+    def __init__(self, pools: list, **kwargs) -> None:
+        super().__init__([], **kwargs)
+        self.pools = pools
+        self.data_rounds = 0
+
+    async def post_json(self, path: str, payload: dict) -> dict:
+        if path == "/query/data" and payload.get("mode") != "bypass":
+            pool = self.pools[min(self.data_rounds, len(self.pools) - 1)]
+            self.data_rounds += 1
+            if isinstance(pool, Exception):
+                self.data_raises = pool
+            else:
+                self.data_payload = {"status": "success", "message": "ok",
+                                     "data": {"entities": [], "relationships": [], "chunks": [],
+                                              "references": pool}}
+        return await super().post_json(path, payload)
+
+
 class _TempStore(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="grg-gl10p3-")
@@ -1445,6 +1472,240 @@ class TestNoCompanyNamedNeverRunsThePass(_TempStore, _PipelineSettings):
         self.assertNotIn("scoped_pass", data["query_scope"])
         self.assertNotIn("stages_skipped_for_scope", data["query_scope"])
         self.assertNotIn("warning", data["query_scope"])
+
+
+class TestScopedRetrievalOverFetch(_TempStore):
+    """The scoped retrieval must over-fetch, because the company filter throws most of it away.
+
+    Stack2 cutover-9 R2: 1056 references came back, 614 survived the filter, and the answer chunk for
+    the named company was often in the discarded 442 - so an honest model refused 21 answerable
+    questions it used to guess at. The lever is recall BEFORE the filter. Three rules make pulling it
+    safe, and each is pinned here: at multiplier 1 nothing about a request changes; a wider round can
+    never buy a second generation; and the context cap still decides what the model reads however much
+    was fetched.
+    """
+
+    BASE = {"mode": "mix", "top_k": 10, "chunk_top_k": 5}
+
+    def setUp(self):
+        super().setUp()
+        # More of the named company's own documents, so a wider pool can genuinely hold more of them.
+        self.nw_extra = [(f"/source_docs/Northwind Chemicals/nw{i}.pdf", f"Northwind figure {i}.")
+                         for i in range(2, 6)]
+        for index, (path, _text) in enumerate(self.nw_extra):
+            self.seed(path, NW, document_id=f"doc-nw-extra-{index}")
+
+    def _nw_refs(self, count: int) -> list[dict]:
+        refs = [_ref("1", NW_PATH, [NW_CHUNK])]
+        for index, (path, text) in enumerate(self.nw_extra[:count - 1], start=2):
+            refs.append(_ref(str(index), path, [text]))
+        return refs
+
+    def _scoped(self, client, *, multiplier=2, floor=3, ceiling=200, cap=12000,
+                base: dict | None = None):
+        with patch.object(scoped_pass.settings, "company_scoped_retrieval_multiplier", multiplier), \
+                patch.object(scoped_pass.settings, "company_scoped_retrieval_floor", floor), \
+                patch.object(scoped_pass.settings, "company_scoped_retrieval_ceiling", ceiling), \
+                patch.object(scoped_pass.settings, "company_scoped_context_max_chars", cap):
+            result = _run(scoped_pass.company_scoped_pass(
+                "what did Northwind Chemicals report?", [NW],
+                payload_base=dict(base or self.BASE), client=client))
+        return result
+
+    @staticmethod
+    def _data_payloads(client) -> list[dict]:
+        return [payload for path, payload in client.calls if path == "/query/data"]
+
+    def test_multiplier_1_changes_nothing_in_the_request_or_the_call_count(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._scoped(client, multiplier=1)
+        self.assertEqual(self._data_payloads(client)[0]["top_k"], 10)
+        self.assertEqual(self._data_payloads(client)[0]["chunk_top_k"], 5)
+        self.assertEqual(client.paths, ["/query/data", "/query"],
+                         "one retrieval, one generation: no second round at multiplier 1")
+        meta = result.meta
+        self.assertFalse(meta["retrieval_widened"])
+        self.assertEqual(meta["retrieval_widen_skipped_reason"], "over_fetch_multiplier_1")
+        self.assertEqual(meta["retrieval_not_scaled_reason"], "multiplier_1")
+        self.assertEqual(meta["retrieval_top_k_requested"], 10)
+        self.assertEqual(meta["model_calls"], 1)
+
+    def test_the_multiplier_scales_both_sizes_and_says_so_in_the_log(self):
+        client = FakeLightRAG(self._nw_refs(3))
+        result = self._scoped(client, multiplier=3)
+        payload = self._data_payloads(client)[0]
+        self.assertEqual((payload["top_k"], payload["chunk_top_k"]), (30, 15))
+        self.assertEqual(client.paths, ["/query/data", "/query"], "3 kept blocks = at the floor, no widen")
+        meta = result.meta
+        self.assertEqual(meta["retrieval_top_k_requested"], 30)
+        self.assertEqual(meta["retrieval_chunk_top_k_requested"], 15)
+        self.assertEqual(meta["retrieval_multiplier"], 3)
+        self.assertEqual(meta["references_returned"], 3)
+        self.assertIsNone(meta["retrieval_widen_skipped_reason"])
+
+    def test_the_ceiling_stops_a_multiplier_asking_for_an_unbounded_pool(self):
+        client = FakeLightRAG(self._nw_refs(3))
+        self._scoped(client, multiplier=3, ceiling=12)
+        payload = self._data_payloads(client)[0]
+        self.assertEqual((payload["top_k"], payload["chunk_top_k"]), (12, 12),
+                         "10x3 and 5x3 both clamp to the ceiling, not to 30 and 15")
+
+    def test_a_thin_kept_set_gets_one_wider_round_that_carries_the_answer(self):
+        client = FakePerRoundRetrieval([self._nw_refs(1), self._nw_refs(4)])
+        result = self._scoped(client, multiplier=2, floor=3)
+        self.assertEqual([payload["top_k"] for payload in self._data_payloads(client)], [20, 40])
+        self.assertEqual(client.paths, ["/query/data", "/query/data", "/query"],
+                         "two rounds and one generation, no more")
+        meta = result.meta
+        self.assertTrue(meta["retrieval_widened"])
+        self.assertTrue(meta["retrieval_widening_kept"])
+        self.assertEqual(meta["retrieval_rounds"], 2)
+        self.assertEqual(meta["retrieval_calls"], 2)
+        self.assertEqual(meta["model_calls"], 1)
+        self.assertFalse(meta["second_model_call"])
+        self.assertEqual([citation["file_path"] for citation in result.citations],
+                         [NW_PATH] + [path for path, _ in self.nw_extra[:3]])
+        prompt = client.bypass_prompts[0]
+        for _path, text in self.nw_extra[:3]:
+            self.assertIn(text, prompt, "the wider round's evidence is what the model was shown")
+        detail = meta["retrieval_rounds_detail"]
+        self.assertEqual([(round_["round"], round_["top_k_requested"], round_["kept"],
+                           round_["blocks_kept"]) for round_ in detail],
+                         [(1, 20, 1, 1), (2, 40, 4, 4)])
+
+    def test_the_wider_round_never_buys_a_second_generation(self):
+        """A wider round that fails must not fall back to the answering endpoint.
+
+        The first round cost nothing; the pass may not turn that row into one that paid for a
+        discarded generation just because it tried harder. The first round's evidence stands.
+        """
+        client = FakePerRoundRetrieval([self._nw_refs(1),
+                                        LightRAGRejected(400, '{"detail":"Invalid request"}')])
+        result = self._scoped(client, multiplier=2, floor=3)
+        self.assertEqual([payload for path, payload in client.calls
+                          if path == "/query" and payload.get("mode") != "bypass"], [],
+                         "no retrieval ever went to the answering endpoint")
+        self.assertEqual(client.paths, ["/query/data", "/query/data", "/query"],
+                         "the single /query call is the scoped generation")
+        meta = result.meta
+        self.assertTrue(meta["retrieval_widened"])
+        self.assertFalse(meta["retrieval_widening_kept"])
+        self.assertEqual([citation["file_path"] for citation in result.citations], [NW_PATH])
+        self.assertEqual(meta["model_calls"], 1)
+        self.assertEqual(meta["retrieval_rounds_detail"][1]["route"], "query/data")
+        self.assertTrue(meta["retrieval_rounds_detail"][1]["fallback_reason"]
+                        .startswith("wider_round_no_query_fallback:"))
+
+    def test_widening_is_skipped_when_the_first_round_already_paid_a_generation(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], reject_first_retrievals=1)
+        result = self._scoped(client, multiplier=2, floor=3)
+        self.assertEqual(client.paths, ["/query/data", "/query", "/query"])
+        meta = result.meta
+        self.assertEqual(meta["retrieval_widen_skipped_reason"], "first_round_paid_a_generation")
+        self.assertEqual(meta["retrieval_rounds"], 1)
+        self.assertTrue(meta["second_model_call"], "the /query retrieval fallback did pay twice")
+
+    def test_widening_is_skipped_when_the_ceiling_has_already_been_reached(self):
+        client = FakeLightRAG(self._nw_refs(1))
+        result = self._scoped(client, multiplier=6, ceiling=12, floor=3)
+        self.assertEqual(client.paths, ["/query/data", "/query"])
+        self.assertEqual(result.meta["retrieval_widen_skipped_reason"], "at_retrieval_ceiling")
+        self.assertEqual(result.meta["retrieval_widened"], False)
+
+    def test_widening_is_skipped_when_there_is_no_size_to_scale(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = self._scoped(client, multiplier=2, floor=3, base={"mode": "mix"})
+        self.assertEqual(client.paths, ["/query/data", "/query"])
+        self.assertEqual(result.meta["retrieval_widen_skipped_reason"], "no_sizes_in_payload_base")
+
+    def test_the_multiplier_touches_only_the_two_sizes_it_names(self):
+        """The bridge door's payload carries rerank and token budgets; scaling must leave them alone.
+
+        This is the whole rerank interplay question in one assertion: the over-fetch must not turn the
+        request into a different KIND of retrieval. If scaling dropped `enable_rerank`, the bigger pool
+        would arrive unreranked and the run would measure a longer context, not a better-ordered one.
+        """
+        client = FakeLightRAG(self._nw_refs(3))
+        base = {"mode": "mix", "top_k": 10, "chunk_top_k": 5, "enable_rerank": True,
+                "max_entity_tokens": 10000, "max_relation_tokens": 10000,
+                "max_total_tokens": 32000, "conversation_history": [{"role": "user",
+                                                                      "content": "earlier turn"}]}
+        self._scoped(client, multiplier=3, base=base)
+        payload = self._data_payloads(client)[0]
+        self.assertEqual((payload["top_k"], payload["chunk_top_k"]), (30, 15))
+        for key, value in (("enable_rerank", True), ("max_entity_tokens", 10000),
+                           ("max_relation_tokens", 10000), ("max_total_tokens", 32000)):
+            self.assertEqual(payload[key], value, f"{key} must survive the over-fetch untouched")
+        self.assertEqual(payload["conversation_history"], base["conversation_history"])
+
+    def test_the_wider_round_keeps_the_door_payload_not_a_rebuilt_one(self):
+        client = FakePerRoundRetrieval([self._nw_refs(1), self._nw_refs(4)])
+        base = dict(self.BASE, enable_rerank=False, max_total_tokens=8000)
+        self._scoped(client, multiplier=2, floor=3, base=base)
+        for payload in self._data_payloads(client):
+            self.assertEqual(payload["enable_rerank"], False)
+            self.assertEqual(payload["max_total_tokens"], 8000)
+        self.assertEqual([payload["top_k"] for payload in self._data_payloads(client)], [20, 40])
+
+    def test_over_fetch_never_raises_the_context_budget(self):
+        cap = 200
+        client = FakePerRoundRetrieval([self._nw_refs(1), self._nw_refs(5)])
+        result = self._scoped(client, multiplier=2, floor=3, cap=cap)
+        meta = result.meta
+        self.assertTrue(meta["retrieval_widening_kept"], "more was fetched")
+        self.assertLessEqual(meta["context_chars"], cap, "but the model still sees no more than the cap")
+        self.assertEqual(meta["context_max_chars"], cap)
+        self.assertEqual(meta["context_truncated_blocks"], 0,
+                         "whole blocks only: the cap dropped the rest rather than cutting one")
+        self.assertGreater(meta["references_dropped_by_context_cap"], 0,
+                           "the extra fetch is real, and the cap is what stopped it")
+        prompt = client.bypass_prompts[0]
+        for _path, text in self.nw_extra[2:]:
+            self.assertNotIn(text, prompt, "fetched but not shown: the cap is still the limit")
+
+    def test_a_widened_context_is_still_a_prefix_of_the_wider_retrieval_order(self):
+        """Over-fetching must not let the cap pick a ragged set: what is kept stays rank-ordered."""
+        refs = self._nw_refs(5)
+        blocks = [f"Source: {ref['file_path']}\n{ref['content'][0]}" for ref in refs]
+        cap = sum(len(block) for block in blocks[:2]) + 2 * len("\n\n")
+        client = FakePerRoundRetrieval([self._nw_refs(1), refs])
+        result = self._scoped(client, multiplier=2, floor=3, cap=cap)
+        meta = result.meta
+        self.assertEqual(meta["context_blocks_kept"], 2)
+        self.assertEqual(meta["context_first_dropped_index"], 2)
+        prompt = client.bypass_prompts[0]
+        self.assertIn(refs[0]["content"][0], prompt)
+        self.assertIn(refs[1]["content"][0], prompt)
+        for ref in refs[2:]:
+            self.assertNotIn(ref["content"][0], prompt)
+
+    def test_the_widening_decision_reaches_the_emitted_log_line(self):
+        """Real pass meta through the real projection: the counters Hermes reads exist on the line."""
+        client = FakePerRoundRetrieval([self._nw_refs(1), self._nw_refs(4)])
+        result = self._scoped(client, multiplier=2, floor=3)
+        timer = app.observability.StageTimer()
+        with patch("app.observability._emit") as emit:
+            app.observability.emit_query_log(
+                request_id="req-widen", query="what did Northwind Chemicals report?", company=None,
+                mode_requested="mix", mode_used="mix", top_k=10, chunk_top_k=5,
+                query_scope={"company_scope": {"companies": [NW], "company_detected_from": "question",
+                                               "company_candidates": []},
+                             "scoped_pass": result.meta},
+                citations_raw=4, citations_merged=4, citations_final=4, answer="a",
+                timer=timer, started=0.0)
+        line = emit.call_args.args[0]
+        self.assertIs(line["scoped_pass_retrieval_widened"], True)
+        self.assertIs(line["scoped_pass_retrieval_widening_kept"], True)
+        self.assertEqual(line["scoped_pass_retrieval_rounds"], 2)
+        self.assertEqual(line["scoped_pass_retrieval_calls"], 2)
+        self.assertEqual(line["scoped_pass_retrieval_multiplier"], 4)
+        self.assertEqual(line["scoped_pass_retrieval_top_k_requested"], 40)
+        self.assertEqual(line["scoped_pass_retrieval_chunk_top_k_requested"], 20)
+        self.assertEqual(line["scoped_pass_references_returned"], 4)
+        self.assertEqual(line["scoped_pass_retrieval_floor"], 3)
+        self.assertNotIn(NW_CHUNK + " extra", json.dumps(line))
+        self.assertNotIn("Northwind figure", json.dumps(line),
+                         "round detail carries counts, never chunk text")
 
 
 if __name__ == "__main__":

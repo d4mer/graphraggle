@@ -69,6 +69,27 @@ class Settings(BaseSettings):
     company_scoped_context_max_chars: int = Field(default=12000,
                                                   alias="COMPANY_SCOPED_CONTEXT_MAX_CHARS")
 
+    # GL-10: over-fetch the scoped retrieval. LightRAG ranks over ALL companies and the pass then
+    # throws most of what came back away (other company, unattributable, ambiguous, cap). On stack2
+    # cutover-9 that was 246 + 90 + 100 + 116 of 1056 references: the named company's answer chunk is
+    # often not in the survivors, and since the refusal prompt landed an honest model refuses 21
+    # answerable questions where it used to guess. The lever is recall BEFORE the filter, so ask for
+    # `multiplier` x the door's top_k/chunk_top_k, never above COMPANY_SCOPED_RETRIEVAL_CEILING. The
+    # context cap is untouched and stays the only limit on what the model sees.
+    # Default 1 = unchanged shipped behaviour, until Hermes measures it on stack2.
+    company_scoped_retrieval_multiplier: int = Field(
+        default=1, alias="COMPANY_SCOPED_RETRIEVAL_MULTIPLIER")
+    company_scoped_retrieval_ceiling: int = Field(
+        default=200, alias="COMPANY_SCOPED_RETRIEVAL_CEILING")
+
+    # GL-10: if the kept, attributable set is thinner than this, retrieve ONCE more at double the
+    # multiplier before generating. Counts blocks that actually reached the prompt, not references
+    # kept, because a block with no chunk text cannot answer anything. 0 disables the second round, and
+    # the round never runs at MULTIPLIER=1: the second retrieval belongs to the over-fetch lever, so
+    # flag-off behaviour stays one retrieval and one generation per row.
+    company_scoped_retrieval_floor: int = Field(
+        default=3, alias="COMPANY_SCOPED_RETRIEVAL_FLOOR")
+
     # GL-10: when the question names an identifier (a code like NC-3617) and that identifier appears
     # nowhere in the material the scoped pass chose to send, refuse instead of generating. This is the
     # one unanswerable case the gateway can decide for itself; the matcher is the shipped

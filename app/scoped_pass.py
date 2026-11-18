@@ -173,56 +173,118 @@ def apply_keyword_hint(payload: dict[str, Any], companies: Sequence[str]) -> boo
     return added
 
 
+def _scaled_sizes(payload_base: dict[str, Any], multiplier: int) -> tuple[dict[str, int], dict[str, Any]]:
+    """Ask for more candidates than we can keep, because the company filter throws most of them away.
+
+    Ranked retrieval over the whole index at the ordinary top_k/chunk_top_k, then a filter that removes
+    ~40% of the survivors (other company, unattributable, ambiguous), leaves a named company with a thin -
+    sometimes answer-less - context. Stack2 cutover-9 measured the consequence: an honest model refused 21
+    answerable questions it used to guess at. The lever is recall BEFORE filtering, not another prompt
+    line.
+
+    Scaling only touches keys the door already sets, and stops at `COMPANY_SCOPED_RETRIEVAL_CEILING` so a
+    multiplier cannot silently ask upstream for an unbounded pool. With multiplier 1 (the shipped default)
+    the payload is not touched at all: the request stays byte-for-byte what it was.
+    """
+    bookkeeping: dict[str, Any] = {
+        "multiplier": multiplier,
+        "ceiling": settings.company_scoped_retrieval_ceiling,
+        "base_top_k": payload_base.get("top_k"),
+        "base_chunk_top_k": payload_base.get("chunk_top_k"),
+        "top_k_requested": payload_base.get("top_k"),
+        "chunk_top_k_requested": payload_base.get("chunk_top_k"),
+        "scaled": False,
+        "not_scaled_reason": None,
+    }
+    if multiplier <= 1:
+        bookkeeping["not_scaled_reason"] = "multiplier_1"
+        return {}, bookkeeping
+    ceiling = settings.company_scoped_retrieval_ceiling
+    sizes: dict[str, int] = {}
+    for key in ("top_k", "chunk_top_k"):
+        base = payload_base.get(key)
+        if not isinstance(base, int) or base <= 0:
+            continue
+        sizes[key] = min(base * multiplier, ceiling)
+    if not sizes:
+        bookkeeping["not_scaled_reason"] = "no_sizes_in_payload_base"
+        return {}, bookkeeping
+    bookkeeping["scaled"] = any(sizes[key] != payload_base.get(key) for key in sizes)
+    bookkeeping["top_k_requested"] = sizes.get("top_k", bookkeeping["top_k_requested"])
+    bookkeeping["chunk_top_k_requested"] = sizes.get("chunk_top_k", bookkeeping["chunk_top_k_requested"])
+    return sizes, bookkeeping
+
+
 async def retrieve_context(question: str, payload_base: dict[str, Any], client: Any,
-                           companies: Sequence[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                           companies: Sequence[str], *,
+                           multiplier: int | None = None,
+                           allow_query_fallback: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Get the chunk text and document paths WITHOUT paying for an answer that will be thrown away.
 
     `/query/data` is the retrieval-only endpoint; a scoped question then costs one retrieval and one
     generation, the same as an unscoped one. It is tried first and abandoned on evidence, not on
     assumption: if the call fails, or the body carries no usable chunk text, the pass falls back to
     the `/query` retrieval it used before (which does cost an extra generation) and records why.
+
+    `multiplier` overrides COMPANY_SCOPED_RETRIEVAL_MULTIPLIER for this round (the widening round asks
+    twice as wide). `allow_query_fallback=False` keeps a round retrieval-only: the wider round must not
+    turn a row that cost nothing into one that costs a discarded generation, so if `/query/data` fails
+    on that round the round simply returns empty and the first round's evidence stands.
     """
     # Counted separately from the answer the pass later writes, so a run that declines before
     # generating does not report a generation it never made.
     meta: dict[str, Any] = {"retrieval_route": "query/data", "retrieval_fallback_reason": None,
                             "keyword_hint_applied": False, "retrieval_model_calls": 0,
-                            "retrieval_errors": {}}
+                            "retrieval_errors": {}, "retrieval_calls": 0}
+    sizes, sizes_log = _scaled_sizes(payload_base, multiplier if multiplier is not None
+                                     else max(1, settings.company_scoped_retrieval_multiplier))
+    meta["retrieval_sizes"] = sizes_log
     # `query` is set here rather than trusted from payload_base: the gateway door passes
     # mode/top_k/chunk_top_k and the bridge door strips `query` deliberately, so a retrieval built
     # from either base without the question is rejected by LightRAG (400 on /query/data, 422 on
     # /query). The question is what is being retrieved; it belongs to the pass, not to the caller.
-    payload = {**payload_base, "query": question, "include_references": True,
+    payload = {**payload_base, **sizes, "query": question, "include_references": True,
                "include_chunk_content": True}
     if settings.company_keyword_hint:
         meta["keyword_hint_applied"] = apply_keyword_hint(payload, companies)
+    meta["retrieval_calls"] += 1
     try:
         body = await client.post_json("/query/data", payload)
     except Exception as exc:
-        meta["retrieval_route"] = "query"
         meta["retrieval_errors"]["/query/data"] = error_detail(exc)
         status = meta["retrieval_errors"]["/query/data"].get("status")
-        meta["retrieval_fallback_reason"] = (f"query_data_http_{status}" if status
-                                             else f"query_data_error:{type(exc).__name__}")
-        return await _retrieve_via_query(question, payload_base, client, meta, companies)
+        reason = f"query_data_http_{status}" if status else f"query_data_error:{type(exc).__name__}"
+        if not allow_query_fallback:
+            meta["retrieval_fallback_reason"] = f"wider_round_no_query_fallback:{reason}"
+            meta["retrieval_shape"] = {"references_found": 0, "chunks_found": 0, "items_with_text": 0}
+            return [], meta
+        meta["retrieval_route"] = "query"
+        meta["retrieval_fallback_reason"] = reason
+        return await _retrieve_via_query(question, payload_base, client, meta, companies, sizes)
 
     items, census = normalize_data_payload(body)
     meta["retrieval_shape"] = census
     if not any(citation_content(item) for item in items):
+        reason = "query_data_no_chunks" if items else "query_data_no_items"
+        if not allow_query_fallback:
+            meta["retrieval_fallback_reason"] = f"wider_round_no_query_fallback:{reason}"
+            return items, meta
         meta["retrieval_route"] = "query"
-        meta["retrieval_fallback_reason"] = ("query_data_no_chunks" if items
-                                             else "query_data_no_items")
-        return await _retrieve_via_query(question, payload_base, client, meta, companies)
+        meta["retrieval_fallback_reason"] = reason
+        return await _retrieve_via_query(question, payload_base, client, meta, companies, sizes)
     return items, meta
 
 
 async def _retrieve_via_query(question: str, payload_base: dict[str, Any], client: Any,
                               meta: dict[str, Any],
-                              companies: Sequence[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                              companies: Sequence[str],
+                              sizes: dict[str, int] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """The route this code used before: retrieve through the answered endpoint, and pay for it."""
-    payload = {**payload_base, "query": question, "include_references": True,
+    payload = {**payload_base, **(sizes or {}), "query": question, "include_references": True,
                "include_chunk_content": True}
     if settings.company_keyword_hint:
         meta["keyword_hint_applied"] = apply_keyword_hint(payload, companies)
+    meta["retrieval_calls"] += 1
     try:
         body = await client.post_json("/query", payload)
     except Exception as exc:
@@ -509,6 +571,42 @@ def build_scoped_context(references: list[dict[str, Any]],
                                 "first_dropped_index": first_dropped_index}
 
 
+def _round_record(round_number: int, retrieval_meta: dict[str, Any], counts: dict[str, int],
+                  context_meta: dict[str, int]) -> dict[str, Any]:
+    """One retrieval round as the log must show it: asked / returned / kept.
+
+    Without the ASKED numbers a thin context is undiagnosable: "this company has no such document"
+    and "we asked for 20 chunks out of a five-company index and 11 of them belonged to other
+    companies" look identical in the counts, and they want opposite fixes. Counted per round rather
+    than summed, because the only way to see whether the multiplier pays for itself is to compare
+    round 1 against round 2 in the same row.
+    """
+    sizes = retrieval_meta.get("retrieval_sizes") or {}
+    shape = retrieval_meta.get("retrieval_shape") or {}
+    return {
+        "round": round_number,
+        "multiplier": sizes.get("multiplier"),
+        "top_k_requested": sizes.get("top_k_requested"),
+        "chunk_top_k_requested": sizes.get("chunk_top_k_requested"),
+        "scaled": sizes.get("scaled"),
+        "not_scaled_reason": sizes.get("not_scaled_reason"),
+        "route": retrieval_meta.get("retrieval_route"),
+        "retrieval_calls": retrieval_meta.get("retrieval_calls", 0),
+        "fallback_reason": retrieval_meta.get("retrieval_fallback_reason"),
+        "errors": retrieval_meta.get("retrieval_errors") or {},
+        "returned_references": shape.get("references_found"),
+        "returned_chunks": shape.get("chunks_found"),
+        "items_with_text": shape.get("items_with_text"),
+        "kept": counts["kept"],
+        "dropped_other_company": counts["other_company"],
+        "unattributable": counts["unattributable"],
+        "ambiguous": counts["ambiguous"],
+        "blocks_kept": context_meta["blocks_kept"],
+        "dropped_by_cap": context_meta["dropped_by_cap"],
+        "context_chars": context_meta["context_chars"],
+    }
+
+
 async def company_scoped_pass(
     question: str,
     allowed_companies: list[str],
@@ -532,6 +630,20 @@ async def company_scoped_pass(
             for path, detail in sorted(retrieval_meta["retrieval_errors"].items()))
         return ScopedPass(answer="", citations=[], used=False, meta={
             "companies": list(allowed_companies),
+            # Same sizing keys as the carried path, so a run's retrieval-sizing census covers the
+            # failures too instead of silently dropping them from the totals.
+            "retrieval_rounds": 1,
+            "retrieval_calls": retrieval_meta.get("retrieval_calls", 0),
+            "retrieval_floor": settings.company_scoped_retrieval_floor,
+            "retrieval_ceiling": settings.company_scoped_retrieval_ceiling,
+            "retrieval_multiplier": retrieval_meta["retrieval_sizes"]["multiplier"],
+            "retrieval_top_k_requested": retrieval_meta["retrieval_sizes"]["top_k_requested"],
+            "retrieval_chunk_top_k_requested": retrieval_meta["retrieval_sizes"]["chunk_top_k_requested"],
+            "retrieval_not_scaled_reason": retrieval_meta["retrieval_sizes"]["not_scaled_reason"],
+            "retrieval_widened": False,
+            "retrieval_widening_kept": False,
+            "retrieval_widen_skipped_reason": "retrieval_routes_failed",
+            "references_returned": 0,
             "retrieval_route": retrieval_meta["retrieval_route"],
             "retrieval_fallback_reason": retrieval_meta["retrieval_fallback_reason"],
             "retrieval_errors": retrieval_meta["retrieval_errors"],
@@ -547,7 +659,75 @@ async def company_scoped_pass(
     kept, counts = classify_references(references, owners_by_path, allowed_companies)
     context, context_meta = build_scoped_context(kept, settings.company_scoped_context_max_chars)
 
+    # ── one wider round when the company filter left too little to answer from ──
+    # The over-fetch multiplier is a static guess about how much the filter eats; this is the reactive
+    # half, and it is what saves a row whose company simply sits low in the ranking. Bounded hard:
+    # one extra round, only when the first round cost no generation (so a widened row is still at most
+    # ONE generation), and only when a wider request would actually differ. The context cap is not
+    # touched by any of this - a wider pool can add blocks to the prompt, never exceed the budget.
+    floor = settings.company_scoped_retrieval_floor
+    base_multiplier = max(1, settings.company_scoped_retrieval_multiplier)
+    rounds = [_round_record(1, retrieval_meta, counts, context_meta)]
+    widened, widening_kept, widen_skipped = False, False, None
+    if floor > 0 and context_meta["blocks_kept"] < floor:
+        if base_multiplier < 2:
+            # Widening belongs to the over-fetch lever, not to every scoped question. With
+            # COMPANY_SCOPED_RETRIEVAL_MULTIPLIER=1 (the shipped default) the pass must behave exactly
+            # as it did before this row existed, one retrieval and one generation per row; a second
+            # retrieval round on every thin row would change that whether or not it helps.
+            widen_skipped = "over_fetch_multiplier_1"
+        elif retrieval_meta.get("retrieval_model_calls"):
+            # The first round already paid for a generation on the `/query` fallback route. A second
+            # round can pay for another, and a row costing two generations is not the row the
+            # operator agreed to buy. Better a thin context than an unbudgeted second answer.
+            widen_skipped = "first_round_paid_a_generation"
+        else:
+            wide_sizes = _scaled_sizes(payload_base, base_multiplier * 2)[0]
+            if not wide_sizes:
+                # The door sent no top_k/chunk_top_k to scale. Nothing is invented here: the pass
+                # over-fetches what the caller asked for, it does not re-decide the caller's sizing.
+                widen_skipped = "no_sizes_in_payload_base"
+            elif wide_sizes == _scaled_sizes(payload_base, base_multiplier)[0]:
+                widen_skipped = "at_retrieval_ceiling"
+            else:
+                widened = True
+                wide_refs, wide_meta = await retrieve_context(
+                    question, payload_base, client, allowed_companies,
+                    multiplier=base_multiplier * 2, allow_query_fallback=False)
+                wide_owners = await document_identity.ownership_for_paths(
+                    sorted({path_of(reference) for reference in wide_refs} - {""}))
+                wide_kept, wide_counts = classify_references(wide_refs, wide_owners,
+                                                             allowed_companies)
+                wide_context, wide_context_meta = build_scoped_context(
+                    wide_kept, settings.company_scoped_context_max_chars)
+                rounds.append(_round_record(2, wide_meta, wide_counts, wide_context_meta))
+                # Take the wider round only if it is strictly better on what the model actually gets
+                # to read, then on attributable references. On a tie the first round stands: a second
+                # retrieval that changed nothing must not silently change which evidence answers.
+                if ((wide_context_meta["blocks_kept"], wide_counts["kept"])
+                        > (context_meta["blocks_kept"], counts["kept"])):
+                    references, kept, counts = wide_refs, wide_kept, wide_counts
+                    context, context_meta = wide_context, wide_context_meta
+                    retrieval_meta = wide_meta
+                    widening_kept = True
+    carried = rounds[-1] if widening_kept else rounds[0]
+
     meta = {
+        # Retrieval sizing, per round. `retrieval_widened` says a second round ran (whether or not it
+        # won); `retrieval_widen_skipped_reason` says why a thin kept set did NOT get one. A run that
+        # cannot tell these apart cannot tell an over-fetch that worked from one that was refused.
+        "retrieval_rounds": len(rounds),
+        "retrieval_calls": sum(round_["retrieval_calls"] for round_ in rounds),
+        "retrieval_floor": floor,
+        "retrieval_ceiling": settings.company_scoped_retrieval_ceiling,
+        "retrieval_multiplier": carried["multiplier"],
+        "retrieval_top_k_requested": carried["top_k_requested"],
+        "retrieval_chunk_top_k_requested": carried["chunk_top_k_requested"],
+        "retrieval_not_scaled_reason": carried["not_scaled_reason"],
+        "retrieval_widened": widened,
+        "retrieval_widening_kept": widening_kept,
+        "retrieval_widen_skipped_reason": widen_skipped,
+        "retrieval_rounds_detail": rounds,
         "companies": list(allowed_companies),
         "references_total": counts["total"],
         "references_kept": counts["kept"],
@@ -555,6 +735,7 @@ async def company_scoped_pass(
         "references_unattributable": counts["unattributable"],
         "references_ambiguous": counts["ambiguous"],
         "references_dropped_by_context_cap": context_meta["dropped_by_cap"],
+        "references_returned": carried["returned_references"],
         "references_without_content": context_meta["without_content"],
         "context_chars": context_meta["context_chars"],
         "context_max_chars": settings.company_scoped_context_max_chars,

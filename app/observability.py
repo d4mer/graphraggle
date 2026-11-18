@@ -355,6 +355,26 @@ def emit_query_log(
             # Counts of what the retrieval-only endpoint returned (references, chunks, how many carried
             # text, how many had no path). Counts only - never chunk text.
             "scoped_pass_retrieval_shape": scoped.get("retrieval_shape"),
+            # Retrieval sizing. The company filter throws most of what retrieval returns away, so a row
+            # must say what was ASKED as well as what was kept: without these, "we asked for 20 chunks
+            # out of a five-company index and 11 belonged to other companies" is indistinguishable from
+            # "this company has no such document". `retrieval_rounds_detail` is the same numbers per
+            # round, which is the only way to see whether the over-fetch and the widening paid for
+            # themselves. Counts and settings only - never chunk text.
+            "scoped_pass_retrieval_rounds": scoped.get("retrieval_rounds"),
+            "scoped_pass_retrieval_calls": scoped.get("retrieval_calls"),
+            "scoped_pass_retrieval_multiplier": scoped.get("retrieval_multiplier"),
+            "scoped_pass_retrieval_top_k_requested": scoped.get("retrieval_top_k_requested"),
+            "scoped_pass_retrieval_chunk_top_k_requested": scoped.get("retrieval_chunk_top_k_requested"),
+            "scoped_pass_retrieval_not_scaled_reason": scoped.get("retrieval_not_scaled_reason"),
+            "scoped_pass_retrieval_floor": scoped.get("retrieval_floor"),
+            "scoped_pass_retrieval_ceiling": scoped.get("retrieval_ceiling"),
+            "scoped_pass_retrieval_widened": scoped.get("retrieval_widened"),
+            "scoped_pass_retrieval_widening_kept": scoped.get("retrieval_widening_kept"),
+            "scoped_pass_retrieval_widen_skipped_reason": scoped.get(
+                "retrieval_widen_skipped_reason"),
+            "scoped_pass_references_returned": scoped.get("references_returned"),
+            "scoped_pass_retrieval_rounds_detail": scoped.get("retrieval_rounds_detail"),
             # What the context cap did: the budget, what survived it, whether the highest-ranked block
             # had to be cut, and the index at which the ranked list stopped being kept. A binding cap
             # (stack2: 100 references dropped) is otherwise indistinguishable from bad retrieval.

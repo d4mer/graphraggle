@@ -244,6 +244,14 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
     declined: Counter[str] = Counter()
     retrieval_routes: Counter[str] = Counter()
     retrieval_fallbacks: Counter[str] = Counter()
+    # Retrieval sizing per run: which multiplier a row actually ran with, how wide it asked, and what
+    # the widening round did. Histograms rather than sums - "average top_k requested" hides a run where
+    # half the rows were never scaled at all.
+    retrieval_multipliers: Counter[str] = Counter()
+    retrieval_top_k: Counter[str] = Counter()
+    retrieval_chunk_top_k: Counter[str] = Counter()
+    not_scaled_reasons: Counter[str] = Counter()
+    widen_skipped_reasons: Counter[str] = Counter()
     latency: list[float] = []
     unscoped_diff = 0
     unscoped_diff_ids: list[str] = []
@@ -307,7 +315,8 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
             scoped_sums["rows_with_scoped_pass"] += 1
             for key in ("references_kept", "references_dropped_other_company",
                         "references_unattributable", "references_ambiguous",
-                        "references_dropped_by_context_cap", "model_calls"):
+                        "references_dropped_by_context_cap", "model_calls",
+                        "references_returned", "retrieval_rounds", "retrieval_calls"):
                 scoped_sums[key] += int(scoped_meta.get(key) or 0)
             if scoped_meta.get("second_model_call"):
                 scoped_sums["second_model_calls"] += 1
@@ -336,6 +345,19 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                 retrieval_fallbacks[str(scoped_meta["retrieval_fallback_reason"])] += 1
             if scoped_meta.get("keyword_hint_applied"):
                 scoped_sums["keyword_hint_applied"] += 1
+            # Over-fetch bookkeeping: asked vs returned vs kept, and whether the second, wider round
+            # ran and whether it is the round that answered.
+            retrieval_multipliers[str(scoped_meta.get("retrieval_multiplier"))] += 1
+            retrieval_top_k[str(scoped_meta.get("retrieval_top_k_requested"))] += 1
+            retrieval_chunk_top_k[str(scoped_meta.get("retrieval_chunk_top_k_requested"))] += 1
+            if scoped_meta.get("retrieval_not_scaled_reason"):
+                not_scaled_reasons[str(scoped_meta["retrieval_not_scaled_reason"])] += 1
+            if scoped_meta.get("retrieval_widened"):
+                scoped_sums["widened_rows"] += 1
+            if scoped_meta.get("retrieval_widening_kept"):
+                scoped_sums["widening_kept_rows"] += 1
+            if scoped_meta.get("retrieval_widen_skipped_reason"):
+                widen_skipped_reasons[str(scoped_meta["retrieval_widen_skipped_reason"])] += 1
             reason = scoped_meta.get("declined_reason")
             if reason:
                 declined[str(reason)] += 1
@@ -379,8 +401,17 @@ def score_run(name: str, joined: list[dict[str, Any]], probes_by_shape: dict[str
                                  "keyword_hint_applied", "context_chars", "context_blocks_kept",
                                  "context_unused_chars", "context_truncated_blocks",
                                  "hard_refusal_verdicts", "generation_errors", "fallback_errors",
-                                 "history_messages")},
+                                 "history_messages", "references_returned", "retrieval_rounds",
+                                 "retrieval_calls", "widened_rows", "widening_kept_rows")},
                              "retrieval_routes": dict(sorted(retrieval_routes.items())),
+                             "retrieval_multipliers": dict(sorted(retrieval_multipliers.items())),
+                             "retrieval_top_k_requested": dict(sorted(retrieval_top_k.items())),
+                             "retrieval_chunk_top_k_requested": dict(
+                                 sorted(retrieval_chunk_top_k.items())),
+                             "retrieval_not_scaled_reasons": dict(
+                                 sorted(not_scaled_reasons.items(), key=lambda item: -item[1])),
+                             "retrieval_widen_skipped_reasons": dict(
+                                 sorted(widen_skipped_reasons.items(), key=lambda item: -item[1])),
                              "retrieval_fallbacks": dict(sorted(retrieval_fallbacks.items(),
                                                                 key=lambda item: -item[1])),
                              "declined_reasons": dict(sorted(declined.items(),
@@ -458,6 +489,18 @@ SCOPED_LOG_KEYS: dict[str, str] = {
     "retrieval_errors": "scoped_pass_retrieval_errors",
     "keyword_hint_applied": "scoped_pass_keyword_hint_applied",
     "retrieval_shape": "scoped_pass_retrieval_shape",
+    "references_returned": "scoped_pass_references_returned",
+    "retrieval_rounds": "scoped_pass_retrieval_rounds",
+    "retrieval_calls": "scoped_pass_retrieval_calls",
+    "retrieval_multiplier": "scoped_pass_retrieval_multiplier",
+    "retrieval_top_k_requested": "scoped_pass_retrieval_top_k_requested",
+    "retrieval_chunk_top_k_requested": "scoped_pass_retrieval_chunk_top_k_requested",
+    "retrieval_not_scaled_reason": "scoped_pass_retrieval_not_scaled_reason",
+    "retrieval_floor": "scoped_pass_retrieval_floor",
+    "retrieval_ceiling": "scoped_pass_retrieval_ceiling",
+    "retrieval_widened": "scoped_pass_retrieval_widened",
+    "retrieval_widening_kept": "scoped_pass_retrieval_widening_kept",
+    "retrieval_widen_skipped_reason": "scoped_pass_retrieval_widen_skipped_reason",
     "declined_reason": "scoped_pass_declined_reason",
 }
 

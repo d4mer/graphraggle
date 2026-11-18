@@ -200,6 +200,44 @@ class TestRealLogShape(_Fixtures):
         self.assertEqual(report["history_messages"], 2)
         self.assertEqual(report["declined_reasons"], {"generation_failed_400": 1})
 
+    def test_the_over_fetch_counters_are_reported_per_run(self):
+        """Asked vs returned vs kept, per run: the numbers that decide whether to keep the multiplier."""
+        line = self._emitted_line({
+            "references_kept": 4, "references_returned": 9, "model_calls": 1,
+            "retrieval_route": "query/data", "retrieval_rounds": 2, "retrieval_calls": 2,
+            "retrieval_multiplier": 4, "retrieval_top_k_requested": 40,
+            "retrieval_chunk_top_k_requested": 20, "retrieval_floor": 3, "retrieval_ceiling": 200,
+            "retrieval_widened": True, "retrieval_widening_kept": True,
+            "retrieval_widen_skipped_reason": None, "retrieval_not_scaled_reason": None,
+            "retrieval_rounds_detail": [{"round": 1, "top_k_requested": 20, "kept": 1,
+                                         "blocks_kept": 1, "route": "query/data"},
+                                        {"round": 2, "top_k_requested": 40, "kept": 4,
+                                         "blocks_kept": 4, "route": "query/data"}],
+            "declined_reason": None})
+        self.assertEqual(line["scoped_pass_retrieval_top_k_requested"], 40)
+        report = self._score(line)
+        self.assertEqual(report["widened_rows"], 1)
+        self.assertEqual(report["widening_kept_rows"], 1)
+        self.assertEqual(report["retrieval_rounds"], 2)
+        self.assertEqual(report["retrieval_calls"], 2)
+        self.assertEqual(report["references_returned"], 9)
+        self.assertEqual(report["retrieval_multipliers"], {"4": 1})
+        self.assertEqual(report["retrieval_top_k_requested"], {"40": 1})
+        self.assertEqual(report["retrieval_chunk_top_k_requested"], {"20": 1})
+        self.assertEqual(report["retrieval_widen_skipped_reasons"], {})
+
+    def test_a_widening_that_was_refused_is_counted_as_refused(self):
+        line = self._emitted_line({
+            "references_kept": 1, "model_calls": 1, "retrieval_route": "query",
+            "retrieval_rounds": 1, "retrieval_calls": 2, "retrieval_multiplier": 3,
+            "retrieval_widened": False, "retrieval_widening_kept": False,
+            "retrieval_widen_skipped_reason": "first_round_paid_a_generation",
+            "declined_reason": None})
+        report = self._score(line)
+        self.assertEqual(report["widened_rows"], 0)
+        self.assertEqual(report["retrieval_widen_skipped_reasons"],
+                         {"first_round_paid_a_generation": 1})
+
     def test_a_nested_export_still_scores(self):
         line = _log_line("req-flat", Q_SCOPED, [ALPHA],
                          scoped_pass={"references_kept": 4, "model_calls": 1,
