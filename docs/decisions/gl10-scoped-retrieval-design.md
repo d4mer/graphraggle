@@ -174,3 +174,32 @@ Failure is a degradation, not an error: a rejected or timed-out scoped generatio
 its citation-filtered path, and if that fails too the request is served with the honest decline. The
 decline sets no weak-signal reason, so the evidence-adding stages cannot re-open an unscoped search — that
 would trade a 500 for a leak, which is the one swap this feature refuses to make.
+
+## Retrieval must over-fetch, because the filter is the point (2026-11-18)
+
+The guarantee is a subtraction: retrieve over the whole index, then drop everything that is not the named
+company's. Cutover-9 measured the price of doing that at the ordinary request size — 1056 references, 614
+kept, and the answer chunk for the company that was asked about frequently sitting in the discarded 442.
+Once the prompt was honest enough to refuse what it cannot support, that loss stopped looking like a
+hallucination and started looking like a refusal: `refused_wrong` 4 → 21 on questions the corpus answers.
+
+The decision, and its three bounds:
+
+- **Ask wider than we can keep** (`COMPANY_SCOPED_RETRIEVAL_MULTIPLIER`, ceiling
+  `COMPANY_SCOPED_RETRIEVAL_CEILING`), and when fewer than `COMPANY_SCOPED_RETRIEVAL_FLOOR` blocks reached
+  the prompt, retrieve once more at double the multiplier. Default multiplier 1: the lever is off until a
+  stack run measures it, and it stays one retrieval and one generation per row while off.
+- **Widening may not buy a generation.** A second retrieval is allowed only when the first cost none, and the
+  wider round itself never uses the answering endpoint. A row may be retrieved twice; it may not be answered
+  twice for a reason the caller never agreed to.
+- **Widening may not move the evidence boundary.** The wider round wins only if strictly more blocks reach
+  the prompt; on a tie the first round stands. Only `top_k`/`chunk_top_k` are rewritten — rerank and token
+  budgets come from the door unchanged, so the pool is bigger and better ordered, never a different kind of
+  retrieval. The context cap is untouched and remains the only limit on what the model is shown.
+
+What the run has to decide that this repo cannot: whether `/query/data`'s returned reference payload is
+itself bounded by `max_total_tokens`. If it is, the multiplier enlarges the pool without enlarging the text
+we can read, and the tell is `scoped_pass_references_returned` refusing to move while
+`scoped_pass_retrieval_top_k_requested` climbs. That is why the requested numbers are logged per round:
+without them, "we asked for 20 chunks out of a five-company index" and "this company has no such document"
+are the same row.
