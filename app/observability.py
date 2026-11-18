@@ -367,6 +367,15 @@ def emit_query_log(
             # Set only with COMPANY_SCOPED_HARD_REFUSAL on: the classifier's verdict, never the codes it
             # matched or any document text.
             "scoped_pass_hard_refusal_verdict": scoped.get("hard_refusal_verdict"),
+            # The scoped GENERATION call failed (class + status only, never the response body's text or
+            # any document content). `used=False` then means the caller's normal path served the request,
+            # which must be visible: otherwise a degraded run reads as a set of ordinary unscoped answers.
+            "scoped_pass_generation_error": scoped.get("generation_error"),
+            # ...and if even that fallback path raised, the request was served with the honest decline.
+            "scoped_pass_fallback_error": scoped.get("fallback_error"),
+            # How many earlier turns the scoped prompt carried, so a follow-up row can be read without
+            # guessing whether history reached the generation call.
+            "scoped_pass_history_messages": scoped.get("history_messages"),
             "scoped_pass_declined_reason": scoped.get("declined_reason"),
             "latency_ms_total": timer.total_ms(started),
             "latency_ms_by_stage": timer.elapsed_ms,

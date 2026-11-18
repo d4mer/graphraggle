@@ -269,7 +269,48 @@ def no_scoped_material_message(companies: list[str]) -> str:
             "to answer it. I have not answered from any other company's material.")
 
 
-def scoped_generation_prompt(question: str, companies: list[str], context: str) -> str:
+HISTORY_BLOCK_MAX_CHARS = 2000
+HISTORY_BLOCK_MESSAGE_CHARS = 400
+
+
+def history_block(payload_base: dict[str, Any]) -> tuple[str, int]:
+    """Earlier turns, as prompt context for WHAT the question is asking - never as evidence.
+
+    A follow-up like "and what about their second contract?" only resolves against the previous turn, and
+    the scoped retrieval already gets that history - so without it here the pass retrieves the right
+    material and then asks the model a question it cannot see the referent of.
+
+    Only USER turns are embedded, for a safety reason: an assistant turn in the history may be an answer
+    this gateway produced before any company boundary existed, and pasting it into a scoped generation
+    would put another company's text back in front of the model - the exact thing the pass exists to stop.
+    Earlier questions carry the referent without carrying any company's facts. The full history is still
+    sent upstream in the payload, as the normal path does; this block is what makes the instruction
+    self-sufficient whatever upstream does with that field under `mode: bypass`.
+    """
+    history = payload_base.get("conversation_history")
+    if not isinstance(history, list):
+        return "", 0
+    lines: list[str] = []
+    used = 0
+    for entry in history:
+        if not isinstance(entry, dict) or entry.get("role") != "user":
+            continue
+        content = entry.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        line = " ".join(content.split())[:HISTORY_BLOCK_MESSAGE_CHARS]
+        cost = len(line) + 2
+        if used + cost > HISTORY_BLOCK_MAX_CHARS:
+            break
+        lines.append(f"- {line}")
+        used += cost
+    if not lines:
+        return "", 0
+    return "\n".join(lines), len(lines)
+
+
+def scoped_generation_prompt(question: str, companies: list[str], context: str,
+                             history: str = "") -> str:
     """The instruction that makes the generation call answer from the scoped material, or refuse.
 
     Why it is this long. `mode: bypass` sends the LLM the text we hand it and nothing else: LightRAG's
@@ -303,7 +344,9 @@ def scoped_generation_prompt(question: str, companies: list[str], context: str) 
         "5. If the material answers only part of the question, answer that part and then say which "
         "part is not in these documents.\n"
         "\n"
-        f"Question: {question}\n"
+        + (f"Earlier questions in this conversation. They say what the question refers to; they are NOT "
+           f"evidence, and you must not answer from them:\n{history}\n" if history else "")
+        + f"Question: {question}\n"
         "\n"
         "MATERIAL START\n"
         f"{context}\n"
@@ -530,6 +573,11 @@ async def company_scoped_pass(
         "second_model_call": bool(retrieval_meta.get("retrieval_model_calls")),
         "generated": False,
         "hard_refusal_verdict": None,
+        # A rejected or failed GENERATION call (status and class only): the difference between "the scoped
+        # pass decided to decline" and "the scoped pass could not run".
+        "generation_error": None,
+        "fallback_error": None,
+        "history_messages": 0,
         # `second_model_call` is kept as the log/scorer key it already is. Under `/query/data` it is
         # the only model call the pass makes - `model_calls` says which - and it is genuinely the
         # second one only on the `/query` fallback route.
@@ -577,16 +625,38 @@ async def company_scoped_pass(
             return ScopedPass(answer=no_scoped_material_message(allowed_companies), citations=kept,
                               meta=meta, used=True)
 
-    meta["generated"] = True
+    meta["generated"] = False
     if retrieval_meta.get("retrieval_model_calls"):
         meta["second_model_call"] = True
     meta["model_calls"] = retrieval_meta.get("retrieval_model_calls", 0) + 1
-    generation = await client.post_json(
-        "/query",
-        {"query": scoped_generation_prompt(question, allowed_companies, context),
-         "mode": "bypass",
-         "include_references": False},
-    )
+    history_text, history_messages = history_block(payload_base)
+    meta["history_messages"] = history_messages
+    generation_payload: dict[str, Any] = {
+        "query": scoped_generation_prompt(question, allowed_companies, context, history_text),
+        "mode": "bypass",
+        "include_references": False,
+    }
+    # The same history the normal /query path would send, sent the same way (it was bounded at the door:
+    # extract_ollama_history for the bridge, the caller's own list for /query). Sending it costs nothing
+    # and is what upstream would honour; the prompt block above is what makes the instruction work even if
+    # bypass ignores the field.
+    if isinstance(payload_base.get("conversation_history"), list) and payload_base["conversation_history"]:
+        generation_payload["conversation_history"] = payload_base["conversation_history"]
+    try:
+        generation = await client.post_json("/query", generation_payload)
+    except Exception as exc:
+        # The scoped pass failing to generate must not become the user's 500. Degrade the way the
+        # retrieval legs do: used=False sends the caller back to its normal path with citation filtering,
+        # and the log carries the class and status. No other-company text comes from THIS pass; the caller
+        # decides what its own path produced, and it is already the shipped `citations` behaviour.
+        detail = error_detail(exc)
+        meta["generation_error"] = detail
+        status = detail.get("status")
+        meta["declined_reason"] = (f"generation_failed_{status}" if status
+                                   else f"generation_failed:{detail['type']}")
+        meta["model_calls"] = retrieval_meta.get("retrieval_model_calls", 0)
+        return ScopedPass(answer="", citations=[], used=False, meta=meta)
+    meta["generated"] = True
     answer = str(generation.get("response", "")).strip()
     if not answer:
         # A blank regeneration must not become a silent pass-through of the unscoped draft: the

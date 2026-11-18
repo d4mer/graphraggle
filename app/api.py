@@ -49,7 +49,8 @@ from .keywords import KeywordResult, extract_keywords
 from .rewrite import RewriteResult, rewrite_query
 from .rerank import rerank_citations, truncate_citations
 from .company_scope import detect_companies, parse_alias_map, validate_aliases
-from .scoped_pass import ScopedPass, company_scoped_pass
+from .scoped_pass import (ScopedPass, company_scoped_pass,
+                          no_scoped_material_message)
 from .state_store import (
     build_company_attribution,
     derive_readiness,
@@ -1547,7 +1548,20 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
         first_weak_reason = None
     else:
         timer.start("first_pass")
-        answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
+        try:
+            answer, all_citations, _, _, first_weak_reason = await execute_query_pass(retrieval_mode, req.query)
+        except Exception as exc:
+            # A scoped pass that could not generate has already degraded to this path. If THIS path fails
+            # too, the caller still gets a served request with the honest decline, not a 500 - but only for
+            # a request the scoped pass actually attempted. Every other request re-raises exactly as it did
+            # before this branch existed, so the flag-off envelope and status are untouched.
+            if scoped is None or not scoped.meta.get("generation_error"):
+                raise
+            scoped.meta["fallback_error"] = f"fallback_pass_failed:{type(exc).__name__}"
+            answer = no_scoped_material_message(list(scoped.meta.get("companies") or []))
+            # No weak-signal reason: a decline must not trigger the evidence-adding stages, which would
+            # search unscoped again and could put another company's text back into the answer.
+            all_citations, first_weak_reason = [], None
         timer.stop("first_pass")
     citations_raw = len(all_citations)
 
@@ -1867,10 +1881,15 @@ async def _query_core(req: QueryRequest, *, request_id: str, timer: StageTimer, 
 
     if requested_company is not None or allowed_companies:
         if settings.company_scope_enforcement == "retrieval":
-            query_scope["warning"] = ("The answer was regenerated from the retrieved references that "
-                                      "join a named company's documents; the rest of LightRAG's index "
-                                      "was still searched, and references the gateway cannot attribute "
-                                      "to any company were dropped")
+            if scoped is not None and scoped.meta.get("generation_error"):
+                query_scope["warning"] = ("The company-scoped generation failed, so this answer is the "
+                                          "gateway's decline or the citation-filtered fallback, not a "
+                                          "regenerated scoped answer")
+            else:
+                query_scope["warning"] = ("The answer was regenerated from the retrieved references that "
+                                          "join a named company's documents; the rest of LightRAG's index "
+                                          "was still searched, and references the gateway cannot attribute "
+                                          "to any company were dropped")
         else:
             query_scope["warning"] = "Company scoping is enforced on gateway-returned citations only; this packet does not claim hard isolation inside LightRAG itself"
 

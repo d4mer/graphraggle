@@ -109,12 +109,16 @@ class FakeLightRAG:
     def __init__(self, references: list[dict], generation_text: str = "the scoped answer",
                  response_text: str = "the unscoped draft answer", *,
                  data_payload: object = DEFAULT, data_raises: Exception | None = None,
+                 generation_raises: Exception | None = None,
+                 query_raises: Exception | None = None,
                  strict: bool = True, reject_first_retrievals: int = 0) -> None:
         self.references = references
         self.generation_text = generation_text
         self.response_text = response_text
         self.data_payload = data_payload
         self.data_raises = data_raises
+        self.generation_raises = generation_raises
+        self.query_raises = query_raises
         self.strict = strict
         self.reject_first_retrievals = reject_first_retrievals
         self.retrievals_seen = 0
@@ -149,7 +153,11 @@ class FakeLightRAG:
                                        '{"detail":"Invalid request parameters: '
                                        + "; ".join(reasons) + '"}')
         if payload.get("mode") == "bypass":
+            if self.generation_raises is not None:
+                raise self.generation_raises
             return {"response": self.generation_text}
+        if path == "/query" and self.query_raises is not None:
+            raise self.query_raises
         if path == "/query/data":
             if self.data_raises is not None:
                 raise self.data_raises
@@ -1273,6 +1281,170 @@ class TestAmbiguousNamesInTheScopedPass(_TempStore):
         self.assertEqual(result.meta["references_ambiguous"], 0)
         self.assertEqual(result.meta["references_kept"], 2)
         self.assertIn("same bytes again", client.bypass_prompts[0])
+
+
+HISTORY = [
+    {"role": "user", "content": "What did Northwind Chemicals report about the cutover freeze?"},
+    {"role": "assistant", "content": "The freeze ran 5 hours 55 minutes (Source: cutover-notes.txt)."},
+    {"role": "user", "content": "And what about their second contract?"},
+]
+SECOND_TURN = "And what about their second contract?"
+ASSISTANT_TURN_TEXT = "The freeze ran 5 hours 55 minutes (Source: cutover-notes.txt)."
+
+
+class TestConversationHistoryInTheScopedGeneration(_TempStore):
+    """A follow-up must resolve: the scoped RETRIEVAL already got the history, the generation had not.
+
+    Single-turn requests stay byte-identical, including the generation payload's key set.
+    """
+
+    def test_the_generation_payload_carries_the_same_history_the_normal_path_sends(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        _run(scoped_pass.company_scoped_pass(SECOND_TURN, [NW],
+                                             payload_base={"mode": "mix", "top_k": 12,
+                                                           "conversation_history": HISTORY},
+                                             client=client))
+        retrieval, generation = client.retrieval_payloads[0], None
+        for path, payload in client.calls:
+            if payload.get("mode") == "bypass":
+                generation = payload
+        self.assertIsNotNone(generation)
+        self.assertEqual(generation["conversation_history"], HISTORY,
+                         "the same list, the same way the normal /query path sends it")
+        self.assertEqual(retrieval["conversation_history"], HISTORY)
+
+    def test_the_prompt_names_the_earlier_question_but_not_an_earlier_answer(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        _run(scoped_pass.company_scoped_pass(SECOND_TURN, [NW],
+                                             payload_base={"conversation_history": HISTORY},
+                                             client=client))
+        prompt = client.bypass_prompts[0]
+        self.assertIn("What did Northwind Chemicals report about the cutover freeze?", prompt)
+        self.assertIn("NOT", prompt)
+        self.assertNotIn(ASSISTANT_TURN_TEXT, prompt,
+                         "an earlier assistant turn can carry another company's text before any "
+                         "boundary existed - it must not be pasted back into a scoped generation")
+
+    def test_a_single_turn_generation_payload_is_byte_identical_to_today(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        _run(scoped_pass.company_scoped_pass("what did Northwind report?", [NW],
+                                             payload_base={"mode": "mix"}, client=client))
+        payload = [p for _, p in client.calls if p.get("mode") == "bypass"][0]
+        self.assertEqual(set(payload), {"query", "mode", "include_references"},
+                         "no history key when there is no history")
+        self.assertNotIn("Earlier questions", payload["query"])
+
+    def test_the_history_block_is_bounded_and_counted(self):
+        long_history = [{"role": "user", "content": "q" * 900} for _ in range(12)]
+        block, count = scoped_pass.history_block({"conversation_history": long_history})
+        self.assertLessEqual(len(block), scoped_pass.HISTORY_BLOCK_MAX_CHARS)
+        self.assertLess(count, 12, "the budget stops the block, it does not truncate every line")
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])])
+        result = _run(scoped_pass.company_scoped_pass(SECOND_TURN, [NW],
+                                                      payload_base={"conversation_history": HISTORY},
+                                                      client=client))
+        self.assertEqual(result.meta["history_messages"], 2, "user turns only")
+
+    def test_the_door_threads_history_into_both_legs(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api.settings, "company_scope_enforcement", "retrieval"),                 patch.object(api, "client", client):
+            _run(api._query_core(
+                QueryRequest(query=f"Northwind Chemicals: {SECOND_TURN}",
+                             conversation_history=HISTORY),
+                request_id="req-h1", timer=api.StageTimer(), t_start=0.0))
+        for _, payload in client.calls:
+            self.assertEqual(payload.get("conversation_history"), HISTORY)
+
+
+class TestScopedGenerationFailureDegrades(_TempStore):
+    """A rejected or timed-out generation is a degraded scoped run, not the caller's 500."""
+
+    def test_a_rejected_generation_body_declines_the_pass_without_losing_the_request(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              generation_raises=LightRAGRejected(400, '{"detail":"Invalid request"}'))
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertFalse(result.used, "the caller's normal path serves this request")
+        self.assertEqual(result.citations, [], "a failed pass hands over no text of its own")
+        self.assertEqual(result.meta["declined_reason"], "generation_failed_400")
+        self.assertEqual(result.meta["generation_error"]["status"], 400)
+        self.assertFalse(result.meta["generated"])
+        self.assertEqual(result.meta["model_calls"], 0, "the failed call is not counted as an answer")
+
+    def test_a_generation_timeout_logs_the_class_only(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])], generation_raises=RuntimeError("timed out"))
+        result = _run(scoped_pass.company_scoped_pass("anything", [NW], payload_base={},
+                                                      client=client))
+        self.assertEqual(result.meta["declined_reason"], "generation_failed:RuntimeError")
+        self.assertNotIn("message", result.meta["generation_error"],
+                         "a timeout has no server body; nothing else is logged")
+
+    def test_the_door_serves_the_citation_filtered_answer_when_scoped_generation_is_refused(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])],
+                              generation_raises=LightRAGRejected(400, '{"detail":"Invalid request"}'))
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api.settings, "company_scope_enforcement", "retrieval"),                 patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                request_id="req-g1", timer=api.StageTimer(), t_start=0.0))
+        data = envelope.data if isinstance(envelope.data, dict) else envelope.data.model_dump()
+        self.assertEqual(data["answer"], "the unscoped draft answer", "served, not failed")
+        self.assertEqual([c["file_path"] for c in data["citations"]], [NW_PATH],
+                         "citation enforcement still holds")
+        scope = data["query_scope"]
+        self.assertEqual(scope["scoped_pass"]["generation_error"]["status"], 400)
+        self.assertIn("generation failed", scope["warning"],
+                      "the packet must not claim a regenerated scoped answer")
+
+    def test_the_door_returns_the_decline_when_the_fallback_fails_too(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              generation_raises=LightRAGRejected(500, '{"detail":"upstream"}'),
+                              query_raises=LightRAGRejected(502, '{"detail":"upstream"}'))
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api.settings, "company_scope_enforcement", "retrieval"),                 patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                request_id="req-g2", timer=api.StageTimer(), t_start=0.0))
+        data = envelope.data if isinstance(envelope.data, dict) else envelope.data.model_dump()
+        self.assertTrue(api.has_weak_answer_signal(data["answer"]),
+                        "the honest decline, not a 500 and not a guess")
+        self.assertIn("Northwind Chemicals", data["answer"], "the decline names what was searched")
+        self.assertEqual(data["citations"], [], "no citations were ever retrieved")
+        scope = data["query_scope"]
+        self.assertEqual(scope["scoped_pass"]["generation_error"]["status"], 500)
+        self.assertTrue(scope["scoped_pass"]["fallback_error"].startswith("fallback_pass_failed:"))
+
+    def test_a_non_scoped_request_still_raises_as_it_always_did(self):
+        """The decline branch is scoped-only: an ordinary upstream failure keeps its status."""
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK])],
+                              query_raises=LightRAGRejected(502, '{"detail":"upstream"}'))
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api, "client", client):
+            with self.assertRaises(Exception) as caught:
+                _run(api._query_core(
+                    QueryRequest(query="what did Northwind Chemicals report for Q3?"),
+                    request_id="req-g3", timer=api.StageTimer(), t_start=0.0))
+        self.assertIn("502", str(caught.exception))
+
+
+class TestNoCompanyNamedNeverRunsThePass(_TempStore, _PipelineSettings):
+    """The lead's question: with enforcement=retrieval and no company in the question, nothing changes."""
+
+    def test_the_request_is_the_ordinary_one_down_to_the_payload_bytes(self):
+        client = FakeLightRAG([_ref("1", NW_PATH, [NW_CHUNK]), _ref("2", CP_PATH, [CP_CHUNK])])
+        with patch.object(api.settings, "company_from_question", True),                 patch.object(api.settings, "company_scope_enforcement", "retrieval"),                 patch.object(api, "client", client):
+            envelope = _run(api._query_core(
+                QueryRequest(query="what was the cutover freeze window?"),
+                request_id="req-n1", timer=api.StageTimer(), t_start=0.0))
+        self.assertEqual([path for path, _ in client.calls], ["/query"], "no /query/data, no bypass call")
+        path, payload = client.calls[0]
+        defaults = QueryRequest(query="what was the cutover freeze window?")
+        self.assertEqual(payload, {"query": "what was the cutover freeze window?", "mode": "mix",
+                                   "top_k": defaults.top_k,
+                                   "chunk_top_k": api.settings.chunk_top_k,
+                                   "include_references": True, "include_chunk_content": True})
+        data = envelope.data if isinstance(envelope.data, dict) else envelope.data.model_dump()
+        self.assertEqual(data["answer"], "the unscoped draft answer")
+        self.assertNotIn("scoped_pass", data["query_scope"])
+        self.assertNotIn("stages_skipped_for_scope", data["query_scope"])
+        self.assertNotIn("warning", data["query_scope"])
 
 
 if __name__ == "__main__":
