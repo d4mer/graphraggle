@@ -210,3 +210,46 @@ docker compose down --no-temps           # or leave the stack up if the lead ask
 Leave `logs/gl10-R*.query-log.jsonl` and the three `*.results.jsonl` + verdicts files in place and
 list their paths and sha256s in the report, so the numbers can be re-scored without re-running the
 stack.
+
+## What changed for the next run (cutover-9 follow-up: the scoped retrieval now over-fetches)
+
+R2 on cutover-9 refused **21** answerable questions (R0: 4) while hallucinations fell 43 → 28 and leaks
+stayed 0. The census says why: of 1056 references, 614 survived the company filter and 442 were discarded
+(246 other-company, 90 unattributable, 100 ambiguous, 116 over the context cap) while **94,576 characters of
+prompt budget went unused**. Retrieval ranks over all companies and asks for the door's ordinary
+`top_k`/`chunk_top_k`, so the asked company's answer chunk is often discarded before the model ever sees it.
+Three new settings, all default-off / default-unchanged:
+
+```bash
+# R2w — R2 exactly as measured, plus the recall lever. One variable against the R2 row.
+COMPANY_FROM_QUESTION=true
+COMPANY_SCOPE_ENFORCEMENT=retrieval
+COMPANY_SCOPED_CONTEXT_MAX_CHARS=12000
+COMPANY_ALIASES='Northwind Chemicals=northwind;Contoso Pharma=contoso'
+COMPANY_SCOPED_RETRIEVAL_MULTIPLIER=3
+COMPANY_SCOPED_RETRIEVAL_FLOOR=3
+COMPANY_SCOPED_RETRIEVAL_CEILING=200
+```
+
+Acceptance is the R2 acceptance the refusals broke: `scoped_correct >= 35/58`, `refused_wrong` back at the
+R0 level or better, `hallucinated` not worse than 28, leaks 0, cross-company named-cited 18/18, and per-row
+latency reported. The widening round is free of extra generations by construction, so a widened row must
+still report `scoped_pass_model_calls=1`; if it reports 2, say so rather than averaging it away.
+
+Send the sizing numbers back with the row: `scoped_pass_retrieval_top_k_requested`,
+`..._chunk_top_k_requested`, `..._retrieval_multiplier`, `..._retrieval_rounds`,
+`..._retrieval_calls`, `..._retrieval_widened`, `..._retrieval_widening_kept`,
+`..._retrieval_widen_skipped_reason`, `..._references_returned`, and the per-round detail
+(`scoped_pass_retrieval_rounds_detail`, counts only). From the scorer: `widened_rows`,
+`widening_kept_rows`, `references_returned`, `retrieval_multipliers`, `retrieval_top_k_requested`,
+`retrieval_chunk_top_k_requested`, `retrieval_not_scaled_reasons`, `retrieval_widen_skipped_reasons`.
+
+Two readings this repo cannot settle offline:
+
+- **Is the returned reference payload itself token-limited?** If `/query/data` truncates what it returns by
+  `max_total_tokens`, the multiplier enlarges the pool without enlarging the readable text. The signature is
+  `scoped_pass_references_returned` staying flat while `..._retrieval_top_k_requested` climbs. Report that
+  pair per row; do not infer it either way.
+- **The 90 unattributable drops are stack2 contamination** (Solvay-era documents in the shared index with no
+  `documents` row). The rule that drops them is deliberately unchanged — production Solvay questions have no
+  such rows missing. Do not read the unattributable count as a scoping defect.
