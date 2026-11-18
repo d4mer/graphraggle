@@ -1183,3 +1183,66 @@ New log keys: `scoped_pass_generation_error` (class and status only, never body 
 `scoped_pass_fallback_error`, `scoped_pass_history_messages`; the scorer reports `generation_errors`,
 `fallback_errors`, `generated_rows` and summed `history_messages`.
 Suite: `1669 passed, 2 skipped, 327 subtests passed` (base `5642ca9`: 1657).
+
+## 2026-11-18 — GL-10: the scoped retrieval over-fetches, because the company filter throws most of it away
+
+**Area:** `app/scoped_pass.py`, `app/config.py`, `app/observability.py`, `scripts/score_gl10_run.py` ·
+**Tests:** +15 · **New settings:** `COMPANY_SCOPED_RETRIEVAL_MULTIPLIER` (1),
+`COMPANY_SCOPED_RETRIEVAL_CEILING` (200), `COMPANY_SCOPED_RETRIEVAL_FLOOR` (3)
+
+**The recall loss was in the filter, not the prompt.** Cutover-9 R2: 1056 references came back,
+614 survived, and 246 + 90 + 100 + 116 were discarded as other-company / unattributable / ambiguous /
+over-cap. Retrieval ranks over **all** companies and asks for the door's ordinary `top_k`/`chunk_top_k`,
+so the named company's answer chunk is frequently not among the survivors. That is the mechanism behind
+`refused_wrong` 4 → 21 while `hallucinated` fell 43 → 28: the prompt fix worked, and an honest model now
+refuses questions that are answerable in the corpus but absent from the 614. The lever is recall **before**
+the filter.
+
+- **Over-fetch.** The scoped retrieval sends `top_k × multiplier` and `chunk_top_k × multiplier`, capped at
+  `COMPANY_SCOPED_RETRIEVAL_CEILING` so a multiplier cannot ask upstream for an unbounded pool. At the
+  default multiplier 1 the payload is not touched at all — flag-off behaviour is byte-for-byte what it was,
+  including the one-retrieval-one-generation cost. Only those two keys are overridden: `enable_rerank`,
+  `max_entity_tokens`, `max_relation_tokens`, `max_total_tokens` and `conversation_history` survive, so the
+  bigger pool is **reranked, not merely longer** (pinned by test, on the bridge-shaped payload that actually
+  carries those keys).
+- **One reactive widening round.** When fewer than `COMPANY_SCOPED_RETRIEVAL_FLOOR` blocks reached the
+  prompt, a second retrieval runs at double the multiplier. Bounded three ways: one extra round only; never
+  when the first round already paid for a generation on the `/query` fallback (`first_round_paid_a_generation`);
+  and the wider round itself never falls back to the answering endpoint (`wider_round_no_query_fallback:<reason>`)
+  — trying harder may not turn a free row into one that bought a discarded generation. It is also skipped at
+  the ceiling (`at_retrieval_ceiling`), when the door sent no sizes to scale (`no_sizes_in_payload_base`), and
+  whenever the multiplier is 1 (`over_fetch_multiplier_1`): widening belongs to the over-fetch lever, so
+  shipped behaviour is unchanged. The wider round's evidence is taken only when it is strictly better on blocks
+  reaching the prompt, then on attributable references; on a tie the first round answers, so a retrieval that
+  changed nothing cannot silently change which evidence did.
+- **The cap still decides what the model reads.** A wider pool can add blocks to the prompt; it can never
+  exceed `COMPANY_SCOPED_CONTEXT_MAX_CHARS`, and the kept set is still a prefix of that round's retrieval order.
+- **Counted per round, not summed:** `retrieval_rounds_detail[]` carries round, multiplier,
+  `top_k_requested`/`chunk_top_k_requested`, route, references/chunks returned, items with text, kept,
+  dropped-by-reason, blocks kept, dropped by cap, context chars, fallback reason and retrieval errors. Top
+  level: `retrieval_rounds`, `retrieval_calls`, `retrieval_multiplier`,
+  `retrieval_top_k_requested`/`retrieval_chunk_top_k_requested`, `retrieval_floor`/`retrieval_ceiling`,
+  `retrieval_widened`, `retrieval_widening_kept`, `retrieval_widen_skipped_reason`,
+  `references_returned`. The scorer reports `widened_rows`, `widening_kept_rows`, the two sums,
+  `references_returned`, and histograms of multipliers and requested sizes (a mean hides a run where half
+  the rows were never scaled).
+
+**Reranker interplay, as the code stands today (reported, unchanged).** Two doors, two answers. The
+gateway `/query` door's scoped payload is `{mode, top_k, chunk_top_k[, conversation_history]}` and sends **no
+`enable_rerank`** — so there, both the scoped pass and the ordinary pass get whatever the LightRAG server's
+own rerank default is; consistency holds because neither asks. The bridge door copies the bridge payload,
+so it carries `enable_rerank: BRIDGE_ENABLE_RERANK` and the token budgets, and the scoped retrieval is
+reranked exactly when the normal bridge retrieval is. Gateway-only: `apply_scope_rerank_truncate` runs the
+cross-encoder over the merged citations **after** the answer, so on that door the reranker re-orders the
+displayed Sources (and truncates to `CITATION_TOP_K`) but never re-orders the scoped prompt, which is in
+upstream retrieval rank order. The bridge door does not call the gateway reranker at all.
+
+Two things this repo cannot verify offline, so Hermes must read them off the run rather than assume them:
+whether `/query/data` truncates the reference payload it returns by `max_total_tokens` (if it does, the
+multiplier raises the *pool* but not the *text*, and `scoped_pass_references_returned` staying flat while
+`..._top_k_requested` rises is the signature); and, per the existing note, whether `mode: bypass` honours
+`conversation_history`. The unattributable-90 on stack2 is store contamination — Solvay-era documents in the
+shared index with no `documents` row — and the unattributable rule is deliberately **not** weakened to hide
+it: production has no such contamination for Solvay questions.
+
+Suite: `1684 passed, 2 skipped, 327 subtests passed` (base `3d0460c`: 1669 / 2 / 327).
