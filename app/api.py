@@ -10,6 +10,7 @@ from typing import Any
 
 import aiofiles
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import StreamingResponse
 
 from . import grounding
 from .auth import require_bearer
@@ -40,12 +41,23 @@ from .graph_synthesis import is_graph_synthesis_answer_usable, synthesize_graph_
 from .observability import (
     StageTimer,
     emit_bridge_log,
+    emit_openai_bridge_log,
     emit_query_log,
     is_canned_failure,
     new_request_id,
     start_bridge_log,
 )
 from .keywords import KeywordResult, extract_keywords
+from .openai_bridge import (
+    OPENAI_BRIDGE_MODEL,
+    chat_completion_body,
+    chat_completion_chunk,
+    citation_annotations,
+    new_completion_id,
+    openai_models_payload,
+    openai_request_invalid_reason,
+    sse_event,
+)
 from .rewrite import RewriteResult, rewrite_query
 from .rerank import rerank_citations, truncate_citations
 from .company_scope import detect_companies, parse_alias_map, validate_aliases
@@ -453,7 +465,8 @@ def _rewrite_log_fields(rw: Any, rw_step_ms: int) -> dict[str, Any]:
     }
 
 
-async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str | None = None) -> str:
+async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str | None = None,
+                                     citation_sink: list[dict[str, Any]] | None = None) -> str:
     prompt = extract_ollama_prompt(payload)
     if not prompt.strip():
         return ""
@@ -594,6 +607,8 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
                     scoped.citations, requested_company=None,
                     allowed_companies=list(company_meta["companies"]))
                 answer = scoped.answer
+                if citation_sink is not None:
+                    citation_sink.extend(citations)
                 if settings.bridge_sources_enabled:
                     answer += build_sources_block(citations)
                 log_fields["scoped_pass"] = scoped.meta
@@ -682,6 +697,10 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
                 citations, requested_company=None,
                 allowed_companies=list(company_meta["companies"]),
             )
+    if citation_sink is not None:
+        # The citations exactly as the Sources block sees them, for the
+        # OpenAI-compatible door's annotations. A sink never changes this answer.
+        citation_sink.extend(citations)
     if canned and kw is not None and kw.source == "fallback":
         # Honest failure: fallback keywords and still the canned no-context
         # text. A successful LLM-keyword request never gets this message.
@@ -707,7 +726,8 @@ async def answer_ollama_bridge_direct(payload: dict[str, Any], request_id: str |
     return answer
 
 
-async def answer_ollama_bridge_pipeline(prompt: str, history: list[dict[str, str]] | None = None) -> str:
+async def answer_ollama_bridge_pipeline(prompt: str, history: list[dict[str, str]] | None = None,
+                                        citation_sink: list[dict[str, Any]] | None = None) -> str:
     """Stage 0 bridge: the full gateway /query pipeline (kept for comparison)."""
     if not prompt.strip():
         return ""
@@ -725,16 +745,20 @@ async def answer_ollama_bridge_pipeline(prompt: str, history: list[dict[str, str
         return ""
     citations = data.get("citations") if isinstance(data, dict) else None
     if isinstance(citations, list):
+        if citation_sink is not None:
+            citation_sink.extend(citations)
         answer += build_sources_block(citations)
     return answer
 
 
-async def answer_ollama_bridge_prompt(payload: dict[str, Any], request_id: str | None = None) -> str:
+async def answer_ollama_bridge_prompt(payload: dict[str, Any], request_id: str | None = None,
+                                      citation_sink: list[dict[str, Any]] | None = None) -> str:
     if settings.bridge_backend == "gateway_pipeline":
         prompt = extract_ollama_prompt(payload)
         history = extract_ollama_history(payload, settings.bridge_history_turns)
-        return await answer_ollama_bridge_pipeline(prompt, history)
-    return await answer_ollama_bridge_direct(payload, request_id=request_id)
+        return await answer_ollama_bridge_pipeline(prompt, history, citation_sink=citation_sink)
+    return await answer_ollama_bridge_direct(payload, request_id=request_id,
+                                             citation_sink=citation_sink)
 
 
 def build_ollama_chat_response(model: str, content: str) -> dict[str, Any]:
@@ -2045,3 +2069,115 @@ async def api_chat(request: Request):
         content = normalize_ollama_stream_response(resp.content, response_key="message")
         media_type = "application/x-ndjson"
     return Response(content=content, media_type=media_type)
+
+
+# ── OpenAI-compatible door: the only Open WebUI path that can carry citations ──
+# The Ollama door stays exactly as it is. This door re-runs the same bridge
+# answer (same prompt extraction, same history extraction, same keyword and
+# rewrite steps, same upstream payload) and only re-packages it as an OpenAI
+# chat completion, because Open WebUI 0.12.0 drops every extra key on an
+# Ollama-native response and reads citations only from
+# choices[0].delta.annotations[].url_citation on a STREAMING chat completion
+# (see app/openai_bridge.py for the file:line evidence).
+#
+# Bearer-authed, unlike the Ollama door: this door exposes the same corpus, so
+# it carries the key the gateway's other corpus doors require (RAG_API_KEY).
+
+def citation_entries(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """(label, company) per reference, in Sources-block order, deduped by label.
+
+    Uses the same path keys and the same company rule as build_sources_block, so
+    the chip labels and the text block cannot drift apart.
+    """
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        path = extract_citation_path(citation)
+        if not path:
+            continue
+        label = path.rsplit("/", 1)[-1]
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        company = citation.get("company")
+        entries.append({
+            "label": label,
+            "company": company if isinstance(company, str) and company.strip() else None,
+        })
+    return entries
+
+
+def build_door_citations(citations: list[dict[str, Any]]
+                         ) -> tuple[list[dict[str, Any]], str | None]:
+    """Annotations for one door answer, plus the reason there are none."""
+    return citation_annotations(
+        citation_entries(citations),
+        base_url=settings.bridge_citation_base_url,
+        limit=settings.bridge_citation_limit,
+        enabled=settings.bridge_citations_enabled,
+    )
+
+
+@app.get("/v1/models")
+async def v1_models(_: None = Depends(require_bearer)):
+    """OpenAI model listing for an Open WebUI OpenAI connection."""
+    return Response(content=json.dumps(openai_models_payload()), media_type="application/json")
+
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(request: Request, _: None = Depends(require_bearer)):
+    payload = parse_json_body(await request.body())
+    invalid = openai_request_invalid_reason(payload)
+    if invalid:
+        raise HTTPException(status_code=422, detail=invalid)
+
+    model = str(payload.get("model") or OPENAI_BRIDGE_MODEL)
+    wants_stream = bool(payload.get("stream"))
+    request_id = new_request_id()
+    citations: list[dict[str, Any]] = []
+    answer = await answer_ollama_bridge_prompt(payload, request_id=request_id, citation_sink=citations)
+
+    annotations, skipped_reason = build_door_citations(citations)
+    text = answer
+    if annotations and wants_stream and SOURCES_MARKER in text:
+        # On the streaming path the annotations replace the text block, so the
+        # operator gets one source list rather than a chip row plus a duplicate
+        # block in the answer body. The strip is the same split the
+        # conversation-history path already uses.
+        #
+        # On the NON-streaming path the block stays: Open WebUI 0.12.0 has no
+        # annotation handler there, so stripping would leave that answer with no
+        # sources at all. The annotations are still attached to the message
+        # because that is where the OpenAI schema puts them.
+        text = text.split(SOURCES_MARKER, 1)[0]
+    emit_openai_bridge_log(
+        request_id=request_id,
+        model=model,
+        stream=wants_stream,
+        answer_chars=len(text),
+        reference_count=len(citations),
+        citations_emitted=len(annotations),
+        citations_skipped_reason=skipped_reason,
+        sources_block_included=SOURCES_MARKER in text,
+    )
+
+    completion_id = new_completion_id()
+    created = int(time.time())
+    if not wants_stream:
+        body = chat_completion_body(model, completion_id=completion_id, created=created,
+                                   content=text, annotations=annotations or None)
+        return Response(content=json.dumps(body), media_type="application/json")
+
+    async def events():
+        # One event per yielded chunk: Open WebUI iterates the body iterator and
+        # parses each item whole, so two events in one chunk fail to parse.
+        yield sse_event(chat_completion_chunk(
+            model, completion_id=completion_id, created=created, role="assistant", content=text))
+        yield sse_event(chat_completion_chunk(
+            model, completion_id=completion_id, created=created,
+            annotations=annotations or None, finish_reason="stop"))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")

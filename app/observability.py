@@ -50,6 +50,22 @@ Bridge field meanings:
 ``rewrite_changed``    True when retrieval ran on a rewritten query
 ``empty_retries_used`` extra /query/stream attempts made because the answer
                        stream came back empty (0 when none were needed)
+
+A third line type, ``endpoint="openai_bridge"``, records what the
+OpenAI-compatible door handed the client for the SAME request id as its bridge
+line (the bridge line says how the answer was produced; this one says what the
+client was given):
+
+``model``              the model id the client asked for (never a prompt)
+``stream``             whether the client asked for a streamed completion
+``answer_chars``       characters of answer text the client received
+``reference_count``    LightRAG references behind that answer
+``citations_emitted``  url_citation annotations attached (0 with the door off)
+``citations_skipped_reason`` citations_off | base_url_unset | no_references,
+                       or null when annotations were emitted
+``sources_block_included`` True when the text Sources block is in the body the
+                       client received (it is replaced by annotations only on a
+                       streaming request whose annotations were emitted)
 """
 
 from __future__ import annotations
@@ -239,6 +255,40 @@ def emit_bridge_log(
             }
         )
         _emit(line)
+    except Exception:
+        pass
+
+
+def emit_openai_bridge_log(
+    *,
+    request_id: str,
+    model: str,
+    stream: bool,
+    answer_chars: int,
+    reference_count: int,
+    citations_emitted: int,
+    citations_skipped_reason: Optional[str],
+    sources_block_included: bool,
+) -> None:
+    """One line per OpenAI-compatible door request. Counts and ids only.
+
+    The door shares the bridge line's request_id, so a run can join the two:
+    the bridge line says how the answer was produced, this one says what the
+    client was actually given. Prompt text is never logged here either.
+    """
+    try:
+        _emit({
+            "request_id": request_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "endpoint": "openai_bridge",
+            "model": model,
+            "stream": bool(stream),
+            "answer_chars": int(answer_chars),
+            "reference_count": int(reference_count),
+            "citations_emitted": int(citations_emitted),
+            "citations_skipped_reason": citations_skipped_reason,
+            "sources_block_included": bool(sources_block_included),
+        })
     except Exception:
         pass
 
