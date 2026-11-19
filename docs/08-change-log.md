@@ -1246,3 +1246,59 @@ shared index with no `documents` row — and the unattributable rule is delibera
 it: production has no such contamination for Solvay questions.
 
 Suite: `1684 passed, 2 skipped, 327 subtests passed` (base `3d0460c`: 1669 / 2 / 327).
+
+## 2026-11-19 — Open WebUI citations: the Ollama door structurally cannot carry them, so the gateway has a second door
+
+The project started because Open WebUI answered worse than the LightRAG web UI. The answers now match; what
+was still missing was the sources. What the operator saw was a text block at the end of the answer body, and
+Open WebUI's own `sources` column stayed null. **The cause is not that the block is badly rendered; it is that
+the door it travels on has no room for structure.**
+
+**Verified in the Open WebUI source at tag `v0.12.0` (commit `15818d8`), not inferred:**
+
+- `backend/open_webui/utils/response.py` — `convert_response_ollama_to_openai` and
+  `convert_streaming_response_ollama_to_openai` rebuild every Ollama-native response into a fresh OpenAI
+  template, reading only `model`, `message.content` / `thinking` / `tool_calls`, `done`, `done_reason` and the
+  usage fields. Any extra top-level key on our Ollama response (`sources`, `citations`, `metadata`) is
+  **dropped**. So no payload added to `/api/chat` could ever become a citation.
+- `backend/open_webui/utils/middleware.py` ~5301 — on the OpenAI-compatible chat-completions path,
+  `choices[0].delta.annotations[]` entries of type `url_citation` become `type: source` events;
+  `src/lib/components/chat/Chat.svelte` ~1626 appends them to `message.sources`; and
+  `Messages/Citations.svelte` renders the "N Sources" chip, one row per document, opening a modal.
+- Annotations are read in only two places in that tag — the chat-completions **stream** delta (~5301) and the
+  Responses-API `output_item.done` branch (~5177). A **non-streaming** chat completion therefore carries no
+  citations, which is why the new door streams and why it keeps the text block on a non-streaming request
+  (stripping it there would leave that answer with no sources at all).
+- `Citations.svelte` ~108-147 keys one chip on `metadata.source` — the url we send — and when that id starts
+  with `http` it replaces the displayed name with the id itself. Distinct urls per document are therefore
+  mandatory (equal or empty urls collapse every document into one chip), and an http base makes the rows read
+  as URLs. The rows are buttons, not links; the modal renders a link only for a valid http url.
+- Correction to a premise from the lead's brief: the non-empty-`url` guard exists on the **Responses-API**
+  branch (~5182), not on the chat-completions delta branch. An empty url is not dropped; it produces the
+  collapsed single chip above. The conclusion is the same, the reason is not.
+
+**Shipped:** a second door on the gateway — `GET /v1/models` and `POST /v1/chat/completions`, both
+bearer-authed with `RAG_API_KEY` — in `app/api.py`, with the pure re-packaging in a new `app/openai_bridge.py`.
+It calls the existing bridge answer (`answer_ollama_bridge_prompt`) with the same messages and the same
+settings, so **the answer text is byte-identical to the Ollama door's** — a test compares the two doors under
+identical settings rather than asserting it in prose. The only change is what the client is handed: on a
+streaming request with citations on, the text Sources block is replaced by `url_citation` annotations (one per
+document, title = basename plus company when known, built from the same path and company rules as
+`build_sources_block` so the two cannot drift). The Ollama door, `lightrag:latest`, the task-prompt
+short-circuit, the history strip and the bypass side requests are untouched.
+
+**Settings** (`app/config.py`): `BRIDGE_CITATIONS_ENABLED` (**default False** — the door answers, it just
+carries no annotations and the text block stays), `BRIDGE_CITATION_BASE_URL` (default empty; no host is
+hardcoded, and without it the door cannot mint per-document urls, so it emits nothing), `BRIDGE_CITATION_LIMIT`
+(default 12 chips, 0 = uncapped). New log line `endpoint="openai_bridge"` sharing the bridge line's
+`request_id`: `citations_emitted`, `citations_skipped_reason` (`citations_off` / `base_url_unset` /
+`no_references`), `sources_block_included`, `stream`, `reference_count`, `answer_chars`. Counts and ids only,
+no prompt text, as everywhere else.
+
+**Reported, deliberately not fixed:** `answer_ollama_bridge_pipeline` (the non-default `gateway_pipeline`
+backend) appends the Sources block without consulting `BRIDGE_SOURCES_ENABLED`, unlike the `lightrag_direct`
+path production runs. Dormant on today's settings; a one-line fix if the lead wants it.
+
+Suite: `1712 passed, 2 skipped, 327 subtests passed` (base `8b13d32`: 1684 / 2 / 327), 28 new tests in
+`tests/test_openai_bridge_door.py`, including a transcription of Open WebUI 0.12.0's own stream parse and chip
+labelling so the operator-visible result is checked offline. The real Open WebUI check is Hermes' on stack2.

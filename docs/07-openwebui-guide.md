@@ -211,6 +211,73 @@ Before using Open WebUI each day:
 4. confirm target docs are `ingested`
 5. then open `http://localhost:3010`
 
+## Sources You Can See: The Two Doors
+
+The gateway answers Open WebUI on two doors. The answers are the same on both;
+what differs is what the UI can do with the sources.
+
+| Door | Open WebUI connection | Sources the operator sees |
+|------|---------------------|---------------------------|
+| Ollama (`/api/chat`, model `lightrag:latest`) | `OLLAMA_BASE_URLS` | a text `**Sources**` block at the end of the answer body |
+| OpenAI-compatible (`/v1/chat/completions`, model `raggle:latest`) | `OPENAI_API_BASE_URLS` | the same answer plus an `N Sources` chip, one row per document, opening a modal |
+
+Open WebUI 0.12.0 cannot show citations over the Ollama door: it rebuilds every
+Ollama response and drops any extra field (see `docs/08-change-log.md`,
+2026-11-19, for the file:line evidence). The second door exists for that reason
+alone.
+
+### What Hermes sets (stack2 first, then production)
+
+1. Gateway `.env` — the citations are off until these are set:
+
+```bash
+BRIDGE_CITATIONS_ENABLED=True
+# Required. Without a base the door cannot give each document its own url, and
+# Open WebUI keys one citation per distinct url - so it emits nothing and the
+# text block stays. Point it at a surface the operator can read on the LAN.
+# Note: if the base starts with http, Open WebUI shows the URL as the row label
+# instead of the document name. Nothing here hardcodes a host.
+BRIDGE_CITATION_BASE_URL=<set by the operator: where documents can be looked up>
+# Optional: chips per answer (default 12; 0 = no cap).
+BRIDGE_CITATION_LIMIT=12
+```
+
+2. `compose.yml`, `open-webui` service — append a **fourth** entry so the
+   existing three keep their slot order and their key positions do not shift:
+
+```yaml
+OPENAI_API_BASE_URLS: '<existing three>;http://gateway-api:8000/v1'
+# Keys are positionally matched to base urls, so add one key at the end. The
+# value is the gateway's RAG_API_KEY (kept in the host .env as
+# OPENWEBUI_OPENAI_API_KEYS; never in the repo). If the counts mismatch,
+# Open WebUI 0.12.0 pads the key list with empty strings (routers/openai.py
+# ~245), so forgetting this slot does not shift the other three - it just means
+# our door answers 401 and raggle:latest never appears in the picker.
+OPENAI_API_KEYS: "${OPENWEBUI_OPENAI_API_KEYS:-}"
+```
+
+3. In Open WebUI: Admin Panel → Settings → Connections should now list the fourth
+   connection, and the model picker will offer `raggle:latest`. Pick it for the
+   chats whose sources matter. `lightrag:latest` keeps working unchanged.
+
+### What the operator sees, and what it is not
+
+Under the answer: `N Sources`. Clicking it lists one row per document (the file
+name, plus the company when the gateway knows it) and opens a modal. The rows are
+buttons, not links; a link appears in the modal only when the citation url is a
+valid http url, which is what `BRIDGE_CITATION_BASE_URL` supplies.
+
+There are no inline `[1]`-style markers in the text: those would need the answer
+to emit them, and this change deliberately does not touch generation. Sources are
+per answer, not per sentence.
+
+### Rollback
+
+`BRIDGE_CITATIONS_ENABLED=False` returns the door to today's behaviour (text
+block, no annotations). Removing the fourth `OPENAI_API_BASE_URLS` entry and its
+key removes the door from the UI. The Ollama door, the model `lightrag:latest`,
+retrieval and generation are untouched by either.
+
 ## Known-Good Configuration For This Stack
 
 1. Open WebUI URL: `http://localhost:3010`

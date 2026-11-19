@@ -228,6 +228,37 @@ podman exec rag-gateway-api curl -i \
   http://lightrag-server:9621/api/version
 ```
 
+## Open WebUI Doors (Ollama and OpenAI-compatible)
+
+The Ollama door is unauthenticated today and answers model `lightrag:latest`:
+
+```bash
+curl -i -X POST http://localhost:8020/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model":"lightrag:latest","stream":false,"messages":[{"role":"user","content":"What does the document say?"}]}'
+```
+
+The OpenAI-compatible door carries the gateway bearer key and exists because it
+is the only Open WebUI path that can carry citations:
+
+```bash
+curl -i http://localhost:8020/v1/models -H "Authorization: Bearer $RAG_API_KEY"
+
+curl -i -N -X POST http://localhost:8020/v1/chat/completions \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"raggle:latest","stream":true,"messages":[{"role":"user","content":"What does the document say?"}]}'
+```
+
+It advertises one model, `raggle:latest`, and produces the same answer as the
+Ollama door. With `BRIDGE_CITATIONS_ENABLED=True` and
+`BRIDGE_CITATION_BASE_URL` set, a streaming response carries
+`choices[0].delta.annotations[]` `url_citation` entries (one per document) and the
+text `**Sources**` block is dropped from the body; otherwise the block stays.
+A non-streaming response keeps the block and attaches the annotations to
+`choices[0].message.annotations`, because Open WebUI 0.12.0 reads annotations
+only on a streaming completion. See `docs/07-openwebui-guide.md`.
+
 ## Example Smoke-Test Query
 
 ```bash
