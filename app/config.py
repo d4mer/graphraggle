@@ -335,6 +335,29 @@ class Settings(BaseSettings):
     bridge_task_max_chars: int = Field(default=0, alias="BRIDGE_TASK_MAX_CHARS")
     # Append a markdown Sources block to direct-bridge answers.
     bridge_sources_enabled: bool = Field(default=True, alias="BRIDGE_SOURCES_ENABLED")
+    # ── OpenAI-compatible door citations (the Open WebUI "N Sources" chip) ──
+    # The gateway's second door (GET /v1/models, POST /v1/chat/completions) is
+    # the only Open WebUI path that can carry structured citations; the Ollama
+    # door's answers are byte-identical either way. Ships OFF: with this off the
+    # door still answers, it just carries no annotations, and the text Sources
+    # block stays in the body. Setting it on changes only what the client is
+    # handed, never retrieval or generation.
+    bridge_citations_enabled: bool = Field(default=False, alias="BRIDGE_CITATIONS_ENABLED")
+    # Required before annotations are worth emitting. Open WebUI keys one
+    # citation chip per distinct url (0.12.0 Citations.svelte dedupes on it, so
+    # an empty or repeated url collapses several documents into a single chip),
+    # and the door cannot mint a url without a base - with none set it emits no
+    # annotations and the text Sources block stays. No host is hardcoded here:
+    # whatever the operator's LAN serves is what this must point at. Each
+    # document's url is "<base>/<urlencoded label>", and the label is what the
+    # operator reads - note Open WebUI shows the url as the chip label when the
+    # url starts with http, so an http base makes the chips read as URLs.
+    # Set this to the surface where the operator can actually look the document
+    # up; a link is only rendered when the url is a valid http url.
+    bridge_citation_base_url: str = Field(default="", alias="BRIDGE_CITATION_BASE_URL")
+    # Cap on annotations per answer (chips). 0 = no cap. References are deduped
+    # by document name first, the same way the Sources block dedupes them.
+    bridge_citation_limit: int = Field(default=12, alias="BRIDGE_CITATION_LIMIT")
     # Strip complete reasoning regions (recognized boundary pairs only) from
     # aggregated /query/stream text. qwen3.6-35b on the MLX server emits its
     # chain-of-thought inline in the streamed response; the non-stream path
